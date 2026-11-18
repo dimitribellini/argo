@@ -1,0 +1,26 @@
+# Git & local secrets
+.git/
+.env
+.env.*
+
+# Python build/test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Frontend local artifacts (compiled fresh inside Dockerfile Stage 1)
+frontend/node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
+
+# Local SQLite & runtime volumes
+*.db
+*.db-wal
+*.db-shm
+data/
+desktops/

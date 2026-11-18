@@ -1,0 +1,82 @@
+services:
+  valkey:
+    image: valkey/valkey:9.1-alpine
+    mem_limit: 256m
+    cpus: 0.5
+    networks:
+      - argo-net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  argo-core:
+    image: ghcr.io/dimitribellini/argo:latest
+    mem_limit: 2g
+    cpus: 2.0
+    environment:
+      # Generate with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      # All OAuth accounts, Telegram bots, webhooks, and LLM keys are configured in the Web UI (encrypted in SQLite).
+      ARGO_MASTER_KEY: "CHANGE_ME_FERNET_BASE64_KEY"
+      ARGO_DB_PATH: "/data/argo.db"
+      ARGO_VALKEY_URL: "valkey://valkey:6379/0"
+      ARGO_DESKTOP_VOLUMES_ROOT: "/srv/argo/desktops"
+      ARGO_DOCKER_NETWORK: "argo-net"
+      ARGO_PUBLIC_BASE_URL: "https://argo.example.com"
+      # Optional shared Google OAuth client for 1-click Gmail onboarding (falls back to UI client setup)
+      # ARGO_GOOGLE_CLIENT_ID: ""
+      # ARGO_GOOGLE_CLIENT_SECRET: ""
+    volumes:
+      - argo-data:/data
+      - /srv/argo/desktops:/srv/argo/desktops
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - valkey
+    networks:
+      - argo-net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+    mem_limit: 256m
+    cpus: 0.5
+    environment:
+      OAUTH2_PROXY_CLIENT_ID: "CHANGE_ME_GOOGLE_CLIENT_ID"
+      OAUTH2_PROXY_CLIENT_SECRET: "CHANGE_ME_GOOGLE_CLIENT_SECRET"
+      OAUTH2_PROXY_COOKIE_SECRET: "CHANGE_ME_32_BYTE_COOKIE_SECRET"
+      OAUTH2_PROXY_REDIRECT_URL: "https://argo.example.com/oauth2/callback"
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+    command:
+      - --provider=google
+      - --http-address=0.0.0.0:4180
+      - --upstream=http://argo-core:8000
+      - --skip-auth-regex=^/(hooks/|favicon\.(svg|ico)$|apple-touch-icon\.png$)
+      - --reverse-proxy=true
+      - --set-xauthrequest=true
+    ports:
+      - "127.0.0.1:4180:4180"
+    depends_on:
+      - argo-core
+    networks:
+      - argo-net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  argo-net:
+    name: argo-net
+    driver: bridge
+
+volumes:
+  argo-data:

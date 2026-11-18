@@ -1,0 +1,452 @@
+@import "tailwindcss";
+
+:root {
+  --argo-bg: #f8fafc;
+  --argo-fg: #0f172a;
+  --argo-sidebar: #f1f5f9;
+  --argo-border: #e2e8f0;
+  --argo-card: #ffffff;
+  --argo-muted: #475569;
+}
+
+html.dark {
+  --argo-bg: #13161c;
+  --argo-fg: #f3f4f6;
+  --argo-sidebar: #181c23;
+  --argo-border: #2d3440;
+  --argo-card: #1e232c;
+  --argo-muted: #9ca3af;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background-color: var(--argo-bg);
+  color: var(--argo-fg);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Readable minimum typography across dense metadata & controls */
+.text-\[9px\],
+.text-\[10px\],
+.text-\[10\.5px\] {
+  font-size: 11.5px !important;
+  line-height: 1.45 !important;
+}
+.text-\[11px\] {
+  font-size: 12px !important;
+  line-height: 1.45 !important;
+}
+.text-xs {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* Light mode secondary text legibility */
+html:not(.dark) .text-slate-400 {
+  color: #64748b;
+}
+html:not(.dark) .text-slate-500 {
+  color: #475569;
+}
+
+/* Dark mode neutral graphite surface & typography mapping */
+html.dark .bg-white {
+  background-color: #1e232c !important;
+}
+html.dark .bg-slate-50,
+html.dark .bg-slate-50\/40,
+html.dark .bg-slate-50\/50,
+html.dark .bg-slate-50\/60,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50\/80,
+html.dark .bg-slate-50\/90,
+html.dark .disabled\:bg-slate-50:disabled {
+  background-color: #141820 !important;
+}
+html.dark .bg-slate-100,
+html.dark .bg-slate-100\/60,
+html.dark .bg-slate-100\/70,
+html.dark .bg-slate-100\/80 {
+  background-color: #181c23 !important;
+}
+html.dark .bg-slate-200,
+html.dark .bg-slate-200\/70 {
+  background-color: #252b36 !important;
+}
+html.dark .bg-slate-900 {
+  background-color: #f3f4f6 !important;
+  color: #111827 !important;
+}
+html.dark .bg-slate-900:hover {
+  background-color: #e5e7eb !important;
+}
+html.dark .bg-slate-900.text-white,
+html.dark .bg-slate-900 .text-white {
+  color: #111827 !important;
+}
+html.dark .bg-slate-900 .text-slate-200,
+html.dark .bg-slate-900 .text-slate-300,
+html.dark .bg-slate-900 .text-slate-400 {
+  color: #374151 !important;
+}
+html.dark .bg-slate-900 svg {
+  color: #111827 !important;
+}
+
+html.dark .argo-desktop-studio,
+html.dark .argo-desktop-studio .bg-slate-900,
+html.dark .argo-desktop-studio .bg-slate-950 {
+  background-color: #14171d !important;
+  color: #f3f4f6 !important;
+}
+html.dark .argo-studio-btn,
+.argo-studio-btn {
+  background-color: #222732 !important;
+  color: #e5e7eb !important;
+  border: 1px solid #353d4d !important;
+}
+html.dark .argo-studio-btn:hover,
+.argo-studio-btn:hover {
+  background-color: #2c3340 !important;
+  color: #ffffff !important;
+}
+html.dark .argo-studio-btn svg,
+.argo-studio-btn svg {
+  color: currentColor !important;
+}
+
+html.dark .text-slate-900,
+html.dark .text-slate-800 {
+  color: #f3f4f6 !important;
+}
+html.dark .text-slate-700,
+html.dark .text-slate-600 {
+  color: #d1d5db !important;
+}
+html.dark .text-slate-500,
+html.dark .text-slate-400,
+html.dark .disabled\:text-slate-400:disabled {
+  color: #9ca3af !important;
+}
+html.dark .hover\:text-slate-700:hover,
+html.dark .hover\:text-slate-800:hover,
+html.dark .hover\:text-slate-900:hover {
+  color: #ffffff !important;
+}
+html.dark .border-slate-200,
+html.dark .border-slate-300,
+html.dark .border-slate-100 {
+  border-color: #2d3440 !important;
+}
+html.dark .divide-slate-100 > :not(:last-child) {
+  border-color: #252b36 !important;
+}
+html.dark .hover\:bg-slate-50:hover,
+html.dark .hover\:bg-slate-50\/80:hover,
+html.dark .hover\:bg-slate-100:hover,
+html.dark .hover\:bg-slate-100\/70:hover,
+html.dark .hover\:bg-slate-200:hover,
+html.dark .hover\:bg-slate-200\/50:hover,
+html.dark .hover\:bg-slate-200\/60:hover,
+html.dark .hover\:bg-slate-200\/80:hover,
+html.dark .hover\:bg-slate-300:hover {
+  background-color: #262d38 !important;
+}
+html.dark input,
+html.dark select,
+html.dark textarea {
+  background-color: #141820 !important;
+  color: #f3f4f6 !important;
+  border-color: #323a48 !important;
+}
+html.dark input.bg-transparent,
+html.dark select.bg-transparent,
+html.dark textarea.bg-transparent {
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+html.dark select option {
+  background-color: #1e232c;
+  color: #f3f4f6;
+}
+
+.argo-user-bubble {
+  background-color: #1e293b;
+  color: #f8fafc;
+}
+html.dark .argo-user-bubble {
+  background-color: #28486e;
+  color: #ffffff;
+}
+
+/* Muted, plain solid accents & callouts (Grok-style neutral graphite) */
+.bg-emerald-400,
+.bg-emerald-500 {
+  background-color: #3b8c62 !important;
+}
+html.dark .bg-emerald-50,
+html.dark .bg-emerald-50\/50,
+html.dark .bg-emerald-50\/60,
+html.dark .bg-emerald-50\/70,
+html.dark .bg-emerald-100,
+html.dark .bg-amber-50,
+html.dark .bg-amber-50\/50,
+html.dark .bg-amber-50\/70,
+html.dark .bg-amber-100,
+html.dark .hover\:bg-amber-100:hover,
+html.dark .bg-sky-50,
+html.dark .bg-blue-50,
+html.dark .bg-indigo-50,
+html.dark .bg-indigo-50\/50,
+html.dark .bg-indigo-50\/60 {
+  background-color: #181c23 !important;
+}
+html.dark .bg-rose-50,
+html.dark .bg-rose-100,
+html.dark .hover\:bg-rose-50:hover {
+  background-color: #23191c !important;
+}
+
+html.dark .text-emerald-300,
+html.dark .text-emerald-400,
+html.dark .text-emerald-600,
+html.dark .text-emerald-700,
+html.dark .text-emerald-800,
+html.dark .text-emerald-800\/75,
+html.dark .text-emerald-900,
+html.dark .text-emerald-900\/90,
+html.dark .text-emerald-950 {
+  color: #a7d4b8 !important;
+}
+html.dark .text-amber-300,
+html.dark .text-amber-400,
+html.dark .text-amber-600,
+html.dark .text-amber-700,
+html.dark .text-amber-800,
+html.dark .text-amber-900,
+html.dark .text-amber-950 {
+  color: #dec084 !important;
+}
+html.dark .text-rose-300,
+html.dark .text-rose-400,
+html.dark .text-rose-600,
+html.dark .text-rose-700,
+html.dark .text-rose-800,
+html.dark .text-rose-900 {
+  color: #df9a9a !important;
+}
+html.dark .text-sky-300,
+html.dark .text-sky-400,
+html.dark .text-sky-600,
+html.dark .text-sky-700,
+html.dark .text-sky-800,
+html.dark .text-sky-900,
+html.dark .hover\:text-sky-900:hover,
+html.dark .text-blue-500,
+html.dark .text-blue-600,
+html.dark .text-blue-700,
+html.dark .text-indigo-300,
+html.dark .text-indigo-400,
+html.dark .text-indigo-500,
+html.dark .text-indigo-600,
+html.dark .text-indigo-700,
+html.dark .hover\:text-indigo-700:hover,
+html.dark .hover\:text-indigo-900:hover {
+  color: #9bb7d8 !important;
+}
+
+html.dark .border-emerald-200,
+html.dark .border-emerald-300,
+html.dark .border-amber-200,
+html.dark .border-amber-300,
+html.dark .border-sky-200,
+html.dark .border-blue-200,
+html.dark .border-blue-300,
+html.dark .border-indigo-200 {
+  border-color: #2d3440 !important;
+}
+html.dark .border-rose-200,
+html.dark .border-rose-300 {
+  border-color: #4a2c32 !important;
+}
+
+/* Global thin scrollbars styled consistently across WebUI */
+html,
+body,
+*,
+.custom-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+*::-webkit-scrollbar,
+.custom-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track,
+.custom-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb,
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover,
+.custom-scroll::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+html.dark,
+html.dark *,
+html.dark .custom-scroll {
+  scrollbar-color: #363e4d transparent;
+}
+
+html.dark *::-webkit-scrollbar-thumb,
+html.dark .custom-scroll::-webkit-scrollbar-thumb {
+  background: #363e4d;
+}
+
+html.dark *::-webkit-scrollbar-thumb:hover,
+html.dark .custom-scroll::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
+
+@keyframes argo-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes argo-modal-pop {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.argo-modal-backdrop {
+  background-color: rgba(15, 23, 42, 0.56);
+  animation: argo-fade-in 140ms ease-out;
+}
+
+html.dark .argo-modal-backdrop {
+  background-color: rgba(10, 12, 16, 0.78);
+}
+
+.argo-modal-panel {
+  background-color: #ffffff;
+  border: 1px solid #cbd5e1;
+  box-shadow:
+    0 0 0 1px rgba(15, 23, 42, 0.05),
+    0 24px 56px -12px rgba(15, 23, 42, 0.32);
+  animation: argo-modal-pop 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+html.dark .argo-modal-panel {
+  background-color: #1e232c !important;
+  border: 1px solid #363e4d !important;
+  box-shadow: 0 24px 56px -12px rgba(0, 0, 0, 0.65) !important;
+}
+
+html.dark .argo-modal-panel .border-slate-200 {
+  border-color: #2d3440 !important;
+}
+
+.argo-modal-header {
+  background-color: #f8fafc;
+}
+
+html.dark .argo-modal-header {
+  background-color: #232934 !important;
+}
+
+/* Plain, flat neutral @mention badges (Grok-style, zero fluo backgrounds) */
+.argo-mention-chip-bot,
+.argo-mention-chip-integration,
+.argo-mention-chip-vault,
+.argo-mention-chip-skill,
+.argo-mention-chip-unknown {
+  background-color: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+html.dark .argo-mention-chip-bot,
+html.dark .argo-mention-chip-integration,
+html.dark .argo-mention-chip-vault,
+html.dark .argo-mention-chip-skill,
+html.dark .argo-mention-chip-unknown {
+  background-color: #252b36 !important;
+  border-color: #363e4d !important;
+  color: #f3f4f6 !important;
+}
+
+/* Zero-drift syntax highlight layer inside bot thread composer */
+.argo-composer-backdrop {
+  color: transparent !important;
+}
+
+textarea.argo-composer-input {
+  background-color: transparent !important;
+  color: #0f172a;
+  caret-color: #0f172a;
+}
+
+textarea.argo-composer-input::placeholder {
+  color: #94a3b8;
+}
+
+html.dark textarea.argo-composer-input {
+  background-color: transparent !important;
+  color: #eef1f7 !important;
+  caret-color: #eef1f7;
+}
+
+html.dark textarea.argo-composer-input::placeholder {
+  color: #64748b !important;
+}
+
+.argo-composer-mention {
+  color: transparent !important;
+  border-radius: 3px;
+  padding: 1px 0;
+}
+
+.argo-composer-mention-bot,
+.argo-composer-mention-integration,
+.argo-composer-mention-vault,
+.argo-composer-mention-skill,
+.argo-composer-mention-unknown {
+  background-color: #e2e8f0;
+}
+
+html.dark .argo-composer-mention-bot,
+html.dark .argo-composer-mention-integration,
+html.dark .argo-composer-mention-vault,
+html.dark .argo-composer-mention-skill,
+html.dark .argo-composer-mention-unknown {
+  background-color: #28303d;
+}

@@ -1,0 +1,41 @@
+# Environments
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Frontend / Vite static build
+node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
+
+# SQLite WAL & Local Runtime Volumes
+*.db
+*.db-wal
+*.db-shm
+data/
+desktops/
