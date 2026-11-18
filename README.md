@@ -1,6 +1,29 @@
-# Argo Operator & User Manual
+# Argo
 
-**Argo** is a self-hosted multi-bot automation workspace that runs on a single Linux container host behind Google SSO (`oauth2-proxy`). Administrators deploy three containers from one Compose file; workspace users create and refine bots in plain English, receive live-streamed replies with inline tool progress chips and non-blocking queued follow-ups, group specialists into shared Rooms with fast auto-routing, inspect live dashboards side-by-side in Split View, review external actions before sending, and automate isolated XFCE Virtual Desktops without writing code or rebuilding containers.
+<div align="center">
+
+[![GitHub](https://img.shields.io/badge/GITHUB-DIMITRIBELLINI%2FARGO-24292F?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitribellini/argo)
+[![Release](https://img.shields.io/github/v/release/dimitribellini/argo?style=for-the-badge&label=RELEASE&color=0A84FF&logo=github&logoColor=white)](https://github.com/dimitribellini/argo/releases)
+<br />
+[![Platforms](https://img.shields.io/badge/PLATFORMS-LINUX%20X86__64%20%7C%20LINUX%20ARM64%20%7C%20DOCKER-EE7F2D?style=for-the-badge&logo=docker&logoColor=white)](#14-configure-compose-and-start-argo)
+[![Engine](https://img.shields.io/badge/ENGINE-PYTHON%20%2B%20REACT%20%2B%20PYDANTIC--AI-8A2BE2?style=for-the-badge&logo=python&logoColor=white)](#11-system-requirements-and-architecture)
+[![License](https://img.shields.io/badge/LICENSE-APACHE%202.0-4CC61E?style=for-the-badge)](#license)
+
+Self-hosted multi-bot automation workspace with Google SSO, live-streamed Team Rooms, human-in-the-loop Approvals, interactive Living Pages, and isolated Selkies XFCE Virtual Desktops.
+
+[**Releases**](https://github.com/dimitribellini/argo/releases) · [**Quick Start**](#14-configure-compose-and-start-argo) · [**Architecture**](#11-system-requirements-and-architecture) · [**Users Guide**](#chapter-2-users-usage-guide) · [**Team Rooms**](#25-multi-bot-rooms-auto-picker-routing-and-delegation-plans) · [**Approvals**](#26-reviewing-actions-in-approvals-and-writing-rules) · [**Living Pages**](#27-interactive-pages-and-side-by-side-split-view) · [**Virtual Desktops**](#29-virtual-desktops-teach-a-task-recording-and-live-takeover) · [**License**](#license)
+
+</div>
+
+---
+
+<div align="center">
+  <img src="screenshots/argo_screenshot_1.png" alt="Argo Multi-Bot Team Room & Virtual Desktop Workspace" width="100%" />
+</div>
+
+---
+
+**Argo** runs on a single Linux container host behind Google SSO (`oauth2-proxy`). Administrators deploy three containers from one Compose file; workspace users create and refine bots in plain English, receive live-streamed replies with inline tool progress chips and non-blocking queued follow-ups, group specialists into shared Rooms with fast auto-routing, inspect live dashboards side-by-side in Split View, review external actions before sending, and automate isolated XFCE Virtual Desktops without writing code or rebuilding containers.
 
 ---
 
@@ -27,6 +50,7 @@
   - [2.10 Real-Life Usage Playbooks](#210-real-life-usage-playbooks)
   - [2.11 Monitoring Activity, Token Budgets, and Diagnostics](#211-monitoring-activity-token-budgets-and-diagnostics)
 - [Reference Documentation](#reference-documentation)
+- [License](#license)
 
 ---
 
@@ -402,3 +426,9 @@ Use **Cloud API (`0 MB` extra RAM)** for email, feeds, Telegram, LinkedIn, and p
 
 - [`compose.yml`](compose.yml) — Single-host container stack and environment configuration
 - [`Dockerfile`](Dockerfile) — Multi-stage Fedora 45 build (`Node 26` frontend + `Python 3.15` runtime)
+
+---
+
+## License
+
+Copyright © 2026 Dimitri Bellini. Released under the [Apache License 2.0](LICENSE).

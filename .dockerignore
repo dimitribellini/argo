@@ -1,5 +1,11 @@
 # Git & local secrets
 .git/
+.gitea/
+.agents/
+AGENTS.md
+doc/
+screenshots/
+tests/
 .env
 .env.*
 

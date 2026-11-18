@@ -14,6 +14,7 @@ ARG APP_VERSION=dev
 LABEL org.opencontainers.image.title="Argo" \
       org.opencontainers.image.description="Self-hosted domain-agnostic multi-bot automation workspace" \
       org.opencontainers.image.source="https://github.com/dimitribellini/argo" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${APP_VERSION}"
 ENV APP_VERSION=${APP_VERSION} \
     PYTHONDONTWRITEBYTECODE=1 \
