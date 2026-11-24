@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
     status TEXT NOT NULL DEFAULT 'ok',
     last_checked_at TEXT,
     last_error TEXT,
+    owner_email TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'shared',
+    allowed_groups_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 
@@ -28,6 +31,8 @@ CREATE TABLE IF NOT EXISTS model_providers (
     is_default INTEGER NOT NULL DEFAULT 0,
     daily_token_limit INTEGER,
     monthly_budget_usd REAL,
+    input_price_per_million REAL,
+    output_price_per_million REAL,
     created_at TEXT NOT NULL
 );
 
@@ -39,6 +44,9 @@ CREATE TABLE IF NOT EXISTS bots (
     role TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     card_json TEXT NOT NULL,
+    owner_email TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'shared',
+    allowed_groups_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -55,6 +63,7 @@ CREATE TABLE IF NOT EXISTS bot_runs (
     estimated_cost_usd REAL DEFAULT 0.0,
     status TEXT NOT NULL,
     summary TEXT,
+    triggered_by_email TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL,
     finished_at TEXT
 );
@@ -158,6 +167,9 @@ CREATE TABLE IF NOT EXISTS pages (
     content_payload TEXT NOT NULL,
     allowed_collections_json TEXT NOT NULL,
     owner_bot_slug TEXT NOT NULL,
+    created_by_email TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'shared',
+    allowed_groups_json TEXT NOT NULL DEFAULT '[]',
     pinned INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );

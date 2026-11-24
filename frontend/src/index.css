@@ -23,6 +23,8 @@ html,
 body,
 #root {
   height: 100%;
+  height: 100dvh;
+  height: var(--argo-vh, 100dvh);
   margin: 0;
   background-color: var(--argo-bg);
   color: var(--argo-fg);
@@ -33,6 +35,14 @@ body,
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+}
+
+.argo-safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.argo-safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* Readable minimum typography across dense metadata & controls */
@@ -103,6 +113,10 @@ html.dark .bg-slate-900 svg {
   color: #111827 !important;
 }
 
+.argo-desktop-studio {
+  transform: none !important;
+  animation: argo-fade-in 120ms ease-out;
+}
 html.dark .argo-desktop-studio,
 html.dark .argo-desktop-studio .bg-slate-900,
 html.dark .argo-desktop-studio .bg-slate-950 {
@@ -148,7 +162,8 @@ html.dark .border-slate-300,
 html.dark .border-slate-100 {
   border-color: #2d3440 !important;
 }
-html.dark .divide-slate-100 > :not(:last-child) {
+html.dark .divide-slate-100 > :not(:last-child),
+html.dark .divide-slate-200 > :not(:last-child) {
   border-color: #252b36 !important;
 }
 html.dark .hover\:bg-slate-50:hover,
@@ -191,24 +206,48 @@ html.dark .argo-user-bubble {
 
 /* Muted, plain solid accents & callouts (Grok-style neutral graphite) */
 .bg-emerald-400,
-.bg-emerald-500 {
-  background-color: #3b8c62 !important;
+.bg-emerald-500,
+.bg-emerald-600 {
+  background-color: #2f6f54 !important;
+}
+.hover\:bg-emerald-700:hover {
+  background-color: #255a44 !important;
+}
+.bg-amber-400,
+.bg-amber-500 {
+  background-color: #a87d3b !important;
+}
+.bg-rose-500,
+.bg-rose-600 {
+  background-color: #9b444c !important;
+}
+.hover\:bg-rose-700:hover {
+  background-color: #82373e !important;
+}
+.bg-sky-500,
+.bg-blue-500,
+.bg-indigo-600 {
+  background-color: #3b6796 !important;
 }
 html.dark .bg-emerald-50,
 html.dark .bg-emerald-50\/50,
 html.dark .bg-emerald-50\/60,
 html.dark .bg-emerald-50\/70,
 html.dark .bg-emerald-100,
+html.dark .hover\:bg-emerald-100:hover,
 html.dark .bg-amber-50,
 html.dark .bg-amber-50\/50,
 html.dark .bg-amber-50\/70,
 html.dark .bg-amber-100,
 html.dark .hover\:bg-amber-100:hover,
 html.dark .bg-sky-50,
+html.dark .bg-sky-100,
+html.dark .hover\:bg-sky-100:hover,
 html.dark .bg-blue-50,
 html.dark .bg-indigo-50,
 html.dark .bg-indigo-50\/50,
-html.dark .bg-indigo-50\/60 {
+html.dark .bg-indigo-50\/60,
+html.dark .hover\:bg-indigo-100:hover {
   background-color: #181c23 !important;
 }
 html.dark .bg-rose-50,
@@ -267,13 +306,21 @@ html.dark .hover\:text-indigo-900:hover {
 
 html.dark .border-emerald-200,
 html.dark .border-emerald-300,
+html.dark .border-emerald-500,
 html.dark .border-amber-200,
 html.dark .border-amber-300,
+html.dark .border-amber-500,
 html.dark .border-sky-200,
+html.dark .border-sky-300,
 html.dark .border-blue-200,
 html.dark .border-blue-300,
-html.dark .border-indigo-200 {
+html.dark .border-indigo-200,
+html.dark .border-indigo-300 {
   border-color: #2d3440 !important;
+}
+html.dark .border-sky-500,
+html.dark .border-slate-500 {
+  border-color: #5a6678 !important;
 }
 html.dark .border-rose-200,
 html.dark .border-rose-300 {
@@ -348,27 +395,25 @@ html.dark .custom-scroll::-webkit-scrollbar-thumb:hover {
 }
 
 .argo-modal-backdrop {
-  background-color: rgba(15, 23, 42, 0.56);
+  background-color: #e2e8f0;
   animation: argo-fade-in 140ms ease-out;
 }
 
 html.dark .argo-modal-backdrop {
-  background-color: rgba(10, 12, 16, 0.78);
+  background-color: #0f1218;
 }
 
 .argo-modal-panel {
   background-color: #ffffff;
   border: 1px solid #cbd5e1;
-  box-shadow:
-    0 0 0 1px rgba(15, 23, 42, 0.05),
-    0 24px 56px -12px rgba(15, 23, 42, 0.32);
+  box-shadow: none;
   animation: argo-modal-pop 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 html.dark .argo-modal-panel {
   background-color: #1e232c !important;
   border: 1px solid #363e4d !important;
-  box-shadow: 0 24px 56px -12px rgba(0, 0, 0, 0.65) !important;
+  box-shadow: none !important;
 }
 
 html.dark .argo-modal-panel .border-slate-200 {
@@ -449,4 +494,55 @@ html.dark .argo-composer-mention-vault,
 html.dark .argo-composer-mention-skill,
 html.dark .argo-composer-mention-unknown {
   background-color: #28303d;
+}
+
+/* Dedicated SSH terminal viewport immunity against global dark inversions */
+.argo-ssh-terminal {
+  background-color: #f8fafc;
+  color: #0f172a;
+}
+
+html.dark .argo-ssh-terminal,
+html.dark .argo-ssh-terminal:hover,
+html.dark pre.argo-ssh-terminal,
+html.dark pre.argo-ssh-terminal:hover {
+  background-color: #14171d !important;
+  color: #e5e7eb !important;
+}
+
+.argo-code-block {
+  background-color: #0f172a;
+  color: #f1f5f9;
+  border-color: #334155;
+}
+
+.argo-code-block-bar {
+  background-color: #1e293b;
+  border-color: #334155;
+  color: #cbd5e1;
+}
+
+html.dark .argo-code-block,
+html.dark .argo-code-block:hover,
+html.dark pre.argo-code-block,
+html.dark pre.argo-code-block:hover {
+  background-color: #14171d !important;
+  color: #e5e7eb !important;
+  border-color: #2d3440 !important;
+}
+
+html.dark .argo-code-block-bar {
+  background-color: #1b2029 !important;
+  border-color: #2d3440 !important;
+  color: #9ca3af !important;
+}
+
+html.dark .argo-code-block svg,
+html.dark .argo-code-block button {
+  color: #d1d5db !important;
+}
+
+html.dark .argo-code-block button:hover {
+  background-color: #262d38 !important;
+  color: #ffffff !important;
 }

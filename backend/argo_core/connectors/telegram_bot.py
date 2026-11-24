@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
+import html
 import json
 import logging
 import re
@@ -34,7 +36,336 @@ logger = logging.getLogger(__name__)
 MAX_CALLBACK_DATA_BYTES = 64
 STOP_IDLE_DESKTOPS_CALLBACK = "sys:stop_idle"
 TELEGRAM_POSTS_COLLECTION = "telegram_channel_posts"
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+TELEGRAM_FORMAT_INPUT_MAX_LENGTH = 3950
 _BOT_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"^[ \t]*```([A-Za-z0-9_.+-]*)[ \t]*\n(.*?)(?:\n)?^[ \t]*```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+_INLINE_TRIPLE_CODE_RE = re.compile(r"```([^`\n]+)```")
+_INLINE_DOUBLE_CODE_RE = re.compile(r"``([^`\n]+?)``")
+_INLINE_SINGLE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_HTML_PRE_BLOCK_RE = re.compile(r"<pre>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
+_HTML_PRE_INNER_CODE_RE = re.compile(
+    r"^\s*<code(?:\s+class=([\"'])(language-[A-Za-z0-9_.+-]+)\1)?\s*>(.*)</code>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_CODE_TAG_RE = re.compile(
+    r"<code(?:\s+class=([\"'])(language-[A-Za-z0-9_.+-]+)\1)?\s*>(.*?)</code>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_LINK_TAG_RE = re.compile(
+    r"<a\s+href=([\"'])((?:https?|tg)://[^\"'\s<>]+|mailto:[^\"'\s<>]+)\1\s*>(.*?)</a>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_SAFE_PAIR_TAG_RE = re.compile(
+    r"<(/?)(b|strong|i|em|u|ins|s|strike|del|tg-spoiler|blockquote)(\s+expandable)?\s*>",
+    re.IGNORECASE,
+)
+_MD_LINK_RE = re.compile(
+    r"\[([^\]\n]+)\]\(((?:https?://|tg://|mailto:)[^\s<>()]+(?:\([^\s<>()]*\)[^\s<>()]*)*)\)"
+)
+_BARE_URL_RE = re.compile(r"(?<![A-Za-z0-9_])https?://[^\s<>\"'`]+")
+_BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]*(?:&gt;|>)[ \t]?(.*)$")
+_HR_LINE_RE = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$")
+_ATX_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$")
+_BULLET_LINE_RE = re.compile(r"^([ \t]*)[-*][ \t]+(.*)$")
+
+_BOLD_ITALIC_STAR_RE = re.compile(r"\*\*\*([^\s*](?:.*?\S)?)\*\*\*")
+_BOLD_ITALIC_UNDER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])___([^\s_](?:.*?\S)?)___(?![A-Za-z0-9_])"
+)
+_BOLD_STAR_RE = re.compile(r"\*\*([^\s*](?:.*?\S)?)\*\*")
+_UNDERLINE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])__([^\s_](?:.*?\S)?)__(?![A-Za-z0-9_])"
+)
+_STRIKE_RE = re.compile(r"~~([^\s~](?:.*?\S)?)~~")
+_SPOILER_RE = re.compile(r"\|\|([^\s|](?:.*?\S)?)\|\|")
+_ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^\s*](?:[^*]*?\S)?)\*(?!\*)")
+_ITALIC_UNDER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])_([^\s_](?:[^_]*?\S)?)_(?![A-Za-z0-9_])"
+)
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\x00TGPH(\d+)\x00")
+
+
+def _truncate_text_at_boundary(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    cut = text[: max_len - 3]
+    newline_pos = cut.rfind("\n")
+    space_pos = cut.rfind(" ")
+    boundary = max(newline_pos, space_pos)
+    if boundary > max_len // 2:
+        cut = cut[:boundary]
+    return cut.rstrip() + "..."
+
+
+def _split_bare_url_trailing(raw_url: str) -> tuple[str, str]:
+    url = raw_url
+    trailing = ""
+    while url:
+        last = url[-1]
+        if last in ".,;:!?'\"[]":
+            trailing = last + trailing
+            url = url[:-1]
+            continue
+        if last == ")" and url.count(")") > url.count("("):
+            trailing = last + trailing
+            url = url[:-1]
+            continue
+        break
+    return url, trailing
+
+
+def _apply_inline_markdown_html(line: str) -> str:
+    line = _BOLD_ITALIC_STAR_RE.sub(r"<b><i>\1</i></b>", line)
+    line = _BOLD_ITALIC_UNDER_RE.sub(r"<b><i>\1</i></b>", line)
+    line = _BOLD_STAR_RE.sub(r"<b>\1</b>", line)
+    line = _UNDERLINE_RE.sub(r"<u>\1</u>", line)
+    line = _STRIKE_RE.sub(r"<s>\1</s>", line)
+    line = _SPOILER_RE.sub(r"<tg-spoiler>\1</tg-spoiler>", line)
+    line = _ITALIC_STAR_RE.sub(r"<i>\1</i>", line)
+    line = _ITALIC_UNDER_RE.sub(r"<i>\1</i>", line)
+    return line
+
+
+def _protect_paired_safe_tags(
+    text: str,
+    add_placeholder: Any,
+) -> str:
+    """Protect balanced allowlisted HTML tag delimiters before escaping stray angle brackets."""
+    stack: list[tuple[str, int, int, str]] = []
+    replacements: list[tuple[int, int, str]] = []
+
+    for match in _HTML_SAFE_PAIR_TAG_RE.finditer(text):
+        is_close = bool(match.group(1))
+        tag_name = match.group(2).lower()
+        attrs = match.group(3) or ""
+        if not is_close:
+            if attrs and tag_name != "blockquote":
+                continue
+            canonical_open = (
+                "<blockquote expandable>" if attrs and tag_name == "blockquote" else f"<{tag_name}>"
+            )
+            stack.append((tag_name, match.start(), match.end(), canonical_open))
+        else:
+            if attrs:
+                continue
+            match_idx = -1
+            for idx in range(len(stack) - 1, -1, -1):
+                if stack[idx][0] == tag_name:
+                    match_idx = idx
+                    break
+            if match_idx == -1:
+                continue
+            _, open_start, open_end, canonical_open = stack[match_idx]
+            del stack[match_idx:]
+            replacements.append((open_start, open_end, canonical_open))
+            replacements.append((match.start(), match.end(), f"</{tag_name}>"))
+
+    if not replacements:
+        return text
+
+    replacements.sort(key=lambda item: item[0], reverse=True)
+    updated = text
+    for start, end, canonical in replacements:
+        token = add_placeholder(canonical)
+        updated = updated[:start] + token + updated[end:]
+    return updated
+
+
+def _render_telegram_html_segment(
+    source: str,
+    *,
+    allow_block_constructs: bool = True,
+    allow_links: bool = True,
+    allow_bare_urls: bool = True,
+) -> str:
+    placeholders: list[str] = []
+
+    def add_placeholder(snippet: str) -> str:
+        idx = len(placeholders)
+        placeholders.append(snippet)
+        return f"\x00TGPH{idx}\x00"
+
+    text = source
+
+    if allow_block_constructs:
+        def _replace_fenced_code(match: re.Match[str]) -> str:
+            lang = match.group(1).strip()
+            code_body = html.escape(match.group(2).rstrip("\n"), quote=False)
+            if lang:
+                snippet = f'<pre><code class="language-{html.escape(lang, quote=True)}">{code_body}</code></pre>'
+            else:
+                snippet = f"<pre>{code_body}</pre>"
+            return add_placeholder(snippet)
+
+        text = _FENCED_CODE_BLOCK_RE.sub(_replace_fenced_code, text)
+
+    for code_re in (_INLINE_TRIPLE_CODE_RE, _INLINE_DOUBLE_CODE_RE, _INLINE_SINGLE_CODE_RE):
+        text = code_re.sub(
+            lambda m: add_placeholder(f"<code>{html.escape(m.group(1), quote=False)}</code>"),
+            text,
+        )
+
+    def _replace_pre_html(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        inner_code = _HTML_PRE_INNER_CODE_RE.match(inner)
+        if inner_code:
+            lang_class = inner_code.group(2)
+            body = html.escape(html.unescape(inner_code.group(3)), quote=False)
+            if lang_class:
+                return add_placeholder(f'<pre><code class="{lang_class}">{body}</code></pre>')
+            return add_placeholder(f"<pre><code>{body}</code></pre>")
+        return add_placeholder(f"<pre>{html.escape(html.unescape(inner), quote=False)}</pre>")
+
+    text = _HTML_PRE_BLOCK_RE.sub(_replace_pre_html, text)
+
+    def _replace_code_html(match: re.Match[str]) -> str:
+        lang_class = match.group(2)
+        body = html.escape(html.unescape(match.group(3)), quote=False)
+        if lang_class:
+            return add_placeholder(f'<code class="{lang_class}">{body}</code>')
+        return add_placeholder(f"<code>{body}</code>")
+
+    text = _HTML_CODE_TAG_RE.sub(_replace_code_html, text)
+
+    if allow_links:
+        def _replace_html_link(match: re.Match[str]) -> str:
+            safe_href = html.escape(html.unescape(match.group(2)), quote=True)
+            label_html = _render_telegram_html_segment(
+                match.group(3),
+                allow_block_constructs=False,
+                allow_links=False,
+                allow_bare_urls=False,
+            )
+            return add_placeholder(f'<a href="{safe_href}">{label_html}</a>')
+
+        text = _HTML_LINK_TAG_RE.sub(_replace_html_link, text)
+
+    text = _protect_paired_safe_tags(text, add_placeholder)
+
+    if allow_links:
+        def _replace_md_link(match: re.Match[str]) -> str:
+            safe_href = html.escape(match.group(2), quote=True)
+            label_html = _render_telegram_html_segment(
+                match.group(1),
+                allow_block_constructs=False,
+                allow_links=False,
+                allow_bare_urls=False,
+            )
+            return add_placeholder(f'<a href="{safe_href}">{label_html}</a>')
+
+        text = _MD_LINK_RE.sub(_replace_md_link, text)
+
+    if allow_bare_urls:
+        def _replace_bare_url(match: re.Match[str]) -> str:
+            url, trailing = _split_bare_url_trailing(match.group(0))
+            if not url:
+                return match.group(0)
+            return add_placeholder(html.escape(url, quote=False)) + html.escape(trailing, quote=False)
+
+        text = _BARE_URL_RE.sub(_replace_bare_url, text)
+
+    text = html.escape(text, quote=False)
+
+    if not allow_block_constructs:
+        rendered = _apply_inline_markdown_html(text)
+    else:
+        output_lines: list[str] = []
+        lines = text.split("\n")
+        idx = 0
+        total_lines = len(lines)
+        while idx < total_lines:
+            line = lines[idx]
+            quote_match = _BLOCKQUOTE_LINE_RE.match(line)
+            if quote_match:
+                quote_lines: list[str] = []
+                while idx < total_lines:
+                    q_match = _BLOCKQUOTE_LINE_RE.match(lines[idx])
+                    if not q_match:
+                        break
+                    quote_lines.append(_apply_inline_markdown_html(q_match.group(1)))
+                    idx += 1
+                output_lines.append(f"<blockquote>{chr(10).join(quote_lines)}</blockquote>")
+                continue
+
+            if _HR_LINE_RE.match(line):
+                output_lines.append("──────────")
+                idx += 1
+                continue
+
+            heading_match = _ATX_HEADING_RE.match(line)
+            if heading_match:
+                heading_inner = re.sub(r"\s+#+$", "", heading_match.group(1)).strip()
+                heading_formatted = _apply_inline_markdown_html(heading_inner)
+                heading_formatted = re.sub(r"</?b>", "", heading_formatted)
+                output_lines.append(f"<b>{heading_formatted}</b>")
+                idx += 1
+                continue
+
+            bullet_match = _BULLET_LINE_RE.match(line)
+            if bullet_match:
+                indent = "  " if len(bullet_match.group(1).expandtabs(2)) >= 2 else ""
+                body_formatted = _apply_inline_markdown_html(bullet_match.group(2))
+                output_lines.append(f"{indent}• {body_formatted}")
+                idx += 1
+                continue
+
+            output_lines.append(_apply_inline_markdown_html(line))
+            idx += 1
+
+        rendered = "\n".join(output_lines)
+
+    while "\x00TGPH" in rendered:
+        rendered = _PLACEHOLDER_TOKEN_RE.sub(
+            lambda m: placeholders[int(m.group(1))],
+            rendered,
+        )
+    return rendered
+
+
+def format_telegram_html(text: str) -> str:
+    """Convert Markdown/mixed text into sanitized Telegram Bot API HTML within the 4096-char limit."""
+    normalized = str(text or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    bounded = _truncate_text_at_boundary(normalized, TELEGRAM_FORMAT_INPUT_MAX_LENGTH)
+    rendered = _render_telegram_html_segment(bounded)
+    if len(rendered) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        return rendered
+
+    limit = len(bounded)
+    while len(rendered) > TELEGRAM_MAX_MESSAGE_LENGTH and limit > 120:
+        next_limit = min(limit - 1, max(120, int(limit * 3900 / max(len(rendered), 1))))
+        if next_limit >= limit:
+            next_limit = limit - 50
+        limit = next_limit
+        bounded = _truncate_text_at_boundary(normalized, limit)
+        rendered = _render_telegram_html_segment(bounded)
+
+    if len(rendered) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        return rendered
+
+    plain_limit = 800
+    escaped_fallback = html.escape(_truncate_text_at_boundary(normalized, plain_limit), quote=False)
+    while len(escaped_fallback) > TELEGRAM_MAX_MESSAGE_LENGTH and plain_limit > 64:
+        plain_limit = max(64, plain_limit // 2)
+        escaped_fallback = html.escape(
+            _truncate_text_at_boundary(normalized, plain_limit), quote=False
+        )
+    return escaped_fallback
+
+
+def _is_telegram_entity_parse_error(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return (
+        "can't parse entities" in detail
+        or "can't find end of the entity" in detail
+        or "unsupported start tag" in detail
+    )
 
 
 class TelegramIntegrationError(RuntimeError):
@@ -201,6 +532,80 @@ class AiogramTelegramTransport:
                 redact_secrets(f"Telegram getMe failed: {exc}", [bot_token])
             ) from exc
 
+    @staticmethod
+    def _prepare_outgoing(text: str, parse_mode: str | None) -> tuple[str, str | None]:
+        normalized_mode = (
+            parse_mode.strip() if isinstance(parse_mode, str) and parse_mode.strip() else None
+        )
+        if normalized_mode == "HTML":
+            return format_telegram_html(text), "HTML"
+        return _truncate_text_at_boundary(str(text or ""), TELEGRAM_MAX_MESSAGE_LENGTH), normalized_mode
+
+    async def _call_bot_api_with_parse_fallback(
+        self,
+        bot_token: str,
+        method: str,
+        payload: dict[str, Any],
+        plain_text: str,
+    ) -> Any:
+        try:
+            return await self._call_bot_api(bot_token, method, payload)
+        except TelegramIntegrationError as exc:
+            if payload.get("parse_mode") and _is_telegram_entity_parse_error(exc):
+                logger.warning(
+                    "Telegram %s rejected formatted entities; retrying as plain text",
+                    method,
+                )
+                fallback_payload = dict(payload)
+                fallback_payload.pop("parse_mode", None)
+                fallback_payload["text"] = _truncate_text_at_boundary(
+                    str(plain_text or ""), TELEGRAM_MAX_MESSAGE_LENGTH
+                )
+                return await self._call_bot_api(bot_token, method, fallback_payload)
+            raise
+
+    async def _invoke_aiogram_with_parse_fallback(
+        self,
+        bot_token: str,
+        method_name: Literal["send_message", "edit_message_text"],
+        error_label: str,
+        *,
+        plain_text: str,
+        reply_markup: dict[str, Any] | None,
+        call_kwargs: dict[str, Any],
+        bot_cls: Any,
+        markup_cls: Any,
+    ) -> Any:
+        try:
+            markup_obj = (
+                markup_cls.model_validate(reply_markup)
+                if reply_markup is not None
+                else None
+            )
+            kwargs = dict(call_kwargs)
+            kwargs["reply_markup"] = markup_obj
+            async with bot_cls(token=bot_token) as bot:
+                method_fn = getattr(bot, method_name)
+                try:
+                    return await method_fn(**kwargs)
+                except Exception as exc:
+                    if kwargs.get("parse_mode") and _is_telegram_entity_parse_error(exc):
+                        logger.warning(
+                            "Telegram %s rejected formatted entities; retrying as plain text",
+                            error_label,
+                        )
+                        fallback_kwargs = dict(kwargs)
+                        fallback_kwargs.pop("parse_mode", None)
+                        fallback_kwargs["text"] = _truncate_text_at_boundary(
+                            str(plain_text or ""), TELEGRAM_MAX_MESSAGE_LENGTH
+                        )
+                        return await method_fn(**fallback_kwargs)
+                    raise
+        except Exception as exc:
+            raise TelegramIntegrationError(
+                redact_secrets(f"Telegram {error_label} failed: {exc}", [bot_token])
+            ) from exc
+
     async def send_message(
         self,
         bot_token: str,
@@ -208,40 +613,49 @@ class AiogramTelegramTransport:
         chat_id: str | int,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
     ) -> dict[str, Any]:
+        outgoing_text, resolved_mode = self._prepare_outgoing(text, parse_mode)
         try:
             from aiogram import Bot  # type: ignore[import-not-found]
             from aiogram.types import InlineKeyboardMarkup  # type: ignore[import-not-found]
         except ImportError:
-            payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+            payload: dict[str, Any] = {"chat_id": chat_id, "text": outgoing_text}
+            if resolved_mode is not None:
+                payload["parse_mode"] = resolved_mode
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
-            msg = await self._call_bot_api(bot_token, "sendMessage", payload)
+            msg = await self._call_bot_api_with_parse_fallback(
+                bot_token,
+                "sendMessage",
+                payload,
+                text,
+            )
             return {
                 "message_id": int(msg["message_id"]),
                 "chat_id": str(msg.get("chat", {}).get("id", chat_id)),
             }
 
-        try:
-            markup_obj = (
-                InlineKeyboardMarkup.model_validate(reply_markup)
-                if reply_markup is not None
-                else None
-            )
-            async with Bot(token=bot_token) as bot:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=markup_obj,
-                )
-                return {
-                    "message_id": int(sent.message_id),
-                    "chat_id": str(sent.chat.id),
-                }
-        except Exception as exc:
-            raise TelegramIntegrationError(
-                redact_secrets(f"Telegram sendMessage failed: {exc}", [bot_token])
-            ) from exc
+        call_kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": outgoing_text,
+        }
+        if resolved_mode is not None:
+            call_kwargs["parse_mode"] = resolved_mode
+        sent = await self._invoke_aiogram_with_parse_fallback(
+            bot_token,
+            "send_message",
+            "sendMessage",
+            plain_text=text,
+            reply_markup=reply_markup,
+            call_kwargs=call_kwargs,
+            bot_cls=Bot,
+            markup_cls=InlineKeyboardMarkup,
+        )
+        return {
+            "message_id": int(sent.message_id),
+            "chat_id": str(sent.chat.id),
+        }
 
     async def answer_callback_query(
         self,
@@ -279,7 +693,9 @@ class AiogramTelegramTransport:
         message_id: int,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
     ) -> dict[str, Any]:
+        outgoing_text, resolved_mode = self._prepare_outgoing(text, parse_mode)
         try:
             from aiogram import Bot  # type: ignore[import-not-found]
             from aiogram.types import InlineKeyboardMarkup  # type: ignore[import-not-found]
@@ -287,34 +703,41 @@ class AiogramTelegramTransport:
             payload: dict[str, Any] = {
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "text": text,
+                "text": outgoing_text,
             }
+            if resolved_mode is not None:
+                payload["parse_mode"] = resolved_mode
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
-            res = await self._call_bot_api(bot_token, "editMessageText", payload)
+            res = await self._call_bot_api_with_parse_fallback(
+                bot_token,
+                "editMessageText",
+                payload,
+                text,
+            )
             if isinstance(res, dict):
                 return {"message_id": int(res.get("message_id", message_id))}
             return {"message_id": message_id}
 
-        try:
-            markup_obj = (
-                InlineKeyboardMarkup.model_validate(reply_markup)
-                if reply_markup is not None
-                else None
-            )
-            async with Bot(token=bot_token) as bot:
-                res = await bot.edit_message_text(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    reply_markup=markup_obj,
-                )
-                msg_id = int(getattr(res, "message_id", message_id))
-                return {"message_id": msg_id}
-        except Exception as exc:
-            raise TelegramIntegrationError(
-                redact_secrets(f"Telegram editMessageText failed: {exc}", [bot_token])
-            ) from exc
+        call_kwargs: dict[str, Any] = {
+            "text": outgoing_text,
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        if resolved_mode is not None:
+            call_kwargs["parse_mode"] = resolved_mode
+        res = await self._invoke_aiogram_with_parse_fallback(
+            bot_token,
+            "edit_message_text",
+            "editMessageText",
+            plain_text=text,
+            reply_markup=reply_markup,
+            call_kwargs=call_kwargs,
+            bot_cls=Bot,
+            markup_cls=InlineKeyboardMarkup,
+        )
+        msg_id = int(getattr(res, "message_id", message_id))
+        return {"message_id": msg_id}
 
     async def set_webhook(
         self,
@@ -477,6 +900,9 @@ class TelegramBotService:
         public_channels: list[str] | None = None,
         register_webhook: bool = False,
         public_base_url: str = "",
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Verify token via getMe, store encrypted credentials, and optionally set webhook."""
         token = self.validate_token_format(bot_token)
@@ -530,6 +956,9 @@ class TelegramBotService:
                 "public_channels": norm_public,
                 "webhook_secret": webhook_secret,
             },
+            owner_email=owner_email,
+            visibility=visibility,
+            allowed_groups=allowed_groups,
             status="ok",
         )
 
@@ -570,6 +999,9 @@ class TelegramBotService:
         slug: str | None = None,
         display_name: str | None = None,
         sync_immediately: bool = True,
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a non-admin public channel monitor using https://t.me/s/ without MTProto."""
         clean_handle = normalize_public_channel_handle(channel_handle)
@@ -589,6 +1021,9 @@ class TelegramBotService:
                 "mode": "public_preview",
                 "public_channels": [f"@{clean_handle}"],
             },
+            owner_email=owner_email,
+            visibility=visibility,
+            allowed_groups=allowed_groups,
             status="ok",
         )
 
@@ -1085,8 +1520,8 @@ class TelegramBotService:
                 system_prompt = (
                     "You are the built-in Argo Operator Status Assistant answering an authorized operator "
                     "over Telegram. Ground every claim strictly in the provided platform_status JSON snapshot "
-                    "(never invent jobs, metrics, or secrets). Reply concisely in plain text using the "
-                    "same language as the operator's message."
+                    "(never invent jobs, metrics, or secrets). Reply concisely in Telegram-friendly Markdown "
+                    "(**bold**, `code`, short bullet lists) using the same language as the operator's message."
                 )
                 prompt_payload: dict[str, Any] = {
                     "operator_message": raw_text,
@@ -1178,16 +1613,28 @@ class TelegramBotService:
             cb_id = str(callback_query.get("id") or "")
             cb_data = str(callback_query.get("data") or "")
             actor_info = callback_query.get("from") or {}
+            bot_token = str(secrets_map.get("bot_token") or "")
+            if bool(actor_info.get("is_bot")):
+                return {"status": "ignored_bot_sender"}
             actor_name = (
                 actor_info.get("username")
                 or actor_info.get("id")
                 or "telegram_operator"
             )
             message_obj = callback_query.get("message") or {}
-            chat_id = (message_obj.get("chat") or {}).get("id") or secrets_map.get("operator_chat_id")
+            chat_id = (message_obj.get("chat") or {}).get("id")
+            configured_op_chat = str(secrets_map.get("operator_chat_id") or "").strip()
+            if not configured_op_chat or chat_id is None or str(chat_id) != configured_op_chat:
+                if cb_id and bot_token:
+                    with contextlib.suppress(Exception):
+                        await self._transport.answer_callback_query(
+                            bot_token,
+                            callback_query_id=cb_id,
+                            text="Unauthorized chat.",
+                        )
+                return {"status": "ignored_unauthorized_chat"}
             message_id = message_obj.get("message_id")
             original_text = str(message_obj.get("text") or "Argo Host Resource Guard Alert")
-            bot_token = str(secrets_map.get("bot_token") or "")
 
             if cb_data == STOP_IDLE_DESKTOPS_CALLBACK:
                 if cb_id and bot_token:
@@ -1247,17 +1694,40 @@ class TelegramBotService:
                     "approve" if cb_data.startswith("apr:ok:") else "reject"
                 )
                 approval_id = cb_data.split(":", 2)[2]
+                if self._approval_coordinator is None:
+                    if cb_id and bot_token:
+                        await self._transport.answer_callback_query(
+                            bot_token,
+                            callback_query_id=cb_id,
+                            text="Processing approval...",
+                        )
+                    return {
+                        "status": "ignored_no_coordinator",
+                        "approval_id": approval_id,
+                    }
+                try:
+                    existing_apr = self._repo.get_approval(approval_id)
+                except Exception:
+                    existing_apr = None
+                if (
+                    isinstance(existing_apr, dict)
+                    and existing_apr.get("telegram_chat_id")
+                    and str(existing_apr["telegram_chat_id"]) != str(chat_id)
+                ):
+                    if cb_id and bot_token:
+                        with contextlib.suppress(Exception):
+                            await self._transport.answer_callback_query(
+                                bot_token,
+                                callback_query_id=cb_id,
+                                text="Unauthorized chat.",
+                            )
+                    return {"status": "ignored_unauthorized_chat", "approval_id": approval_id}
                 if cb_id and bot_token:
                     await self._transport.answer_callback_query(
                         bot_token,
                         callback_query_id=cb_id,
                         text="Processing approval...",
                     )
-                if self._approval_coordinator is None:
-                    return {
-                        "status": "ignored_no_coordinator",
-                        "approval_id": approval_id,
-                    }
                 try:
                     resolved = await self._approval_coordinator.resolve_approval(
                         approval_id,
@@ -1360,7 +1830,9 @@ class TelegramBotService:
 
             msg_chat_id = (message_obj.get("chat") or {}).get("id")
             configured_op_chat = str(secrets_map.get("operator_chat_id") or "").strip()
-            if configured_op_chat and str(msg_chat_id) != configured_op_chat:
+            if not configured_op_chat or msg_chat_id is None:
+                return {"status": "ignored_no_operator_chat"}
+            if str(msg_chat_id) != configured_op_chat:
                 return {"status": "ignored_unauthorized_chat"}
 
             sender_name = (
@@ -1384,8 +1856,6 @@ class TelegramBotService:
                     if revision is not None:
                         return {"status": "revised", **revision}
 
-            if not configured_op_chat or msg_chat_id is None:
-                return {"status": "ignored_no_operator_chat"}
             if not raw_text:
                 return {"status": "accepted"}
 

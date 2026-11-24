@@ -1,0 +1,216 @@
+{{define "sign_in.html"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Sign in · Argo</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f1f5f9;
+      --card: #ffffff;
+      --border: #cbd5e1;
+      --border-soft: #e2e8f0;
+      --text: #0f172a;
+      --muted: #475569;
+      --subtle: #64748b;
+      --badge-bg: #0f172a;
+      --badge-fg: #ffffff;
+      --btn-bg: #0f172a;
+      --btn-hover: #1e293b;
+      --btn-fg: #ffffff;
+      --msg-bg: #f8fafc;
+    }
+    html.dark {
+      --bg: #0f1218;
+      --card: #161b24;
+      --border: #2a3342;
+      --border-soft: #232b38;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --subtle: #64748b;
+      --badge-bg: #f1f5f9;
+      --badge-fg: #0f172a;
+      --btn-bg: #f1f5f9;
+      --btn-hover: #e2e8f0;
+      --btn-fg: #0f172a;
+      --msg-bg: #1c2330;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 28px 26px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: var(--badge-bg);
+      color: var(--badge-fg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      flex-shrink: 0;
+    }
+    .brand-title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+    .brand-sub {
+      margin: 2px 0 0;
+      font-size: 12px;
+      color: var(--subtle);
+    }
+    .desc {
+      margin: 0 0 22px;
+      font-size: 13.5px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+    .btn {
+      width: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      height: 44px;
+      padding: 0 16px;
+      border-radius: 10px;
+      border: 1px solid var(--btn-bg);
+      background: var(--btn-bg);
+      color: var(--btn-fg);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 120ms ease;
+    }
+    .btn:hover {
+      background: var(--btn-hover);
+    }
+    .btn:focus-visible {
+      outline: 2px solid #3b72b2;
+      outline-offset: 2px;
+    }
+    .meta {
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-soft);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11.5px;
+      color: var(--subtle);
+    }
+    .theme-btn {
+      background: transparent;
+      border: 1px solid var(--border-soft);
+      color: var(--muted);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .theme-btn:hover {
+      color: var(--text);
+      border-color: var(--border);
+    }
+  </style>
+  <script>
+    (function () {
+      try {
+        var saved = window.localStorage.getItem("argo_theme");
+        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        if (saved === "dark" || (!saved && prefersDark)) {
+          document.documentElement.classList.add("dark");
+        }
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <main class="card" role="main">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">A</div>
+      <div>
+        <h1 class="brand-title">Argo</h1>
+        <p class="brand-sub">Multi-Bot Automation Workspace</p>
+      </div>
+    </div>
+
+    <p class="desc">
+      Sign in with your workspace account to access bots, Team Rooms, Approvals, Living Pages, and isolated Virtual Desktops.
+    </p>
+
+    <form method="GET" action="{{.ProxyPrefix}}/start">
+      <input type="hidden" name="rd" id="argo-rd" value="{{.Redirect}}" />
+      <button type="submit" class="btn">
+        <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="currentColor" d="M21.35 11.1h-9.18v2.98h5.27c-.23 1.48-1.69 4.35-5.27 4.35-3.17 0-5.76-2.63-5.76-5.88s2.59-5.88 5.76-5.88c1.81 0 3.02.77 3.71 1.43l2.53-2.44C16.78 4.14 14.68 3.2 12.17 3.2 7.21 3.2 3.2 7.21 3.2 12.17s4.01 8.97 8.97 8.97c5.18 0 8.61-3.64 8.61-8.77 0-.59-.06-1.04-.15-1.27z"/>
+        </svg>
+        <span>Sign in with {{.ProviderName}}</span>
+      </button>
+    </form>
+
+    <div class="meta">
+      <span>Protected by SSO</span>
+      <button type="button" class="theme-btn" id="argo-theme-toggle">Switch theme</button>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      var rdInput = document.getElementById("argo-rd");
+      if (rdInput && (!rdInput.value || rdInput.value.indexOf("/oauth2/") === 0)) {
+        rdInput.value = "/";
+      }
+      var btn = document.getElementById("argo-theme-toggle");
+      if (btn) {
+        var syncLabel = function () {
+          btn.textContent = document.documentElement.classList.contains("dark") ? "Light mode" : "Dark mode";
+        };
+        syncLabel();
+        btn.addEventListener("click", function () {
+          var isDark = document.documentElement.classList.toggle("dark");
+          try { window.localStorage.setItem("argo_theme", isDark ? "dark" : "light"); } catch (e) {}
+          syncLabel();
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
+{{end}}

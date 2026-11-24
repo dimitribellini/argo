@@ -10,7 +10,64 @@ interface RichMarkdownProps {
 const INLINE_TOKEN_RE =
   /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|\*\*[^*\n]+?\*\*|\*[^*\n]+?\*|`[^`\n]+?`|https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])/g;
 const HEADING_RE = /^(#{1,6})\s+(.+)$/;
+const HR_RE = /^\s*(?:---+|\*\*\*+|___+)\s*$/;
+const TABLE_SEP_RE = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$/;
 const isHeading = (s: string) => HEADING_RE.test(s.trim());
+const isHorizontalRule = (s: string) => HR_RE.test(s);
+
+function splitTableCells(line: string): string[] {
+  const cells: string[] = [];
+  let cur = "";
+  let inCode = false;
+  for (let idx = 0; idx < line.length; idx += 1) {
+    const ch = line[idx];
+    if (ch === "\\" && idx + 1 < line.length && line[idx + 1] === "|") {
+      cur += "|";
+      idx += 1;
+      continue;
+    }
+    if (ch === "`") {
+      inCode = !inCode;
+      cur += ch;
+      continue;
+    }
+    if (ch === "|" && !inCode) {
+      cells.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  if (cells.length > 0 && cells[0] === "" && line.trimStart().startsWith("|")) {
+    cells.shift();
+  }
+  if (cells.length > 0 && cells[cells.length - 1] === "" && line.trimEnd().endsWith("|")) {
+    cells.pop();
+  }
+  return cells;
+}
+
+function isTableStart(lines: string[], idx: number): boolean {
+  if (idx + 1 >= lines.length) return false;
+  const header = lines[idx];
+  const sep = lines[idx + 1];
+  if (!header.includes("|") || !TABLE_SEP_RE.test(sep)) return false;
+  const headerCells = splitTableCells(header);
+  const sepCells = splitTableCells(sep);
+  return headerCells.length >= 1 && sepCells.length >= 1 && headerCells.length === sepCells.length;
+}
+
+function parseTableAlignments(sepLine: string): Array<"left" | "center" | "right"> {
+  return splitTableCells(sepLine).map((cell) => {
+    const trimmed = cell.trim();
+    const startsColon = trimmed.startsWith(":");
+    const endsColon = trimmed.endsWith(":");
+    if (startsColon && endsColon) return "center";
+    if (endsColon) return "right";
+    return "left";
+  });
+}
 
 function renderInline(
   line: string,
@@ -133,7 +190,7 @@ export function RichMarkdown({ text, className = "", catalog }: RichMarkdownProp
       blocks.push(
         <pre
           key={`b-${blockKey++}`}
-          className="rounded-xl bg-slate-900 text-slate-100 p-3.5 text-xs leading-relaxed font-mono overflow-x-auto border border-slate-700"
+          className="argo-code-block rounded-xl bg-slate-900 text-slate-100 p-3.5 text-xs leading-relaxed font-mono overflow-x-auto border border-slate-700"
         >
           <code>{codeLines.join("\n")}</code>
         </pre>,
@@ -143,6 +200,83 @@ export function RichMarkdown({ text, className = "", catalog }: RichMarkdownProp
 
     if (!line.trim()) {
       i += 1;
+      continue;
+    }
+
+    // Horizontal rules (---, ***, ___)
+    if (isHorizontalRule(line)) {
+      blocks.push(<hr key={`b-${blockKey++}`} className="border-t border-slate-200 my-2" />);
+      i += 1;
+      continue;
+    }
+
+    // GFM Tables (| col | col | \n | --- | --- |)
+    if (isTableStart(lines, i)) {
+      const headers = splitTableCells(lines[i]);
+      const alignments = parseTableAlignments(lines[i + 1]);
+      i += 2;
+      const bodyRows: string[][] = [];
+      while (
+        i < lines.length &&
+        lines[i].trim() !== "" &&
+        lines[i].includes("|") &&
+        !lines[i].trimStart().startsWith("```") &&
+        !isHeading(lines[i]) &&
+        !isHorizontalRule(lines[i])
+      ) {
+        const rowCells = splitTableCells(lines[i]);
+        const normalizedRow = headers.map((_, colIdx) => rowCells[colIdx] ?? "");
+        bodyRows.push(normalizedRow);
+        i += 1;
+      }
+      const bKey = blockKey++;
+      blocks.push(
+        <div key={`b-${bKey}`} className="overflow-x-auto rounded-xl border border-slate-200 my-1.5">
+          <table className="w-full text-left border-collapse text-xs">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr>
+                {headers.map((h, colIdx) => {
+                  const align = alignments[colIdx] ?? "left";
+                  const alignCls =
+                    align === "center"
+                      ? "text-center"
+                      : align === "right"
+                        ? "text-right"
+                        : "text-left";
+                  return (
+                    <th
+                      key={colIdx}
+                      className={`px-2.5 py-2 font-semibold text-slate-900 ${alignCls}`}
+                    >
+                      {renderInline(h, `th-${bKey}-${colIdx}`, catalog)}
+                    </th>
+                  );
+                })}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200 bg-white">
+              {bodyRows.map((row, rowIdx) => (
+                <tr key={rowIdx} className="hover:bg-slate-50 transition-colors">
+                  {row.map((cell, colIdx) => {
+                    const align = alignments[colIdx] ?? "left";
+                    const alignCls =
+                      align === "center"
+                        ? "text-center"
+                        : align === "right"
+                          ? "text-right"
+                          : "text-left";
+                    return (
+                      <td key={colIdx} className={`px-2.5 py-2 text-slate-800 align-top ${alignCls}`}>
+                        {renderInline(cell, `td-${bKey}-${rowIdx}-${colIdx}`, catalog)}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
       continue;
     }
 
@@ -196,6 +330,8 @@ export function RichMarkdown({ text, className = "", catalog }: RichMarkdownProp
           items.length > 0 &&
           lines[i].trim() !== "" &&
           !isHeading(lines[i]) &&
+          !isHorizontalRule(lines[i]) &&
+          !isTableStart(lines, i) &&
           !lines[i].trimStart().startsWith("```") &&
           !isOrdered(lines[i]) &&
           (/^\s{2,}/.test(lines[i]) || /^\*\*/.test(lines[i].trimStart()))
@@ -225,13 +361,15 @@ export function RichMarkdown({ text, className = "", catalog }: RichMarkdownProp
 
     // Numbered lists
     if (isOrdered(line)) {
+      const startMatch = /^\s*(\d+)[.)]\s+/.exec(lines[i]);
+      const startNum = startMatch ? Math.max(1, Number.parseInt(startMatch[1], 10)) : 1;
       const items: string[][] = [];
       while (i < lines.length && isOrdered(lines[i])) {
         items.push([lines[i].replace(/^\s*\d+[.)]\s+/, "")]);
         i += 1;
       }
       blocks.push(
-        <ol key={`b-${blockKey++}`} className="list-decimal pl-5 space-y-1.5">
+        <ol key={`b-${blockKey++}`} start={startNum} className="list-decimal pl-5 space-y-1.5">
           {items.map((itemLines, idx) => (
             <li key={idx} className="leading-relaxed">
               {renderInline(itemLines[0], `ol-${blockKey}-${idx}`, catalog)}
@@ -249,6 +387,8 @@ export function RichMarkdown({ text, className = "", catalog }: RichMarkdownProp
       lines[i].trim() !== "" &&
       !lines[i].trimStart().startsWith("```") &&
       !isHeading(lines[i]) &&
+      !isHorizontalRule(lines[i]) &&
+      !isTableStart(lines, i) &&
       !lines[i].trimStart().startsWith("> ") &&
       !isBullet(lines[i]) &&
       !isOrdered(lines[i])

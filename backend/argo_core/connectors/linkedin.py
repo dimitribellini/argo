@@ -19,6 +19,12 @@ LINKEDIN_POSTS_URL = "https://api.linkedin.com/rest/posts"
 LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 _VERSION_RE = re.compile(r"^\d{6}$")
 _AUTHOR_URN_RE = re.compile(r"^urn:li:(person|organization):[A-Za-z0-9_-]+$")
+_LITTLE_TEXT_SPECIAL_RE = re.compile(r"([\\|{}\[\]()<>*_~])")
+
+
+def escape_linkedin_little_text(text: str) -> str:
+    """Escape LinkedIn Little Text reserved delimiters without corrupting prose, #tags, or @mentions."""
+    return _LITTLE_TEXT_SPECIAL_RE.sub(r"\\\1", text)
 
 
 class LinkedInConfigError(ValueError):
@@ -233,6 +239,9 @@ class LinkedInService:
         linkedin_version: str = DEFAULT_LINKEDIN_VERSION,
         slug: str | None = None,
         display_name: str | None = None,
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Validate version + token, store Fernet-encrypted credentials, and log activation."""
         clean_token = access_token.strip()
@@ -275,6 +284,9 @@ class LinkedInService:
                 "linkedin_version": version,
                 "endpoint": LINKEDIN_POSTS_URL,
             },
+            owner_email=owner_email,
+            visibility=visibility,
+            allowed_groups=allowed_groups,
             status="ok",
         )
 
@@ -327,9 +339,10 @@ class LinkedInService:
         if not access_token:
             raise LinkedInIntegrationError("Stored LinkedIn access_token is missing.", status_code=401)
 
+        escaped_commentary = escape_linkedin_little_text(clean_text)
         payload: dict[str, Any] = {
             "author": author_urn,
-            "commentary": clean_text,
+            "commentary": escaped_commentary,
             "visibility": visibility,
             "distribution": {
                 "feedDistribution": "MAIN_FEED",

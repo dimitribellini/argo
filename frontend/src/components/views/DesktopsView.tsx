@@ -1,37 +1,50 @@
 import { useState } from "react";
-import { Loader2, Monitor, Trash2 } from "lucide-react";
+import { Loader2, Monitor, Terminal, Trash2 } from "lucide-react";
 import type {
   DesktopBootProgress,
   DesktopInfo,
   DesktopLaunchQueueItem,
   HostTelemetry,
+  SandboxInfo,
 } from "../../types";
 import { DesktopScreenPreview } from "../DesktopScreenPreview";
+import { formatVisibilityLabel, visibilityBadgeClasses } from "../VisibilityPicker";
 
 interface DesktopsViewProps {
+  principal?: import("../../types").SsoPrincipal | null;
   host: HostTelemetry | null;
   desktops: DesktopInfo[];
+  sandboxes?: SandboxInfo[];
   queuedLaunches: DesktopLaunchQueueItem[];
   togglingDesktops?: Record<string, boolean>;
+  togglingSandboxes?: Record<string, boolean>;
   desktopBootBySlug?: Record<string, DesktopBootProgress>;
   onToggleDesktop: (slug: string) => void;
+  onToggleSandbox?: (slug: string) => void;
   onStopAllDesktops: () => Promise<void>;
+  onStopAllSandboxes?: () => Promise<void>;
   onOpenSelkies: (desktop: DesktopInfo) => void;
   onDeleteBot?: (slug: string) => Promise<void>;
 }
 
 export function DesktopsView({
+  principal = null,
   host,
   desktops,
+  sandboxes = [],
   queuedLaunches,
   togglingDesktops = {},
+  togglingSandboxes = {},
   desktopBootBySlug = {},
   onToggleDesktop,
+  onToggleSandbox,
   onStopAllDesktops,
+  onStopAllSandboxes,
   onOpenSelkies,
   onDeleteBot,
 }: DesktopsViewProps) {
   const [stoppingAll, setStoppingAll] = useState(false);
+  const [stoppingAllSandboxes, setStoppingAllSandboxes] = useState(false);
   const [confirmDeleteSlug, setConfirmDeleteSlug] = useState<string | null>(null);
   const [deletingSlug, setDeletingSlug] = useState<string | null>(null);
 
@@ -40,6 +53,22 @@ export function DesktopsView({
   const diskPct = host?.disk_percent ?? 0;
   const totalGb = host?.ram_total_gb ?? 0;
   const anyRunning = desktops.some((d) => d.desktop_state === "running");
+  const anySandboxRunning = sandboxes.some((s) => s.sandbox_state === "running");
+  const isMultiUser = Boolean(principal?.multi_user);
+  const isAdmin = Boolean(principal?.is_admin);
+  const callerEmail = (principal?.email || "").toLowerCase();
+  const canManage = (owner?: string) =>
+    !isMultiUser || isAdmin || !owner || owner.toLowerCase() === callerEmail;
+  const isOwnedByCaller = (owner?: string) =>
+    Boolean(callerEmail) && (!owner || owner.toLowerCase() === callerEmail);
+  const myRunningDesktops = isMultiUser
+    ? desktops.filter((d) => d.desktop_state === "running" && isOwnedByCaller(d.owner_email)).length
+    : desktops.filter((d) => d.desktop_state === "running").length;
+  const myRunningSandboxes = isMultiUser
+    ? sandboxes.filter((s) => s.sandbox_state === "running" && isOwnedByCaller(s.owner_email)).length
+    : sandboxes.filter((s) => s.sandbox_state === "running").length;
+  const maxDesktopsPerUser = principal?.max_active_desktops_per_user ?? 2;
+  const maxSandboxesPerUser = principal?.max_active_sandboxes_per_user ?? 4;
 
   const handleStopAll = async () => {
     setStoppingAll(true);
@@ -47,6 +76,16 @@ export function DesktopsView({
       await onStopAllDesktops();
     } finally {
       setStoppingAll(false);
+    }
+  };
+
+  const handleStopAllSandboxes = async () => {
+    if (!onStopAllSandboxes) return;
+    setStoppingAllSandboxes(true);
+    try {
+      await onStopAllSandboxes();
+    } finally {
+      setStoppingAllSandboxes(false);
     }
   };
 
@@ -76,7 +115,25 @@ export function DesktopsView({
                   onClick={() => void handleStopAll()}
                   className="px-2.5 py-1 rounded-xl border border-slate-200 bg-white text-[11px] font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                 >
-                  {stoppingAll ? "Putting to sleep..." : "Sleep All Desktops"}
+                  {stoppingAll
+                    ? "Putting to sleep..."
+                    : !principal?.multi_user || principal?.is_admin
+                      ? "Sleep All Desktops"
+                      : "Sleep My Desktops"}
+                </button>
+              )}
+              {anySandboxRunning && onStopAllSandboxes && (
+                <button
+                  type="button"
+                  disabled={stoppingAllSandboxes}
+                  onClick={() => void handleStopAllSandboxes()}
+                  className="px-2.5 py-1 rounded-xl border border-slate-200 bg-white text-[11px] font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                >
+                  {stoppingAllSandboxes
+                    ? "Stopping..."
+                    : !principal?.multi_user || principal?.is_admin
+                      ? "Sleep All Sandboxes"
+                      : "Stop My Sandboxes"}
                 </button>
               )}
             </div>
@@ -134,6 +191,17 @@ export function DesktopsView({
               </div>
             </div>
           </div>
+
+          {isMultiUser && (
+            <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-2 text-[11px]">
+              <span className="px-2.5 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-slate-700 font-medium">
+                My Active Desktops: {myRunningDesktops} / {maxDesktopsPerUser}
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-slate-700 font-medium">
+                My Active Sandboxes: {myRunningSandboxes} / {maxSandboxesPerUser}
+              </span>
+            </div>
+          )}
         </div>
 
         {(host?.ram_startup_gate_blocked || queuedLaunches.length > 0) && (
@@ -151,13 +219,15 @@ export function DesktopsView({
           </div>
         )}
 
-        {desktops.length === 0 ? (
+        {desktops.length === 0 && sandboxes.length === 0 ? (
           <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center text-xs text-slate-500">
-            No bots need a virtual desktop yet. Most bots use fast direct API connections.
+            No bots need a virtual desktop or script sandbox yet. Most bots use fast direct API connections.
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {desktops.map((desktop) => {
+          <>
+            {desktops.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {desktops.map((desktop) => {
               const running = desktop.desktop_state === "running";
               const toggling = Boolean(togglingDesktops[desktop.bot_slug]);
               const bootProgress = desktopBootBySlug[desktop.bot_slug] ?? null;
@@ -176,6 +246,22 @@ export function DesktopsView({
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                      {isMultiUser && (
+                        <>
+                          {desktop.owner_email && (
+                            <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-[10px] text-slate-600">
+                              {desktop.owner_email}
+                            </span>
+                          )}
+                          <span
+                            className={`px-2 py-0.5 rounded-full border text-[10px] font-medium ${visibilityBadgeClasses(
+                              desktop.visibility,
+                            )}`}
+                          >
+                            {formatVisibilityLabel(desktop.visibility, desktop.allowed_groups)}
+                          </span>
+                        </>
+                      )}
                       {desktop.awaiting_takeover && (
                         <span className="px-2 py-0.5 rounded-full border border-rose-300 text-rose-700 bg-rose-50 text-[10px] font-semibold">
                           Sign-In Needed
@@ -263,6 +349,7 @@ export function DesktopsView({
                       </span>
                     </button>
                     {onDeleteBot &&
+                      canManage(desktop.owner_email) &&
                       (confirmDeleteSlug === desktop.bot_slug ? (
                         <div className="ml-auto inline-flex items-center gap-1.5">
                           <button
@@ -310,7 +397,158 @@ export function DesktopsView({
                 </div>
               );
             })}
-          </div>
+              </div>
+            )}
+
+            {sandboxes.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <div>
+                    <h3 className="text-xs font-semibold text-slate-900">
+                      Script Sandboxes (Fedora 45 CLI · 512 MB cap)
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Lightweight isolated bash &amp; Python 3 containers with persistent /workspace volumes
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {sandboxes.map((sandbox) => {
+                    const running = sandbox.sandbox_state === "running";
+                    const toggling = Boolean(togglingSandboxes[sandbox.bot_slug]);
+                    const idleSeconds = sandbox.idle_seconds ?? 0;
+                    const idleTimeout = sandbox.idle_timeout_seconds ?? 300;
+                    return (
+                      <div
+                        key={sandbox.bot_slug}
+                        className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs space-y-3"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                              <Terminal className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>{sandbox.bot_name}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              Headless Fedora 45 CLI · {sandbox.ram_limit_mb} MB cap · /workspace persisted
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                            {isMultiUser && (
+                              <>
+                                {sandbox.owner_email && (
+                                  <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-[10px] text-slate-600">
+                                    {sandbox.owner_email}
+                                  </span>
+                                )}
+                                <span
+                                  className={`px-2 py-0.5 rounded-full border text-[10px] font-medium ${visibilityBadgeClasses(
+                                    sandbox.visibility,
+                                  )}`}
+                                >
+                                  {formatVisibilityLabel(sandbox.visibility, sandbox.allowed_groups)}
+                                </span>
+                              </>
+                            )}
+                            <span
+                              className={`px-2 py-0.5 rounded-full border text-[11px] font-medium ${
+                                running
+                                  ? "border-emerald-300 text-emerald-700 bg-emerald-50"
+                                  : "border-slate-200 text-slate-600 bg-slate-50"
+                              }`}
+                            >
+                              {running ? "Running" : "Sleeping (Saved)"}
+                            </span>
+                          </div>
+                        </div>
+
+                        <p className="text-xs text-slate-500">{sandbox.role}</p>
+
+                        <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 text-[11px] text-slate-600 flex justify-between gap-2">
+                          <span>
+                            Memory:{" "}
+                            {running
+                              ? `${sandbox.ram_mb} MB / ${sandbox.ram_limit_mb} MB`
+                              : "0 MB (/workspace saved)"}
+                          </span>
+                          <span>
+                            Auto-sleep: {Math.round(idleSeconds)}s / {Math.round(idleTimeout)}s
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-1 flex-wrap">
+                          {onToggleSandbox && (
+                            <button
+                              type="button"
+                              disabled={toggling || deletingSlug === sandbox.bot_slug}
+                              onClick={() => onToggleSandbox(sandbox.bot_slug)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-medium text-slate-900 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                            >
+                              {toggling && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                              <span>
+                                {toggling
+                                  ? running
+                                    ? "Stopping..."
+                                    : "Starting..."
+                                  : running
+                                    ? "Put to Sleep"
+                                    : "Start Sandbox"}
+                              </span>
+                            </button>
+                          )}
+                          {onDeleteBot &&
+                            canManage(sandbox.owner_email) &&
+                            (confirmDeleteSlug === sandbox.bot_slug ? (
+                              <div className="ml-auto inline-flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={deletingSlug === sandbox.bot_slug}
+                                  onClick={async () => {
+                                    setDeletingSlug(sandbox.bot_slug);
+                                    try {
+                                      await onDeleteBot(sandbox.bot_slug);
+                                      setConfirmDeleteSlug(null);
+                                    } finally {
+                                      setDeletingSlug(null);
+                                    }
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-medium disabled:opacity-50 cursor-pointer"
+                                >
+                                  {deletingSlug === sandbox.bot_slug && (
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                  )}
+                                  <span>
+                                    {deletingSlug === sandbox.bot_slug ? "Deleting..." : "Confirm Delete"}
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={deletingSlug === sandbox.bot_slug}
+                                  onClick={() => setConfirmDeleteSlug(null)}
+                                  className="px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-xs text-slate-600 hover:bg-slate-50 cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={deletingSlug === sandbox.bot_slug}
+                                onClick={() => setConfirmDeleteSlug(sandbox.bot_slug)}
+                                className="ml-auto inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-rose-200 bg-white text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Delete Bot</span>
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

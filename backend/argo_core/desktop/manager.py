@@ -24,6 +24,8 @@ from argo_core.desktop.mcp_bridge import (
     DESKTOP_MCP_PORT,
     _DESKTOP_AGENT_SCRIPT,
 )
+from argo_core.docker_mounts import resolve_host_bind_path
+from argo_core.security.tenancy import normalize_email, normalize_visibility
 
 if TYPE_CHECKING:
     from argo_core.bus.valkey_bus import EventBus
@@ -37,15 +39,71 @@ DESKTOP_NETWORK = "argo-net"
 DESKTOP_MEM_LIMIT = "2g"
 DESKTOP_NANO_CPUS = 1_500_000_000
 DESKTOP_SHM_SIZE = "1g"
+DESKTOP_PIDS_LIMIT = 512
 SELKIES_HTTP_PORT = 3000
 SELKIES_HTTPS_PORT = 3001
 CDP_PORT = 9222
 MCP_PORT = DESKTOP_MCP_PORT
 DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 
+_DESKTOP_EXTRA_ISOLATION_HOSTS: dict[str, str] = {
+    "argo-core": "127.0.0.1",
+    "valkey": "127.0.0.1",
+    "oauth2-proxy": "127.0.0.1",
+    "host.docker.internal": "127.0.0.1",
+    "metadata.google.internal": "127.0.0.1",
+}
+
 _DESKTOP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _FORBIDDEN_IMAGE_TOKENS = ("ubuntu", "debian", "fedora:41", "fedora:43")
 _LEGACY_VNC_PATH_TOKENS = ("vnc", "novnc", "rfb", "5900", "6080")
+_HEAD_OPEN_TAG_RE = re.compile(rb"(<head\b[^>]*>)", re.IGNORECASE)
+_SELKIES_IFRAME_SHIM_BYTES = (
+    b'<script data-argo-selkies-shim="1">'
+    b"(function(){if(window.self===window.top)return;"
+    b"try{var topW=(window.top&&window.top.innerWidth)||window.innerWidth;"
+    b"if(topW<768&&window.devicePixelRatio>1){"
+    b'Object.defineProperty(window,"devicePixelRatio",{get:function(){return 1;},configurable:true});'
+    b"}}catch(_){}"
+    b"try{delete Window.prototype.onpointerrawupdate;}catch(_){}"
+    b"try{delete window.onpointerrawupdate;}catch(_){}"
+    b'window.addEventListener("pointerrawupdate",function(e){'
+    b"if(!document.pointerLockElement){e.stopImmediatePropagation();}"
+    b"},true);})();</script>"
+)
+
+
+def _maybe_inject_selkies_iframe_shim(
+    clean_sub: str,
+    status_code: int,
+    content_type: str,
+    body: bytes,
+    resp_headers: dict[str, str],
+) -> tuple[bytes, dict[str, str]]:
+    """Disable raw iframe pointerrawupdate fallback inside embedded HTML so hover aligns with clicks."""
+    if (
+        status_code != 200
+        or clean_sub not in {"", "index.html"}
+        or "text/html" not in (content_type or "").lower()
+        or b'data-argo-selkies-shim="1"' in body
+    ):
+        return body, resp_headers
+
+    if _HEAD_OPEN_TAG_RE.search(body):
+        patched = _HEAD_OPEN_TAG_RE.sub(
+            lambda match: match.group(1) + _SELKIES_IFRAME_SHIM_BYTES,
+            body,
+            count=1,
+        )
+    else:
+        patched = _SELKIES_IFRAME_SHIM_BYTES + body
+
+    cleaned_headers = {
+        k: v for k, v in resp_headers.items() if k.lower() != "etag"
+    }
+    if not any(k.lower() == "cache-control" for k in cleaned_headers):
+        cleaned_headers["Cache-Control"] = "no-cache"
+    return patched, cleaned_headers
 
 
 class DesktopConfigError(ValueError):
@@ -70,6 +128,7 @@ class DesktopRuntimeError(RuntimeError):
 
 _CDP_PROXY_SCRIPT = '''"""Lightweight internal CDP :9222 -> 127.0.0.1:19222 Host-rewriting proxy."""
 import asyncio
+import hmac
 import os
 import re
 
@@ -77,9 +136,12 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(os.environ.get("ARGO_CDP_LISTEN_PORT", "9222"))
 TARGET_HOST = "127.0.0.1"
 TARGET_PORT = int(os.environ.get("ARGO_CDP_TARGET_PORT", "19222"))
+AGENT_TOKEN = os.environ.get("ARGO_DESKTOP_AGENT_TOKEN", "").strip()
 _HOST_HEADER_RE = re.compile(rb"(?im)^host:\\s*([^\\r\\n]+)\\r?\\n")
 _CL_HEADER_RE = re.compile(rb"(?im)^content-length:\\s*(\\d+)\\r?\\n")
 _TE_HEADER_RE = re.compile(rb"(?im)^transfer-encoding:\\s*[^\\r\\n]+\\r?\\n")
+_TOKEN_HEADER_RE = re.compile(rb"(?im)^x-argo-desktop-token:\\s*([^\\r\\n]+)\\r?\\n")
+_BEARER_HEADER_RE = re.compile(rb"(?im)^authorization:\\s*bearer\\s+([^\\r\\n]+)\\r?\\n")
 
 
 async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -124,6 +186,34 @@ async def _handle_client(client_reader: asyncio.StreamReader, client_writer: asy
     try:
         raw_head = await asyncio.wait_for(client_reader.readuntil(b"\\r\\n\\r\\n"), timeout=15.0)
     except Exception:
+        client_writer.close()
+        return
+
+    peer_info = client_writer.get_extra_info("peername")
+    peer_ip = str(peer_info[0]) if isinstance(peer_info, (tuple, list)) and peer_info else ""
+    configured_tok = os.environ.get("ARGO_DESKTOP_AGENT_TOKEN", AGENT_TOKEN).strip()
+    is_loopback = peer_ip in ("127.0.0.1", "::1")
+    if configured_tok:
+        tok_match = _TOKEN_HEADER_RE.search(raw_head)
+        presented = tok_match.group(1).strip().decode("latin1") if tok_match else ""
+        if not presented:
+            bearer_match = _BEARER_HEADER_RE.search(raw_head)
+            presented = bearer_match.group(1).strip().decode("latin1") if bearer_match else ""
+        authorized = bool(
+            presented
+            and hmac.compare_digest(presented.encode("utf-8"), configured_tok.encode("utf-8"))
+        )
+    else:
+        authorized = is_loopback
+
+    if not authorized:
+        try:
+            client_writer.write(
+                b"HTTP/1.1 401 Unauthorized\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n"
+            )
+            await client_writer.drain()
+        except Exception:
+            pass
         client_writer.close()
         return
 
@@ -273,8 +363,20 @@ if [ "$NEED_AGENT_START" = "1" ] && [ -f /config/.argo-desktop-agent.py ]; then
   echo $! > /config/.argo-agent.pid
 fi
 
-if ! is_port_open 9222 && [ -f /config/.argo-cdp-proxy.py ]; then
+if [ "$NEED_AGENT_START" = "1" ] && [ -f /config/.argo-cdp-proxy.py ]; then
+  if [ -f /config/.argo-cdp-proxy.pid ]; then
+    OLD_CDP_PID=$(cat /config/.argo-cdp-proxy.pid 2>/dev/null || true)
+    if [ -n "$OLD_CDP_PID" ]; then
+      kill "$OLD_CDP_PID" >/dev/null 2>&1 || true
+    fi
+  fi
+  pkill -f "/config/.argo-cdp-proxy.py" >/dev/null 2>&1 || true
+  sleep 0.2
+fi
+
+if { [ "$NEED_AGENT_START" = "1" ] || ! is_port_open 9222; } && [ -f /config/.argo-cdp-proxy.py ]; then
   nohup python3 /config/.argo-cdp-proxy.py >> /config/.argo-cdp-proxy.log 2>&1 &
+  echo $! > /config/.argo-cdp-proxy.pid
 fi
 
 DETECTED_DISPLAY="${DISPLAY:-}"
@@ -301,7 +403,8 @@ fi
 
 # Apply clean Chromium flags so manual or bot launches suppress --no-sandbox warnings & restore bubbles
 CHROME_FLAGS="--no-sandbox --test-type --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-infobars --password-store=basic --user-data-dir=/config/.config/argo-chromium --remote-debugging-port=19222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=*"
-printf '%s\n' $CHROME_FLAGS > /config/.config/chromium-flags.conf 2>/dev/null || true
+HOST_RULES='--host-resolver-rules=MAP argo-core 127.0.0.1, MAP valkey 127.0.0.1, MAP oauth2-proxy 127.0.0.1, MAP metadata.google.internal 127.0.0.1'
+{ printf '%s\n' $CHROME_FLAGS; printf '%s\n' "$HOST_RULES"; } > /config/.config/chromium-flags.conf 2>/dev/null || true
 if [ -d /etc/chromium ] && command -v sudo >/dev/null 2>&1; then
   sudo -n sh -c "printf 'CHROMIUM_FLAGS=\"%s\"\n' '$CHROME_FLAGS' > /etc/chromium/chromium.conf" >/dev/null 2>&1 || true
 fi
@@ -467,6 +570,7 @@ class DesktopRuntimeSpec:
     nano_cpus: int
     shm_size: str
     environment: dict[str, str]
+    pids_limit: int = DESKTOP_PIDS_LIMIT
 
 
 class DockerDriver(Protocol):
@@ -655,10 +759,19 @@ class DockerSdkDriver:
             if container is not None and isinstance(getattr(container, "attrs", None), dict):
                 attrs = container.attrs
                 env_list = list((attrs.get("Config") or {}).get("Env") or [])
-                sec_opts = list((attrs.get("HostConfig") or {}).get("SecurityOpt") or [])
+                host_cfg = attrs.get("HostConfig") or {}
+                sec_opts = list(host_cfg.get("SecurityOpt") or [])
                 has_subfolder = expected_subfolder in env_list
                 has_seccomp = any("seccomp=unconfined" in str(opt) for opt in sec_opts)
-                if not (has_subfolder and has_seccomp):
+                extra_hosts_ok = (
+                    True
+                    if "ExtraHosts" not in host_cfg
+                    else all(
+                        f"{host}:{ip}" in (host_cfg.get("ExtraHosts") or [])
+                        for host, ip in _DESKTOP_EXTRA_ISOLATION_HOSTS.items()
+                    )
+                )
+                if not (has_subfolder and has_seccomp and extra_hosts_ok):
                     with contextlib.suppress(Exception):
                         container.stop(timeout=5)
                     container.remove(force=True)
@@ -679,6 +792,7 @@ class DockerSdkDriver:
                             raise
                 if progress_cb:
                     progress_cb(f"Creating isolated Fedora XFCE container ({spec.container_name})...")
+                host_bind_path = resolve_host_bind_path(client, spec.host_volume_path)
                 # Ports stay unbound on host: traffic routes strictly over internal argo-net.
                 container = client.containers.run(
                     spec.image,
@@ -687,9 +801,11 @@ class DockerSdkDriver:
                     mem_limit=spec.mem_limit,
                     nano_cpus=spec.nano_cpus,
                     shm_size=spec.shm_size,
+                    pids_limit=spec.pids_limit,
+                    extra_hosts=dict(_DESKTOP_EXTRA_ISOLATION_HOSTS),
                     network=target_network,
                     security_opt=["seccomp=unconfined"],
-                    volumes={spec.host_volume_path: {"bind": "/config", "mode": "rw"}},
+                    volumes={host_bind_path: {"bind": "/config", "mode": "rw"}},
                     environment=spec.environment,
                     labels={
                         "argo.managed": "true",
@@ -849,6 +965,8 @@ class DesktopManager:
         driver: DockerDriver | None = None,
         selkies_proxy_transport: SelkiesProxyTransport | None = None,
         clock: Callable[[], float] | None = None,
+        multi_user: bool = False,
+        max_active_desktops_per_user: int = 2,
     ) -> None:
         self._repo = repo
         self._bus = bus
@@ -862,6 +980,8 @@ class DesktopManager:
         self._driver: DockerDriver = driver or _auto_select_driver()
         self._selkies_proxy_transport = selkies_proxy_transport
         self._clock = clock or time.monotonic
+        self._multi_user = bool(multi_user)
+        self._max_active_desktops_per_user = max(0, int(max_active_desktops_per_user))
 
         self._last_activity_at: dict[str, float] = {}
         self._takeover_active: set[str] = set()
@@ -920,6 +1040,11 @@ class DesktopManager:
                 correlation_id=correlation_id or "",
             )
 
+    def agent_token_for(self, slug: str) -> str:
+        """Derive a per-desktop scoped HMAC token for :9222 / :9223 auth."""
+        clean_slug = validate_desktop_slug(slug)
+        return self._repo._vault.derive_scoped_token(f"desktop-agent:{clean_slug}")
+
     def build_runtime_spec(self, bot: dict[str, Any]) -> DesktopRuntimeSpec:
         """Build an isolated 1-bot-1-container Selkies desktop spec."""
         clean_slug = validate_desktop_slug(str(bot["slug"]))
@@ -942,9 +1067,14 @@ class DesktopManager:
                 "CUSTOM_PORT": str(SELKIES_HTTP_PORT),
                 "CUSTOM_HTTPS_PORT": str(SELKIES_HTTPS_PORT),
                 "SUBFOLDER": f"/api/desktops/{clean_slug}/selkies/",
+                "SELKIES_USE_CSS_SCALING": "true",
+                "SELKIES_SCALING_DPI": "96",
+                "ARGO_DESKTOP_AGENT_TOKEN": self.agent_token_for(clean_slug),
                 "CHROME_CLI": (
-                    f"--remote-debugging-port={CDP_PORT} "
-                    "--remote-debugging-address=0.0.0.0 --no-first-run"
+                    "--remote-debugging-port=19222 --remote-debugging-address=127.0.0.1 "
+                    "--user-data-dir=/config/.config/argo-chromium --no-first-run "
+                    '--host-resolver-rules="MAP argo-core 127.0.0.1, MAP valkey 127.0.0.1, '
+                    'MAP oauth2-proxy 127.0.0.1, MAP metadata.google.internal 127.0.0.1"'
                 ),
             },
         )
@@ -953,6 +1083,40 @@ class DesktopManager:
         """Reset idle hibernation timer after browser tool use or Selkies interaction."""
         clean_slug = validate_desktop_slug(slug)
         self._last_activity_at[clean_slug] = self._clock()
+
+    def _enforce_user_desktop_quota(self, bot: dict[str, Any]) -> None:
+        """Enforce per-user active Virtual Desktop quota in opt-in multi-user mode."""
+        if not self._multi_user:
+            return
+        if bot.get("desktop_state") == "running":
+            return
+        owner = normalize_email(bot.get("owner_email"))
+        if not owner:
+            return
+        user_rec = self._repo.get_user(owner) if hasattr(self._repo, "get_user") else None
+        raw_override = user_rec.get("max_active_desktops") if isinstance(user_rec, dict) else None
+        if raw_override is not None:
+            effective_cap = max(0, int(raw_override))
+        else:
+            effective_cap = self._max_active_desktops_per_user
+            if effective_cap <= 0:
+                return
+        active_for_owner = [
+            b
+            for b in self._repo.list_bots()
+            if b.get("runtime") == "desktop"
+            and b.get("desktop_state") == "running"
+            and normalize_email(b.get("owner_email")) == owner
+        ]
+        if len(active_for_owner) >= effective_cap:
+            telemetry = self._guard.sample()
+            raise DesktopStartupBlockedError(
+                (
+                    f"User '{owner}' reached the active Virtual Desktop quota "
+                    f"({effective_cap} active)."
+                ),
+                ram_percent=telemetry.ram_percent,
+            )
 
     def _enqueue_launch(self, slug: str, *, reason: str, ram_percent: float) -> None:
         for existing in self._queued_launches:
@@ -1004,7 +1168,13 @@ class DesktopManager:
                 f"Desktop container '{spec.container_name}' is busy with another transition."
             )
 
-        progress_state = "desktop_boot" if reason in ("manual", "operator_takeover") else "working"
+        is_bot_run = bool(correlation_id) and reason not in (
+            "manual",
+            "operator_takeover",
+            "selkies_ws",
+            "selkies_http",
+        )
+        progress_state = "working" if is_bot_run else "desktop_boot"
 
         try:
             driver_status = await self._driver.inspect_status(spec.container_name)
@@ -1021,6 +1191,7 @@ class DesktopManager:
                 correlation_id=correlation_id,
             )
 
+            self._enforce_user_desktop_quota(bot)
             allowed, telemetry = self._guard.can_start_desktop()
             if not allowed:
                 if queue_if_blocked:
@@ -1231,11 +1402,19 @@ class DesktopManager:
         *,
         reason: str = "manual",
         idle_only: bool = False,
+        owner_email: str | None = None,
     ) -> list[str]:
-        """Stop all running desktop containers (or only non-takeover desktops when idle_only)."""
+        """Stop all running desktop containers (optionally scoped to owner_email in multi-user mode)."""
+        norm_owner: str | None = None
+        if owner_email is not None and self._multi_user:
+            norm_owner = normalize_email(owner_email)
+            if not norm_owner:
+                return []
         stopped: list[str] = []
         for bot in self._repo.list_bots():
             if bot["runtime"] != "desktop" or bot["desktop_state"] != "running":
+                continue
+            if norm_owner is not None and normalize_email(bot.get("owner_email")) != norm_owner:
                 continue
             slug = bot["slug"]
             if idle_only and slug in self._takeover_active:
@@ -1244,12 +1423,19 @@ class DesktopManager:
             stopped.append(slug)
         return stopped
 
-    async def sweep_idle_desktops(self) -> list[str]:
+    async def sweep_idle_desktops(self, *, owner_email: str | None = None) -> list[str]:
         """Auto-hibernate any desktop exceeding idle_timeout_seconds outside active takeover."""
+        norm_owner: str | None = None
+        if owner_email is not None and self._multi_user:
+            norm_owner = normalize_email(owner_email)
+            if not norm_owner:
+                return []
         now = self._clock()
         hibernated: list[str] = []
         for bot in self._repo.list_bots():
             if bot["runtime"] != "desktop" or bot["desktop_state"] != "running":
+                continue
+            if norm_owner is not None and normalize_email(bot.get("owner_email")) != norm_owner:
                 continue
             slug = bot["slug"]
             if slug in self._takeover_active:
@@ -1272,8 +1458,14 @@ class DesktopManager:
             except Exception as exc:
                 logger.warning("Desktop idle sweep error: %s", exc)
 
-    def _desktop_item_payload(self, item: dict[str, Any]) -> dict[str, Any]:
+    def _desktop_item_payload(
+        self,
+        item: dict[str, Any],
+        *,
+        bot_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         slug = item["bot_slug"]
+        bot_info = bot_meta or {}
         last_seen = self._last_activity_at.get(slug)
         idle_seconds = (
             max(0, int(self._clock() - last_seen))
@@ -1282,8 +1474,16 @@ class DesktopManager:
         )
         awaiting_info = self._awaiting_takeover.get(slug)
         shot_entry = self._latest_screenshots.get(slug)
+        owner_val = str(item.get("owner_email") or bot_info.get("owner_email") or "")
+        vis_raw = item.get("visibility") or bot_info.get("visibility")
+        vis_val = normalize_visibility(str(vis_raw) if vis_raw else None, default="shared")
+        raw_groups = item.get("allowed_groups") if "allowed_groups" in item else bot_info.get("allowed_groups")
+        allowed_groups = list(raw_groups or []) if vis_val == "team" else []
         return {
             **item,
+            "owner_email": owner_val,
+            "visibility": vis_val,
+            "allowed_groups": allowed_groups,
             "image": DESKTOP_IMAGE,
             "volume_path": str(self._volumes_root / slug),
             "selkies_url": f"/api/desktops/{slug}/selkies/",
@@ -1299,7 +1499,11 @@ class DesktopManager:
             "takeover_reason": awaiting_info["reason"] if awaiting_info else None,
         }
 
-    def list_desktops_status(self) -> dict[str, Any]:
+    def list_desktops_status(
+        self,
+        *,
+        allowed_bot_slugs: set[str] | None = None,
+    ) -> dict[str, Any]:
         """Return host telemetry, enriched desktop status cards, and RAM-gated queue."""
         desktops = self._repo.list_desktops()
         if isinstance(self._driver, DockerSdkDriver):
@@ -1314,11 +1518,20 @@ class DesktopManager:
                             synced = True
             if synced:
                 desktops = self._repo.list_desktops()
-        base_desktops = [self._desktop_item_payload(d) for d in desktops]
+        bots_by_slug = {b["slug"]: b for b in self._repo.list_bots()}
+        if allowed_bot_slugs is not None:
+            desktops = [d for d in desktops if str(d.get("bot_slug") or "") in allowed_bot_slugs]
+        base_desktops = [
+            self._desktop_item_payload(d, bot_meta=bots_by_slug.get(str(d.get("bot_slug") or "")))
+            for d in desktops
+        ]
+        queued = list(self._queued_launches)
+        if allowed_bot_slugs is not None:
+            queued = [q for q in queued if str(q.get("bot_slug") or "") in allowed_bot_slugs]
         return {
             "host": self._guard.sample().to_dict(),
             "desktops": base_desktops,
-            "queued_launches": list(self._queued_launches),
+            "queued_launches": queued,
         }
 
     async def start_takeover(self, slug: str, *, actor: str) -> dict[str, Any]:
@@ -1400,6 +1613,11 @@ class DesktopManager:
         if bot["runtime"] != "desktop":
             raise DesktopConfigError(f"Bot '{clean_slug}' does not use a desktop container.")
 
+        clean_sub = subpath.lstrip("/")
+        subfolder_prefix = f"/api/desktops/{clean_slug}/selkies"
+        if clean_sub.startswith(subfolder_prefix.lstrip("/") + "/"):
+            clean_sub = clean_sub[len(subfolder_prefix.lstrip("/") + "/") :]
+
         if self._selkies_proxy_transport is not None:
             if bot["desktop_state"] != "running":
                 raise DesktopStateError(
@@ -1409,7 +1627,10 @@ class DesktopManager:
             status_code, media_type, content = await self._selkies_proxy_transport(
                 clean_slug, subpath, query_string
             )
-            return status_code, media_type, content, {}
+            patched_body, patched_headers = _maybe_inject_selkies_iframe_shim(
+                clean_sub, status_code, media_type, content, {}
+            )
+            return status_code, media_type, patched_body, patched_headers
 
         if isinstance(self._driver, DockerSdkDriver):
             driver_status = await self._driver.inspect_status(f"argo-desktop-{clean_slug}")
@@ -1419,11 +1640,6 @@ class DesktopManager:
             self.touch_activity(clean_slug)
             import aiohttp  # type: ignore[import-not-found]
 
-            clean_sub = subpath.lstrip("/")
-            subfolder_prefix = f"/api/desktops/{clean_slug}/selkies"
-            if clean_sub.startswith(subfolder_prefix.lstrip("/") + "/"):
-                clean_sub = clean_sub[len(subfolder_prefix.lstrip("/") + "/") :]
-
             base_host = f"http://argo-desktop-{clean_slug}:{SELKIES_HTTP_PORT}"
             primary_url = f"{base_host}{subfolder_prefix}/{clean_sub}"
             fallback_url = f"{base_host}/{clean_sub}"
@@ -1431,11 +1647,42 @@ class DesktopManager:
                 primary_url = f"{primary_url}?{query_string}"
                 fallback_url = f"{fallback_url}?{query_string}"
 
+            allowed_req_headers = {
+                "accept",
+                "accept-language",
+                "content-type",
+                "range",
+                "origin",
+                "referer",
+                "user-agent",
+            }
+            if clean_sub not in {"", "index.html"}:
+                allowed_req_headers.update({"if-none-match", "if-modified-since"})
+
             forward_headers: dict[str, str] = {}
+            host_header = ""
+            proto_header = ""
             for k, v in (headers or {}).items():
                 kl = k.lower()
-                if kl in {"accept", "accept-language", "content-type", "range", "origin", "referer"}:
+                if kl in allowed_req_headers:
                     forward_headers[k] = v
+                elif kl == "host" and v:
+                    host_header = v
+                elif kl == "x-forwarded-proto" and v:
+                    proto_header = v
+            if host_header:
+                forward_headers["X-Forwarded-Host"] = host_header
+            forward_headers["X-Forwarded-Proto"] = proto_header or "http"
+
+            allowed_resp_headers = (
+                "Cache-Control",
+                "ETag",
+                "Last-Modified",
+                "Accept-Ranges",
+                "Content-Range",
+                "Vary",
+                "Location",
+            )
 
             last_exc: Exception | None = None
             async with aiohttp.ClientSession() as session:
@@ -1464,20 +1711,26 @@ class DesktopManager:
                                     )
                                     fb_headers = {
                                         hk: fb_resp.headers[hk]
-                                        for hk in ("Cache-Control", "ETag", "Accept-Ranges", "Content-Range", "Vary")
+                                        for hk in ("Cache-Control", "ETag", "Last-Modified", "Accept-Ranges", "Content-Range", "Vary")
                                         if hk in fb_resp.headers
                                     }
-                                    return fb_resp.status, fb_ct, fb_body, fb_headers
+                                    patched_fb, patched_fb_headers = _maybe_inject_selkies_iframe_shim(
+                                        clean_sub, fb_resp.status, fb_ct, fb_body, fb_headers
+                                    )
+                                    return fb_resp.status, fb_ct, patched_fb, patched_fb_headers
                             resp_body = await resp.read()
                             content_type = resp.headers.get(
                                 "Content-Type", "application/octet-stream"
                             )
                             safe_headers = {
                                 hk: resp.headers[hk]
-                                for hk in ("Cache-Control", "ETag", "Accept-Ranges", "Content-Range", "Vary", "Location")
+                                for hk in allowed_resp_headers
                                 if hk in resp.headers
                             }
-                            return resp.status, content_type, resp_body, safe_headers
+                            patched_body, patched_headers = _maybe_inject_selkies_iframe_shim(
+                                clean_sub, resp.status, content_type, resp_body, safe_headers
+                            )
+                            return resp.status, content_type, patched_body, patched_headers
                     except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, TimeoutError, OSError) as exc:
                         last_exc = exc
                         if attempt < 11:

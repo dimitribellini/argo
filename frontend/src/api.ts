@@ -1,11 +1,15 @@
 import type {
   ActivityEvent,
+  AdminUserRecord,
   ApprovalItem,
+  AuthConfigResponse,
   BotDraftResponse,
   BotMessage,
   BotRecord,
   BotRunRecord,
   BotTriggerResult,
+  ChatRetentionSettings,
+  ClearMessagesResponse,
   CollectionDocument,
   CollectionRecord,
   DebugOverviewResponse,
@@ -15,6 +19,7 @@ import type {
   DesktopRecordingStatus,
   DesktopRecordingStopResponse,
   DesktopsResponse,
+  DiscoverModelsResponse,
   GoogleAuthorizeResponse,
   GoogleWizardConfig,
   HostTelemetry,
@@ -24,13 +29,19 @@ import type {
   ModelProvider,
   PageDataResponse,
   PageRecord,
+  PageSqlQueryResult,
   ProbeAllResponse,
   QueuedMessageAck,
+  ResourceVisibility,
   RoomMessage,
   RoomRecord,
+  SandboxInfo,
+  SSHAuditSettings,
+  SSHSessionRecord,
   SkillRecord,
   SsoPrincipal,
   StyleRule,
+  TeamGroupRecord,
   TeamPackRecord,
   TelegramSyncSummary,
   VaultSecretRecord,
@@ -39,7 +50,97 @@ import type {
   WorkspaceSummary,
 } from "./types";
 
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export const MAX_WORKSPACE_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_ANALYTICS_UPLOAD_BYTES = 100 * 1024 * 1024;
+
+const ANALYTICS_DOCUMENT_EXTS = new Set([
+  ".csv",
+  ".tsv",
+  ".parquet",
+  ".json",
+  ".ndjson",
+  ".jsonl",
+  ".xlsx",
+  ".xlsm",
+  ".xlsb",
+  ".xls",
+  ".ods",
+  ".pdf",
+  ".docx",
+]);
+
+const ANALYTICS_DOCUMENT_MIMES = new Set([
+  "text/csv",
+  "text/tab-separated-values",
+  "application/csv",
+  "application/parquet",
+  "application/vnd.apache.parquet",
+  "application/x-parquet",
+  "application/json",
+  "application/x-ndjson",
+  "application/ndjson",
+  "application/jsonl",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel.sheet.macroenabled.12",
+  "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+  "application/vnd.ms-excel",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+
+export function maxWorkspaceFileBytesForName(filename: string, mimeType = ""): number {
+  const cleanName = String(filename || "").trim().toLowerCase();
+  const dotIdx = cleanName.lastIndexOf(".");
+  const ext = dotIdx >= 0 ? cleanName.slice(dotIdx) : "";
+  const cleanMime = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  if (ANALYTICS_DOCUMENT_EXTS.has(ext) || ANALYTICS_DOCUMENT_MIMES.has(cleanMime)) {
+    return MAX_ANALYTICS_UPLOAD_BYTES;
+  }
+  return MAX_WORKSPACE_FILE_BYTES;
+}
+
+function clearMessagesSuffix(opts?: { keep_last?: number; older_than_days?: number }): string {
+  const qs = new URLSearchParams();
+  if (opts?.keep_last !== undefined) qs.set("keep_last", String(opts.keep_last));
+  if (opts?.older_than_days !== undefined) {
+    qs.set("older_than_days", String(opts.older_than_days));
+  }
+  return qs.toString() ? `?${qs.toString()}` : "";
+}
+
+async function downloadTranscriptMarkdown(url: string, filename: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    let detail = `Export failed (${response.status})`;
+    try {
+      const data = (await response.json()) as { detail?: string };
+      if (data.detail) detail = data.detail;
+    } catch {
+      // Ignore parse errors for non-JSON responses.
+    }
+    throw new Error(detail);
+  }
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  return filename;
+}
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -59,28 +160,127 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     } catch {
       // Ignore parse errors for non-JSON error responses.
     }
-    throw new Error(detail);
+    throw new ApiError(detail, response.status);
   }
   return (await response.json()) as T;
 }
 
 export const api = {
+  getAuthConfig: () => requestJson<AuthConfigResponse>("/api/auth/config"),
+  bootstrapAdmin: (payload: { email: string; display_name?: string; password: string }) =>
+    requestJson<{ status: string; user: AdminUserRecord }>("/api/auth/bootstrap", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  loginWithPassword: (email: string, password: string) =>
+    requestJson<{ status: string; user: AdminUserRecord }>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }),
+  logout: () =>
+    requestJson<{ status: string }>("/api/auth/logout", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  changePassword: (payload: { current_password?: string; new_password: string }) =>
+    requestJson<{ status: string; user: AdminUserRecord }>("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  listMyTeams: () => requestJson<TeamGroupRecord[]>("/api/teams"),
+  listAdminUsers: () => requestJson<AdminUserRecord[]>("/api/admin/users"),
+  createAdminUser: (payload: {
+    email: string;
+    display_name?: string;
+    role: "admin" | "member";
+    auth_methods: Array<"password" | "google">;
+    password?: string;
+    must_change_password?: boolean;
+    group_slugs?: string[];
+    max_active_desktops?: number | null;
+    max_active_sandboxes?: number | null;
+  }) =>
+    requestJson<AdminUserRecord>("/api/admin/users", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateAdminUser: (
+    email: string,
+    payload: {
+      display_name?: string;
+      role?: "admin" | "member";
+      active?: boolean;
+      auth_methods?: Array<"password" | "google">;
+      group_slugs?: string[];
+      max_active_desktops?: number | null;
+      max_active_sandboxes?: number | null;
+      clear_quota_overrides?: boolean;
+    },
+  ) =>
+    requestJson<AdminUserRecord>(`/api/admin/users/${encodeURIComponent(email)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  resetAdminUserPassword: (
+    email: string,
+    newPassword: string,
+    mustChangePassword = true,
+  ) =>
+    requestJson<AdminUserRecord>(
+      `/api/admin/users/${encodeURIComponent(email)}/reset-password`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          new_password: newPassword,
+          must_change_password: mustChangePassword,
+        }),
+      },
+    ),
+  deleteAdminUser: (email: string) =>
+    requestJson<{ status: string; email: string }>(
+      `/api/admin/users/${encodeURIComponent(email)}`,
+      { method: "DELETE" },
+    ),
+  createAdminTeam: (payload: {
+    name: string;
+    slug?: string;
+    description?: string;
+    member_emails?: string[];
+  }) =>
+    requestJson<TeamGroupRecord>("/api/admin/teams", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateAdminTeam: (
+    slug: string,
+    payload: { name?: string; description?: string; member_emails?: string[] },
+  ) =>
+    requestJson<TeamGroupRecord>(`/api/admin/teams/${encodeURIComponent(slug)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteAdminTeam: (slug: string) =>
+    requestJson<{ status: string; slug: string }>(
+      `/api/admin/teams/${encodeURIComponent(slug)}`,
+      { method: "DELETE" },
+    ),
+
   getMe: () => requestJson<SsoPrincipal>("/api/me"),
   getSummary: () => requestJson<WorkspaceSummary>("/api/workspace/summary"),
   getLiveStatus: () => requestJson<LiveWorkspaceStatusResponse>("/api/workspace/live-status"),
 
   listActivity: (category = "all") =>
     requestJson<ActivityEvent[]>(`/api/activity?category=${encodeURIComponent(category)}`),
-  dispatchActivity: (instruction: string, target_slug = "operations-coordinator") =>
+  dispatchActivity: (instruction: string, target_slug?: string) =>
     requestJson<ActivityEvent>("/api/activity/dispatch", {
       method: "POST",
-      body: JSON.stringify({ instruction, target_slug }),
+      body: JSON.stringify(target_slug ? { instruction, target_slug } : { instruction }),
     }),
 
   listBots: () => requestJson<BotRecord[]>("/api/bots"),
   draftBotSpec: (payload: {
     prompt: string;
-    preferred_runtime?: "auto" | "api" | "desktop";
+    preferred_runtime?: "auto" | "api" | "sandbox" | "desktop";
     preferred_rbac?: "auto" | "internal" | "draft" | "execute";
     preferred_model?: string;
     linked_accounts?: string[];
@@ -90,10 +290,12 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   createBot: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     name: string;
     role?: string;
     role_prompt?: string;
-    runtime: "api" | "desktop";
+    runtime: "api" | "sandbox" | "desktop";
     outbound_rbac: "internal" | "draft" | "execute";
     model: string;
     daily_cap: number;
@@ -145,16 +347,20 @@ export const api = {
   updateBot: (
     slug: string,
     updates: {
+      visibility?: ResourceVisibility;
+    allowed_groups?: string[];
       name?: string;
       enabled?: boolean;
-      runtime?: "api" | "desktop";
+      runtime?: "api" | "sandbox" | "desktop";
       role?: string;
       role_prompt?: string;
       model?: string;
       outbound_rbac?: "internal" | "draft" | "execute";
       daily_cap?: number;
+      max_steps_per_run?: number;
       toggle_routine_id?: string;
       routines?: Array<Record<string, unknown>>;
+      collections?: { read: string[]; write: string[] };
       linked_accounts?: string[];
       avatar_color?: string;
       avatar_icon?: string;
@@ -173,6 +379,19 @@ export const api = {
     }),
   listBotMessages: (slug: string) =>
     requestJson<BotMessage[]>(`/api/bots/${encodeURIComponent(slug)}/messages`),
+  clearBotMessages: (
+    slug: string,
+    opts?: { keep_last?: number; older_than_days?: number },
+  ) =>
+    requestJson<ClearMessagesResponse<BotMessage>>(
+      `/api/bots/${encodeURIComponent(slug)}/messages${clearMessagesSuffix(opts)}`,
+      { method: "DELETE" },
+    ),
+  exportBotMessagesMarkdown: (slug: string) =>
+    downloadTranscriptMarkdown(
+      `/api/bots/${encodeURIComponent(slug)}/messages/export`,
+      `${slug}-chat.md`,
+    ),
   listBotMessagesPage: async (
     slug: string,
     opts?: { limit?: number; beforeId?: string },
@@ -258,6 +477,14 @@ export const api = {
         ...(options ?? {}),
       }),
     }),
+  editLastBotMessage: (slug: string, messageId: string, text: string) =>
+    requestJson<QueuedMessageAck>(
+      `/api/bots/${encodeURIComponent(slug)}/messages/${encodeURIComponent(messageId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ text, async_mode: true }),
+      },
+    ),
   cancelRun: (runId: string) =>
     requestJson<{ status: string; run_id: string; message_id?: string | null }>(
       `/api/runs/${encodeURIComponent(runId)}/cancel`,
@@ -296,6 +523,8 @@ export const api = {
 
   listRooms: () => requestJson<RoomRecord[]>("/api/rooms"),
   createRoom: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     title: string;
     member_bot_slugs: string[];
     coordinator_bot_slug?: string | null;
@@ -315,6 +544,8 @@ export const api = {
   updateRoom: (
     slug: string,
     updates: {
+      visibility?: ResourceVisibility;
+    allowed_groups?: string[];
       title?: string;
       member_bot_slugs?: string[];
       coordinator_bot_slug?: string | null;
@@ -335,6 +566,19 @@ export const api = {
     requestJson<{ status: string; slug: string }>(`/api/rooms/${encodeURIComponent(slug)}`, {
       method: "DELETE",
     }),
+  clearRoomMessages: (
+    slug: string,
+    opts?: { keep_last?: number; older_than_days?: number },
+  ) =>
+    requestJson<ClearMessagesResponse<RoomMessage>>(
+      `/api/rooms/${encodeURIComponent(slug)}/messages${clearMessagesSuffix(opts)}`,
+      { method: "DELETE" },
+    ),
+  exportRoomMessagesMarkdown: (slug: string) =>
+    downloadTranscriptMarkdown(
+      `/api/rooms/${encodeURIComponent(slug)}/messages/export`,
+      `${slug}-room-chat.md`,
+    ),
   listRoomMessagesPage: async (
     slug: string,
     opts?: { limit?: number; beforeId?: string },
@@ -417,6 +661,14 @@ export const api = {
         async_mode: true,
       }),
     }),
+  editLastRoomMessage: (slug: string, messageId: string, text: string) =>
+    requestJson<QueuedMessageAck>(
+      `/api/rooms/${encodeURIComponent(slug)}/messages/${encodeURIComponent(messageId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ text, async_mode: true }),
+      },
+    ),
   executeRoomPlan: (slug: string, planId: string, editedSteps?: DelegationPlanStep[]) =>
     requestJson<{
       status: string;
@@ -430,8 +682,10 @@ export const api = {
 
   listWorkspaceFiles: () => requestJson<WorkspaceFileRecord[]>("/api/files"),
   uploadWorkspaceFile: async (file: File): Promise<WorkspaceFileRecord> => {
-    if (file.size > MAX_WORKSPACE_FILE_BYTES) {
-      throw new Error("File exceeds the 10 MB per-file upload limit.");
+    const byteLimit = maxWorkspaceFileBytesForName(file.name, file.type);
+    if (file.size > byteLimit) {
+      const limitMb = Math.round(byteLimit / (1024 * 1024));
+      throw new Error(`File exceeds the ${limitMb} MB per-file upload limit.`);
     }
     const response = await fetch("/api/files", {
       method: "POST",
@@ -495,7 +749,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  listApprovals: (tab: "pending" | "history") =>
+  listApprovals: (tab: "pending" | "history" | "all" = "pending") =>
     requestJson<ApprovalItem[]>(`/api/approvals?tab=${tab}`),
   resolveApproval: (
     approvalId: string,
@@ -503,9 +757,25 @@ export const api = {
       action: "approve" | "reject" | "edit_approve";
       edited_text?: string;
       style_rule?: string;
+      trust_command?: boolean;
+      trust_prefixes?: string[];
     },
   ) =>
     requestJson<ApprovalItem>(`/api/approvals/${encodeURIComponent(approvalId)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  batchResolveApprovals: (payload: {
+    approval_ids: string[];
+    action: "approve" | "reject";
+    trust_command?: boolean;
+  }) =>
+    requestJson<{
+      items: ApprovalItem[];
+      resolved_count: number;
+      errors: Array<{ approval_id: string; detail: string }>;
+      trusted_prefixes_added?: string[];
+    }>("/api/approvals/batch-resolve", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -549,6 +819,8 @@ export const api = {
     requestJson<CollectionRecord[]>("/api/collections"),
   listPages: () => requestJson<PageRecord[]>("/api/pages"),
   generatePage: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     prompt: string;
     title?: string;
     owner_bot_slug?: string;
@@ -559,13 +831,16 @@ export const api = {
       | "live_operations_map"
       | "bot_hub_board"
       | "collection_analytics"
-      | "interactive_playground";
+      | "interactive_playground"
+      | "data_dashboard";
   }) =>
     requestJson<PageRecord>("/api/pages/generate", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   createPage: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     title: string;
     description: string;
     render_mode: "declarative_json" | "sandboxed_html";
@@ -579,6 +854,8 @@ export const api = {
   updatePage: (
     slug: string,
     payload: {
+      visibility?: ResourceVisibility;
+    allowed_groups?: string[];
       title?: string;
       description?: string;
       render_mode?: "declarative_json" | "sandboxed_html";
@@ -595,8 +872,15 @@ export const api = {
     requestJson<{ status: string; slug: string }>(`/api/pages/${encodeURIComponent(slug)}`, {
       method: "DELETE",
     }),
-  getPageData: (slug: string, q?: string) => {
-    const qs = q?.trim() ? `?q=${encodeURIComponent(q.trim())}` : "";
+  getPageData: (slug: string, qOrOpts?: string | { q?: string; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (typeof qOrOpts === "string") {
+      if (qOrOpts.trim()) params.set("q", qOrOpts.trim());
+    } else if (qOrOpts && typeof qOrOpts === "object") {
+      if (qOrOpts.q?.trim()) params.set("q", qOrOpts.q.trim());
+      if (typeof qOrOpts.limit === "number") params.set("limit", String(qOrOpts.limit));
+    }
+    const qs = params.toString() ? `?${params.toString()}` : "";
     return requestJson<PageDataResponse>(`/api/pages/${encodeURIComponent(slug)}/data${qs}`);
   },
   queryPageCollection: (
@@ -605,6 +889,17 @@ export const api = {
   ) =>
     requestJson<{ page_slug: string; collection: string; records: CollectionDocument[] }>(
       `/api/pages/${encodeURIComponent(slug)}/query`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+  queryPageSql: (
+    slug: string,
+    payload: { sql: string; params?: unknown[]; row_cap?: number; engine?: "auto" | "duckdb" | "sqlite" },
+  ) =>
+    requestJson<PageSqlQueryResult>(
+      `/api/pages/${encodeURIComponent(slug)}/sql`,
       {
         method: "POST",
         body: JSON.stringify(payload),
@@ -624,6 +919,28 @@ export const api = {
     requestJson<{ hibernated_desktops: string[] }>("/api/desktops/sweep-idle", {
       method: "POST",
     }),
+  listSandboxes: () =>
+    requestJson<{ host: HostTelemetry; sandboxes: SandboxInfo[] }>("/api/sandboxes"),
+  toggleSandbox: (slug: string) =>
+    requestJson<BotRecord>(`/api/sandboxes/${encodeURIComponent(slug)}/toggle`, {
+      method: "POST",
+    }),
+  startSandbox: (slug: string) =>
+    requestJson<BotRecord>(`/api/sandboxes/${encodeURIComponent(slug)}/start`, {
+      method: "POST",
+    }),
+  stopSandbox: (slug: string) =>
+    requestJson<BotRecord>(`/api/sandboxes/${encodeURIComponent(slug)}/stop`, {
+      method: "POST",
+    }),
+  stopAllSandboxes: () =>
+    requestJson<{ stopped_sandboxes: string[] }>("/api/sandboxes/stop-all", {
+      method: "POST",
+    }),
+  sweepIdleSandboxes: () =>
+    requestJson<{ hibernated_sandboxes: string[] }>("/api/sandboxes/sweep-idle", {
+      method: "POST",
+    }),
   startDesktopTakeover: (slug: string) =>
     requestJson<{ status: string; desktop: DesktopInfo }>(
       `/api/desktops/${encodeURIComponent(slug)}/takeover/start`,
@@ -636,11 +953,18 @@ export const api = {
     ),
   desktopScreenshotUrl: (
     slug: string,
-    opts?: { refresh?: boolean; download?: boolean; maxWidth?: number; cacheBust?: number },
+    opts?: {
+      refresh?: boolean;
+      download?: boolean;
+      passive?: boolean;
+      maxWidth?: number;
+      cacheBust?: number;
+    },
   ) => {
     const qs = new URLSearchParams();
     if (opts?.refresh) qs.set("refresh", "true");
     if (opts?.download) qs.set("download", "true");
+    if (opts?.passive) qs.set("passive", "true");
     if (typeof opts?.maxWidth === "number") qs.set("max_width", String(opts.maxWidth));
     if (typeof opts?.cacheBust === "number") qs.set("t", String(opts.cacheBust));
     const suffix = qs.toString();
@@ -687,6 +1011,8 @@ export const api = {
 
   listVaultSecrets: () => requestJson<VaultSecretRecord[]>("/api/vault"),
   createVaultSecret: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     name: string;
     slug?: string;
     secret_type: "ssh" | "login" | "api_token" | "custom";
@@ -695,6 +1021,7 @@ export const api = {
     url?: string;
     secrets: Record<string, string>;
     allowed_bots?: string[];
+    trusted_command_prefixes?: string[];
   }) =>
     requestJson<VaultSecretRecord>("/api/vault", {
       method: "POST",
@@ -703,6 +1030,8 @@ export const api = {
   updateVaultSecret: (
     slug: string,
     payload: {
+      visibility?: ResourceVisibility;
+    allowed_groups?: string[];
       name?: string;
       secret_type?: "ssh" | "login" | "api_token" | "custom";
       host?: string;
@@ -710,6 +1039,7 @@ export const api = {
       url?: string;
       secrets?: Record<string, string>;
       allowed_bots?: string[];
+      trusted_command_prefixes?: string[];
     },
   ) =>
     requestJson<VaultSecretRecord>(`/api/vault/${encodeURIComponent(slug)}`, {
@@ -720,9 +1050,80 @@ export const api = {
     requestJson<{ status: string; slug: string }>(`/api/vault/${encodeURIComponent(slug)}`, {
       method: "DELETE",
     }),
+  bulkCreateSSHVaultSecrets: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
+    name_prefix: string;
+    hosts_text: string;
+    port?: string;
+    secrets: Record<string, string>;
+    allowed_bots?: string[];
+  }) =>
+    requestJson<{ created: VaultSecretRecord[]; count: number }>("/api/vault/bulk-ssh", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  resetVaultHostKey: (slug: string, hostPort?: string) =>
+    requestJson<VaultSecretRecord>(`/api/vault/${encodeURIComponent(slug)}/reset-host-key`, {
+      method: "POST",
+      body: JSON.stringify({ host_port: hostPort ?? null }),
+    }),
+  getSSHAuditSettings: () => requestJson<SSHAuditSettings>("/api/settings/ssh-audit"),
+  updateSSHAuditSettings: (retentionHours: number) =>
+    requestJson<SSHAuditSettings>("/api/settings/ssh-audit", {
+      method: "PATCH",
+      body: JSON.stringify({ retention_hours: retentionHours }),
+    }),
+  getChatRetentionSettings: () =>
+    requestJson<ChatRetentionSettings>("/api/settings/chat-retention"),
+  updateChatRetentionSettings: (retentionDays: number, pruneNow = false) =>
+    requestJson<ChatRetentionSettings>("/api/settings/chat-retention", {
+      method: "PATCH",
+      body: JSON.stringify({ retention_days: retentionDays, prune_now: pruneNow }),
+    }),
+  listSSHSessions: (params?: { bot_slug?: string; include_closed?: boolean }) => {
+    const qs = new URLSearchParams();
+    if (params?.bot_slug) qs.set("bot_slug", params.bot_slug);
+    if (params?.include_closed !== undefined) {
+      qs.set("include_closed", String(params.include_closed));
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return requestJson<SSHSessionRecord[]>(`/api/ssh/sessions${suffix}`);
+  },
+  getSSHCast: async (sessionId: string): Promise<{ ndjson: string; sha256: string | null }> => {
+    const response = await fetch(`/api/ssh/sessions/${encodeURIComponent(sessionId)}/cast?format=ndjson`);
+    if (!response.ok) {
+      throw new Error(`Unable to load terminal recording (${response.status})`);
+    }
+    return {
+      ndjson: await response.text(),
+      sha256: response.headers.get("X-Cast-Sha256"),
+    };
+  },
+  takeoverSSHSession: (sessionId: string) =>
+    requestJson<SSHSessionRecord>(`/api/ssh/sessions/${encodeURIComponent(sessionId)}/takeover`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  handbackSSHSession: (sessionId: string) =>
+    requestJson<SSHSessionRecord>(`/api/ssh/sessions/${encodeURIComponent(sessionId)}/handback`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  controlSSHSession: (
+    sessionId: string,
+    operation: "pause" | "resume" | "terminate" | "pin" | "unpin",
+    reason?: string,
+  ) =>
+    requestJson<SSHSessionRecord>(`/api/ssh/sessions/${encodeURIComponent(sessionId)}/control`, {
+      method: "POST",
+      body: JSON.stringify({ operation, reason: reason ?? "" }),
+    }),
 
   listIntegrations: () => requestJson<IntegrationAccount[]>("/api/integrations"),
   upsertIntegration: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     slug: string;
     provider: "google" | "telegram" | "linkedin" | "webhook" | "mcp";
     display_name: string;
@@ -739,6 +1140,8 @@ export const api = {
       method: "DELETE",
     }),
   onboardTelegram: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     bot_token: string;
     slug?: string;
     display_name?: string;
@@ -763,6 +1166,8 @@ export const api = {
   getGoogleWizardConfig: () =>
     requestJson<GoogleWizardConfig>("/api/integrations/google/wizard-config"),
   startGoogleOAuth: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     in_production_confirmed: boolean;
     client_id?: string;
     client_secret?: string;
@@ -782,6 +1187,8 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   onboardLinkedIn: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     access_token: string;
     author_urn?: string;
     linkedin_version?: string;
@@ -793,6 +1200,8 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   onboardWebhook: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     display_name: string;
     slug?: string;
     signing_secret?: string;
@@ -804,6 +1213,8 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   addTelegramPublicMonitor: (payload: {
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     channel_handle: string;
     slug?: string;
     display_name?: string;
@@ -822,7 +1233,20 @@ export const api = {
       body: JSON.stringify({ limit_per_channel: limitPerChannel }),
     }),
 
-  listModels: () => requestJson<ModelsResponse>("/api/models"),
+  listModels: (modelId?: string) =>
+    requestJson<ModelsResponse>(
+      modelId ? `/api/models?model_id=${encodeURIComponent(modelId)}` : "/api/models",
+    ),
+  discoverModels: (payload: {
+    provider_type: "google" | "anthropic" | "openai" | "xai" | "openrouter" | "ollama";
+    provider_slug?: string;
+    api_key?: string;
+    api_base?: string;
+  }) =>
+    requestJson<DiscoverModelsResponse>("/api/models/discover", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   upsertModel: (payload: {
     slug: string;
     provider_type: "google" | "anthropic" | "openai" | "xai" | "openrouter" | "ollama";
@@ -832,6 +1256,8 @@ export const api = {
     is_default?: boolean;
     daily_token_limit?: number;
     monthly_budget_usd?: number;
+    input_price_per_million?: number;
+    output_price_per_million?: number;
   }) =>
     requestJson<ModelProvider>("/api/models", {
       method: "POST",

@@ -331,7 +331,7 @@ class TestDesktopVaultRecordingAndApprovals(unittest.TestCase):
             async def _run_real_agent() -> None:
                 health = await transport.health("rec-agent", endpoint)
                 self.assertEqual(health["agent_version"], DESKTOP_AGENT_VERSION)
-                self.assertEqual(DESKTOP_AGENT_VERSION, "6")
+                self.assertEqual(DESKTOP_AGENT_VERSION, "8")
 
                 r_start = await transport.execute_action("rec-agent", endpoint, "record_start", {})
                 self.assertTrue(r_start["recording"])
@@ -966,19 +966,172 @@ class TestDesktopVaultRecordingAndApprovals(unittest.TestCase):
                 updated_approval = repo.get_approval(approval["id"])
                 self.assertEqual(updated_approval["status"], "superseded")
 
-                # Sibling handoff_bot_slug cleared and Room membership reassigned
+                # Sibling handoff_bot_slug cleared and invalid 1-bot Room cleaned up (P1-14)
                 updated_sibling = repo.get_bot("sibling-helper")
                 self.assertEqual(updated_sibling["handoff_bot_slug"], "")
                 rooms = [r for r in repo.list_rooms() if r["slug"] == room["slug"]]
-                self.assertEqual(len(rooms), 1)
-                self.assertEqual(rooms[0]["member_bot_slugs"], ["sibling-helper"])
-                self.assertEqual(rooms[0]["coordinator_bot_slug"], "sibling-helper")
+                self.assertEqual(len(rooms), 0)
 
                 # bot.deleted event emitted
                 events = repo.list_events(category="all", limit=50)
                 self.assertTrue(
                     any(e.get("event_type") == "bot.deleted" and e.get("target_slug") == slug for e in events)
                 )
+
+    def test_stream_action_json_preserves_urls_excludes_nonsecret_vault_keys_and_handles_dns_errors(self) -> None:
+        async def streaming_llm(req: LLMRequest) -> dict[str, Any]:
+            env = json.loads(req.user_prompt)
+            obs = env.get("tool_observations") or []
+            if not obs:
+                target = str((env.get("trigger_payload") or {}).get("url") or "https://quadrata.ae")
+                if "127.0.0.1" in target or "blocked" in target:
+                    payload = {
+                        "summary": f"Checking {target}.",
+                        "actions": [{"type": "desktop_browse", "url": target}],
+                    }
+                elif "missing" in target:
+                    payload = {
+                        "summary": f"Checking {target}.",
+                        "actions": [{"type": "desktop_launch", "app": "chromium", "url": target}],
+                    }
+                else:
+                    payload = {
+                        "summary": "Launching Chromium for https://quadrata.ae now.",
+                        "actions": [{"type": "desktop_launch", "app": "chromium", "url": target}],
+                    }
+                raw_json = json.dumps(payload)
+                return {
+                    "chunks": [raw_json[i : i + 6] for i in range(0, len(raw_json), 6)],
+                    "chunk_delay_s": 0.002,
+                    "input_tokens": 12,
+                    "output_tokens": 14,
+                }
+            return {
+                "text": json.dumps({"summary": f"Handled cleanly: {obs[-1].get('status')}", "actions": []}),
+                "input_tokens": 8,
+                "output_tokens": 8,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = InMemoryDockerDriver()
+            app = self._build_env(tmp, llm_transport=streaming_llm, docker_driver=driver)
+            with TestClient(app) as client:
+                repo = app.state.repo
+                # 1. Vault with non-secret identifier fields (`username="quadrata"`, `email`, `host`, `domain`, `url`)
+                repo.upsert_vault_secret(
+                    name="Corp Web",
+                    slug="corp-web",
+                    secret_type="login",
+                    url="https://quadrata.ae",
+                    secrets={
+                        "username": "quadrata",
+                        "email": "admin@quadrata.ae",
+                        "host": "quadrata.ae",
+                        "domain": "quadrata.ae",
+                        "url": "https://quadrata.ae",
+                        "password": "RealStrongPassword99!",
+                    },
+                    allowed_bots=["*"],
+                )
+                scrub_vals = repo.collect_all_vault_secret_values()
+                self.assertIn("RealStrongPassword99!", scrub_vals)
+                self.assertNotIn("quadrata", scrub_vals)
+                self.assertNotIn("admin@quadrata.ae", scrub_vals)
+                self.assertNotIn("quadrata.ae", scrub_vals)
+                self.assertNotIn("https://quadrata.ae", scrub_vals)
+
+                # 2. Even if an actual secret substring ("quadrata") IS present as a `password`,
+                # streaming JSON actions must NEVER mutate `"https://quadrata.ae"` into `"https://<REDACTED>.ae"`.
+                repo.upsert_vault_secret(
+                    name="Overlap Secret",
+                    slug="overlap-sec",
+                    secret_type="custom",
+                    secrets={"password": "quadrata"},
+                    allowed_bots=["*"],
+                )
+
+                client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Browser Checker",
+                        "slug": "browser-checker",
+                        "role": "Inspect websites in Chrome",
+                        "runtime": "desktop",
+                        "outbound_rbac": "execute",
+                    },
+                )
+
+                import socket as _socket
+
+                real_getaddrinfo = _socket.getaddrinfo
+
+                def _fake_getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> Any:
+                    clean_h = str(host or "").strip().lower().rstrip(".")
+                    if clean_h == "quadrata.ae":
+                        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("151.11.48.80", int(port or 443)))]
+                    if clean_h == "missing.example.invalid":
+                        raise _socket.gaierror(-2, "Name or service not known")
+                    return real_getaddrinfo(host, port, *args, **kwargs)
+
+                streamed_deltas: list[str] = []
+
+                async def _run_cases() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+                    with patch("socket.getaddrinfo", side_effect=_fake_getaddrinfo):
+                        async with app.state.bus.subscribe() as queue:
+                            r_ok = await app.state.bot_runner.execute_bot(
+                                "browser-checker",
+                                trigger_type="manual",
+                                trigger_payload={
+                                    "url": "https://quadrata.ae",
+                                    "input_text": "Open https://quadrata.ae in chrome",
+                                    "text": "Open https://quadrata.ae in chrome",
+                                    "from_chat_thread": True,
+                                },
+                            )
+                            while not queue.empty():
+                                ev = queue.get_nowait()
+                                if ev.get("_sse_event") == "turn_stream" and ev.get("type") == "text_delta":
+                                    streamed_deltas.append(str(ev.get("delta") or ""))
+
+                        r_dns = await app.state.bot_runner.execute_bot(
+                            "browser-checker",
+                            trigger_type="manual",
+                            trigger_payload={
+                                "url": "https://missing.example.invalid",
+                                "input_text": "Open https://missing.example.invalid",
+                                "text": "Open https://missing.example.invalid",
+                                "from_chat_thread": True,
+                            },
+                        )
+                        r_ssrf = await app.state.bot_runner.execute_bot(
+                            "browser-checker",
+                            trigger_type="manual",
+                            trigger_payload={
+                                "url": "http://127.0.0.1:8080/admin",
+                                "input_text": "Open http://127.0.0.1:8080/admin",
+                                "text": "Open http://127.0.0.1:8080/admin",
+                                "from_chat_thread": True,
+                            },
+                        )
+                        return r_ok, r_dns, r_ssrf
+
+                res_ok, res_dns, res_ssrf = asyncio.run(_run_cases())
+                # Action argument received uncorrupted domain while prose & debug trace stayed scrubbed
+                self.assertEqual(res_ok["status"], "completed")
+                sim_state = app.state.desktop_mcp_bridge._sim_state("browser-checker")
+                self.assertIn("https://quadrata.ae", str(sim_state.active_window or ""))
+                self.assertEqual(res_ok["actions"][0]["status"], "ok")
+                self.assertIn("<REDACTED>", "".join(streamed_deltas))
+
+                # DNS resolution failure & SSRF block both degrade into clean action errors (no crash)
+                self.assertEqual(res_dns["status"], "completed")
+                self.assertEqual(res_dns["actions"][0]["status"], "error")
+                self.assertIn("Unable to resolve or reach URL", res_dns["actions"][0]["detail"])
+
+                self.assertEqual(res_ssrf["status"], "completed")
+                self.assertEqual(res_ssrf["actions"][0]["status"], "blocked_ssrf")
+                self.assertIn("disallowed", res_ssrf["actions"][0]["detail"].lower())
 
 
 if __name__ == "__main__":

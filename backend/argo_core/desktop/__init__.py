@@ -1,6 +1,7 @@
 """Per-bot isolated Selkies desktop container lifecycle & CDP bridge."""
 
 from argo_core.desktop.cdp_bridge import (
+    CDPActionTransport,
     CDPPageSnapshot,
     CDPTransport,
     ChromeDevToolsBridge,
@@ -35,6 +36,7 @@ from argo_core.desktop.manager import (
 )
 
 __all__ = [
+    "CDPActionTransport",
     "CDPPageSnapshot",
     "CDPTransport",
     "CDP_PORT",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +20,23 @@ class DebugLogBuffer(logging.Handler):
         self._records: deque[dict[str, Any]] = deque(maxlen=max(50, max_records))
         self._lock = threading.Lock()
         self._seq = 0
+        self._secret_provider: Callable[[], Iterable[str]] | None = None
+        self._tls = threading.local()
+
+    def attach_secret_provider(self, provider: Callable[[], Iterable[str]] | None) -> None:
+        """Register a callback returning active sensitive secrets to scrub from buffered logs."""
+        self._secret_provider = provider
+
+    def _collect_secrets(self) -> Iterable[str]:
+        if self._secret_provider is None or getattr(self._tls, "in_emit", False):
+            return ()
+        self._tls.in_emit = True
+        try:
+            return self._secret_provider() or ()
+        except Exception:
+            return ()
+        finally:
+            self._tls.in_emit = False
 
     def emit(self, record: logging.LogRecord) -> None:
         """Store a formatted, secret-redacted log record without raising."""
@@ -29,12 +47,13 @@ class DebugLogBuffer(logging.Handler):
                 exc_text = formatter.formatException(record.exc_info)
                 if exc_text:
                     raw_message = f"{raw_message}\n{exc_text}"
+            secrets = self._collect_secrets()
             entry = {
                 "seq": self._next_seq(),
                 "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
-                "message": redact_secrets(raw_message),
+                "message": redact_secrets(raw_message, secrets),
             }
             with self._lock:
                 self._records.append(entry)

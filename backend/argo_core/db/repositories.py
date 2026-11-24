@@ -3,18 +3,43 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import html
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
+import time
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from argo_core.analytics.engine import (
+    MAX_ANALYTICS_UPLOAD_BYTES,
+    MAX_WORKSPACE_FILE_BYTES,
+    dataset_identifier,
+    execute_duckdb_query,
+    ingest_file_to_analytics,
+    is_analytics_or_document_file,
+    max_workspace_file_bytes_for_name,
+    profile_datasets,
+    read_dataset_rows,
+    validate_readonly_sandbox_sql,
+)
+from argo_core.security.tenancy import (
+    normalize_email,
+    normalize_group_slugs,
+    normalize_visibility,
+)
 from argo_core.security.vault import SecretVault, redact_secrets
+
+_UNSET = object()
 
 
 class AlreadyResolvedError(Exception):
@@ -26,10 +51,9 @@ class NotFoundError(Exception):
 
 
 class FileTooLargeError(Exception):
-    """Raised when an uploaded workspace file exceeds the 10 MB limit."""
+    """Raised when an uploaded workspace file exceeds the allowed size limit."""
 
 
-MAX_WORKSPACE_FILE_BYTES = 10 * 1024 * 1024
 _TEXT_PREVIEW_EXTENSIONS = frozenset(
     {
         ".txt",
@@ -92,6 +116,8 @@ def _default_permissions(rbac: str, runtime: str) -> list[str]:
     perms = ["collections:read"]
     if runtime == "desktop":
         perms.append("desktop:selkies")
+    elif runtime == "sandbox":
+        perms.append("sandbox:exec")
     if rbac == "execute":
         perms.extend(["connector:execute", "approvals:request"])
     elif rbac == "draft":
@@ -176,8 +202,193 @@ _INTERNAL_SYSTEM_COLLECTIONS = frozenset(
         "workspace_files",
         "thread_read_cursors",
         "delegation_plans",
+        "ssh_audit_log",
+        "ssh_settings",
+        "chat_settings",
+        "argo_users",
+        "argo_team_groups",
+        "argo_auth_sessions",
+        "argo_auth_oauth_states",
     }
 )
+
+_BOT_READABLE_SYSTEM_COLLECTIONS = frozenset({"ssh_audit_log"})
+_READ_FORBIDDEN_SYSTEM_COLLECTIONS = _INTERNAL_SYSTEM_COLLECTIONS - _BOT_READABLE_SYSTEM_COLLECTIONS
+_PAGE_FORBIDDEN_INTERNAL_COLLECTIONS = _INTERNAL_SYSTEM_COLLECTIONS - {
+    "ssh_audit_log",
+}
+
+_SAFE_SANDBOX_SQL_FUNCTIONS = frozenset(
+    {
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "total",
+        "group_concat",
+        "json",
+        "json_array",
+        "json_array_length",
+        "json_extract",
+        "json_object",
+        "json_quote",
+        "json_type",
+        "json_valid",
+        "json_each",
+        "json_tree",
+        "json_group_array",
+        "json_group_object",
+        "->",
+        "->>",
+        "coalesce",
+        "ifnull",
+        "nullif",
+        "iif",
+        "typeof",
+        "abs",
+        "round",
+        "length",
+        "lower",
+        "upper",
+        "trim",
+        "ltrim",
+        "rtrim",
+        "substr",
+        "substring",
+        "instr",
+        "replace",
+        "printf",
+        "format",
+        "like",
+        "glob",
+        "hex",
+        "unicode",
+        "char",
+        "date",
+        "time",
+        "datetime",
+        "julianday",
+        "unixepoch",
+        "strftime",
+        "cast",
+        "row_number",
+        "rank",
+        "dense_rank",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "ntile",
+    }
+)
+
+_FORBIDDEN_SANDBOX_IDENTIFIERS = frozenset(
+    {
+        "pragma",
+        "attach",
+        "detach",
+        "load_extension",
+        "vault_secrets",
+        "oauth_accounts",
+        "integrations",
+        "model_providers",
+        "bot_threads",
+        "room_threads",
+        "sqlite_master",
+        "sqlite_schema",
+        "sqlite_temp_master",
+        "sqlite_temp_schema",
+    }
+)
+
+
+def _validate_readonly_sandbox_sql(sql: str) -> str:
+    """Validate that SQL is a single read-only SELECT/WITH query free of forbidden tables/statements."""
+    return validate_readonly_sandbox_sql(sql, block_duckdb_external_funcs=False)
+
+
+def _json_value_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "null"
+
+
+def _flatten_json_paths(
+    value: Any,
+    *,
+    prefix: str = "$",
+    depth: int = 0,
+    max_depth: int = 6,
+    out: dict[str, list[Any]] | None = None,
+) -> dict[str, list[Any]]:
+    """Collect nested JSON paths ($.key, $.arr[], $.arr[].sub) and their observed non-null values."""
+    if out is None:
+        out = {}
+    if value is None or depth > max_depth:
+        return out
+    if isinstance(value, dict):
+        if prefix != "$":
+            out.setdefault(prefix, []).append(value)
+        if depth == max_depth:
+            return out
+        for k, v in value.items():
+            key_str = str(k)
+            if not key_str:
+                continue
+            child_path = f"{prefix}.{key_str}"
+            if isinstance(v, (dict, list)):
+                _flatten_json_paths(v, prefix=child_path, depth=depth + 1, max_depth=max_depth, out=out)
+            elif v is not None:
+                out.setdefault(child_path, []).append(v)
+        return out
+    if isinstance(value, list):
+        out.setdefault(prefix, []).append(value)
+        arr_path = f"{prefix}[]"
+        if depth == max_depth:
+            return out
+        for item in value[:25]:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                _flatten_json_paths(
+                    item, prefix=arr_path, depth=depth + 1, max_depth=max_depth, out=out
+                )
+            elif isinstance(item, list):
+                _flatten_json_paths(
+                    item, prefix=arr_path, depth=depth + 1, max_depth=max_depth, out=out
+                )
+            else:
+                out.setdefault(arr_path, []).append(item)
+        return out
+    out.setdefault(prefix, []).append(value)
+    return out
+
+
+def _compact_scrubbed_doc(value: Any, secrets_to_scrub: list[str], *, depth: int = 0) -> Any:
+    """Recursively scrub secrets and bound oversized strings for schema-on-read sample rows."""
+    if depth > 5:
+        return "..."
+    if isinstance(value, str):
+        return redact_secrets(value[:240], secrets_to_scrub)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for idx, (k, v) in enumerate(value.items()):
+            if idx >= 24:
+                break
+            out[str(k)] = _compact_scrubbed_doc(v, secrets_to_scrub, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_compact_scrubbed_doc(item, secrets_to_scrub, depth=depth + 1) for item in value[:10]]
+    return value
 
 
 def user_workspace_namespace(email: str | None) -> tuple[str, str]:
@@ -208,6 +419,18 @@ def _ensure_desktop_tools(tools_list: list[Any]) -> list[Any]:
     return updated
 
 
+def _ensure_sandbox_tools(tools_list: list[Any]) -> list[Any]:
+    """Ensure headless script sandbox bots always expose sandbox_exec."""
+    updated = list(tools_list)
+    present = any(
+        t == "sandbox_exec" or (isinstance(t, dict) and t.get("name") == "sandbox_exec")
+        for t in updated
+    )
+    if not present:
+        updated.append({"type": "builtin", "name": "sandbox_exec"})
+    return updated
+
+
 class ArgoRepository:
     """Thread-safe persistence methods across Argo's 5 Core Primitives."""
 
@@ -220,6 +443,8 @@ class ArgoRepository:
         self._conn = conn
         self._vault = vault
         self._lock = threading.RLock()
+        self._vault_secrets_cache: tuple[str, ...] | None = None
+        self._sensitive_secrets_cache: tuple[str, ...] | None = None
         if workspace_files_root:
             self._workspace_files_root = Path(workspace_files_root)
         else:
@@ -229,6 +454,39 @@ class ArgoRepository:
                 self._workspace_files_root = Path(db_file).resolve().parent / "workspace_files"
             else:
                 self._workspace_files_root = Path("./data/workspace_files").resolve()
+        db_list2 = conn.execute("PRAGMA database_list").fetchall()
+        db_file2 = str(db_list2[0][2]) if db_list2 and len(db_list2[0]) > 2 else ""
+        if db_file2 and db_file2 != ":memory:":
+            self._analytics_root = (Path(db_file2).resolve().parent / "analytics").resolve()
+        else:
+            self._analytics_root = (self._workspace_files_root.resolve().parent / "analytics").resolve()
+
+    @contextmanager
+    def _tx(self) -> Iterator[None]:
+        """Serialize SQLite write transactions under self._lock with automatic rollback on failure."""
+        with self._lock:
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+                raise
+
+    def analytics_dir_for_collection(self, collection: str) -> Path:
+        """Return isolated analytics Parquet directory under <db_dir>/analytics/<slug>."""
+        clean_coll = collection_slug(collection)
+        target = (self._analytics_root / clean_coll).resolve()
+        if not target.is_relative_to(self._analytics_root):
+            raise ValueError("Invalid analytics collection path.")
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def workspace_tmp_dir(self) -> Path:
+        """Return staging temp directory outside per-user namespaces for streamed uploads."""
+        tmp_dir = (self._workspace_files_root.resolve() / ".tmp").resolve()
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        return tmp_dir
 
     def _ensure_collection_locked(
         self,
@@ -239,7 +497,7 @@ class ArgoRepository:
     ) -> None:
         """Ensure a collection row exists without committing an outer transaction."""
         raw = str(slug or "").strip()
-        if not raw:
+        if not raw or dataset_identifier(raw).startswith("file:"):
             return
         clean_coll = collection_slug(raw)
         self._conn.execute(
@@ -263,6 +521,9 @@ class ArgoRepository:
         seen: set[str] = set()
         for bucket in ("read", "write"):
             for raw_slug in collections_cfg.get(bucket) or []:
+                ds_id = dataset_identifier(str(raw_slug))
+                if ds_id.startswith("file:"):
+                    continue
                 clean = collection_slug(str(raw_slug))
                 if clean in _INTERNAL_SYSTEM_COLLECTIONS or clean in seen:
                     continue
@@ -335,6 +596,13 @@ class ArgoRepository:
                 """,
                 ("bot_skills", "Reusable skill playbooks saved from conversations", None, now),
             )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO collections(slug, description, schema_hint_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("ssh_audit_log", "Tamper-evident SSH terminal turn audit log", None, now),
+            )
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -372,7 +640,17 @@ class ArgoRepository:
         row: sqlite3.Row,
         usage: dict[str, float | int] | None = None,
     ) -> dict[str, Any]:
+        from argo_core.llm.router import resolve_model_pricing
+
         stats = usage or {}
+        row_keys = set(row.keys())
+        custom_in = row["input_price_per_million"] if "input_price_per_million" in row_keys else None
+        custom_out = row["output_price_per_million"] if "output_price_per_million" in row_keys else None
+        resolved = resolve_model_pricing(
+            row["model_id"],
+            custom_input=custom_in,
+            custom_output=custom_out,
+        )
         return {
             "id": row["id"],
             "slug": row["slug"],
@@ -383,6 +661,11 @@ class ArgoRepository:
             "is_default": bool(row["is_default"]),
             "daily_token_limit": row["daily_token_limit"],
             "monthly_budget_usd": row["monthly_budget_usd"],
+            "input_price_per_million": float(custom_in) if custom_in is not None else None,
+            "output_price_per_million": float(custom_out) if custom_out is not None else None,
+            "effective_input_price_per_million": resolved["input_per_million"],
+            "effective_output_price_per_million": resolved["output_per_million"],
+            "pricing_source": resolved["source"],
             "today_tokens": int(stats.get("today_tokens", 0)),
             "today_cost_usd": float(stats.get("today_cost_usd", 0.0)),
             "month_tokens": int(stats.get("month_tokens", 0)),
@@ -401,15 +684,85 @@ class ArgoRepository:
             "month_cost_usd": 0.0,
         }
 
-    def list_models(self) -> dict[str, Any]:
+    def provider_type_ephemeral_usage_totals(
+        self,
+        provider_type: str,
+        *,
+        parent_model_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate usage for a parent model plus any unconfigured sibling models sharing provider_type."""
+        clean_type = str(provider_type or "").strip().lower()
+        prefix = f"{clean_type}:"
+        with self._lock:
+            per_model = self._usage_by_model_locked()
+            rows = self._conn.execute(
+                "SELECT model_id FROM model_providers WHERE LOWER(provider_type) = ?",
+                (clean_type,),
+            ).fetchall()
+            explicit_models = {str(r["model_id"]) for r in rows}
+
+        today_tokens = 0
+        today_cost = 0.0
+        month_tokens = 0
+        month_cost = 0.0
+        for mid, st in per_model.items():
+            if mid == parent_model_id or (
+                prefix and mid.lower().startswith(prefix) and mid not in explicit_models
+            ):
+                today_tokens += int(st.get("today_tokens", 0))
+                today_cost += float(st.get("today_cost_usd", 0.0))
+                month_tokens += int(st.get("month_tokens", 0))
+                month_cost += float(st.get("month_cost_usd", 0.0))
+        return {
+            "today_tokens": today_tokens,
+            "today_cost_usd": round(today_cost, 6),
+            "month_tokens": month_tokens,
+            "month_cost_usd": round(month_cost, 6),
+        }
+
+    def list_models(
+        self,
+        *,
+        model_id: str | None = None,
+        allowed_bot_slugs: set[str] | None = None,
+        viewer_email: str | None = None,
+    ) -> dict[str, Any]:
         """List configured LLM providers (redacting encrypted keys) and usage totals."""
         today_prefix = utc_now()[:10]
         month_prefix = today_prefix[:7]
+        clean_model_filter = str(model_id or "").strip() or None
+        clean_viewer = normalize_email(viewer_email) if viewer_email else ""
+
+        scope_clauses = ["started_at >= ?"]
+        scope_params: list[Any] = [month_prefix]
+        if allowed_bot_slugs is not None or clean_viewer:
+            or_parts: list[str] = []
+            if allowed_bot_slugs is not None:
+                if allowed_bot_slugs:
+                    placeholders = ",".join("?" for _ in allowed_bot_slugs)
+                    or_parts.append(f"bot_slug IN ({placeholders})")
+                    scope_params.extend(sorted(allowed_bot_slugs))
+                else:
+                    or_parts.append("1 = 0")
+            if clean_viewer:
+                or_parts.append("LOWER(TRIM(triggered_by_email)) = ?")
+                scope_params.append(clean_viewer)
+            scope_clauses.append(f"({' OR '.join(or_parts)})")
+        scope_where = f"WHERE {' AND '.join(scope_clauses)}"
+
+        user_scope_clauses = ["started_at >= ?"]
+        user_scope_params: list[Any] = [month_prefix]
+        if clean_viewer:
+            user_scope_clauses.append("LOWER(TRIM(triggered_by_email)) = ?")
+            user_scope_params.append(clean_viewer)
+        user_scope_where = f"WHERE {' AND '.join(user_scope_clauses)}"
+
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT id, slug, provider_type, model_id, api_base, encrypted_api_key,
-                       is_default, daily_token_limit, monthly_budget_usd, created_at
+                       is_default, daily_token_limit, monthly_budget_usd,
+                       input_price_per_million, output_price_per_million, created_at
                 FROM model_providers
                 ORDER BY is_default DESC, created_at ASC
                 """
@@ -417,7 +770,7 @@ class ArgoRepository:
 
             per_model_usage = self._usage_by_model_locked()
             usage_row = self._conn.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(CASE WHEN started_at >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS today_tokens,
                        COALESCE(SUM(CASE WHEN started_at >= ? THEN estimated_cost_usd ELSE 0.0 END), 0.0) AS today_cost,
                        COALESCE(SUM(CASE WHEN started_at >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS month_tokens,
@@ -425,7 +778,7 @@ class ArgoRepository:
                        COALESCE(SUM(CASE WHEN started_at >= ? AND status = 'success' AND COALESCE(input_tokens, 0) = 0 AND COALESCE(output_tokens, 0) = 0 THEN 1 ELSE 0 END), 0) AS deduplicated_runs_today,
                        COALESCE(SUM(CASE WHEN started_at >= ? AND status = 'success' AND COALESCE(input_tokens, 0) = 0 AND COALESCE(output_tokens, 0) = 0 THEN 1 ELSE 0 END), 0) AS deduplicated_runs_month
                 FROM bot_runs
-                WHERE started_at >= ?
+                {scope_where}
                 """,
                 (
                     today_prefix,
@@ -434,32 +787,61 @@ class ArgoRepository:
                     month_prefix,
                     today_prefix,
                     month_prefix,
-                    month_prefix,
+                    *scope_params,
                 ),
             ).fetchone()
             bot_usage_rows = self._conn.execute(
-                """
+                f"""
                 SELECT bot_slug,
                        COUNT(*) AS runs_count,
                        COALESCE(SUM(CASE WHEN started_at >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS today_tokens,
                        COALESCE(SUM(input_tokens + output_tokens), 0) AS month_tokens,
                        COALESCE(SUM(estimated_cost_usd), 0.0) AS month_cost
                 FROM bot_runs
-                WHERE started_at >= ?
+                {scope_where}
                 GROUP BY bot_slug
-                ORDER BY month_tokens DESC, runs_count DESC
+                ORDER BY month_cost DESC, month_tokens DESC, runs_count DESC
                 """,
-                (today_prefix, month_prefix),
+                (today_prefix, *scope_params),
+            ).fetchall()
+            bot_model_rows = self._conn.execute(
+                f"""
+                SELECT bot_slug,
+                       COALESCE(llm_model_used, 'unknown') AS model_id,
+                       COUNT(*) AS runs_count,
+                       COALESCE(SUM(CASE WHEN started_at >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS today_tokens,
+                       COALESCE(SUM(input_tokens + output_tokens), 0) AS month_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0.0) AS month_cost
+                FROM bot_runs
+                {scope_where}
+                GROUP BY bot_slug, COALESCE(llm_model_used, 'unknown')
+                ORDER BY month_cost DESC, month_tokens DESC, runs_count DESC
+                """,
+                (today_prefix, *scope_params),
             ).fetchall()
             bot_trigger_rows = self._conn.execute(
-                """
+                f"""
                 SELECT bot_slug, trigger_type, COUNT(*) AS cnt
                 FROM bot_runs
-                WHERE started_at >= ?
+                {scope_where}
                 GROUP BY bot_slug, trigger_type
                 ORDER BY cnt DESC
                 """,
-                (month_prefix,),
+                tuple(scope_params),
+            ).fetchall()
+            user_usage_rows = self._conn.execute(
+                f"""
+                SELECT COALESCE(NULLIF(LOWER(TRIM(triggered_by_email)), ''), 'workspace') AS user_email,
+                       COUNT(*) AS runs_count,
+                       COALESCE(SUM(CASE WHEN started_at >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS today_tokens,
+                       COALESCE(SUM(input_tokens + output_tokens), 0) AS month_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0.0) AS month_cost
+                FROM bot_runs
+                {user_scope_where}
+                GROUP BY COALESCE(NULLIF(LOWER(TRIM(triggered_by_email)), ''), 'workspace')
+                ORDER BY month_cost DESC, month_tokens DESC, runs_count DESC
+                """,
+                (today_prefix, *user_scope_params),
             ).fetchall()
             bot_meta_rows = self._conn.execute(
                 "SELECT slug, name, enabled, card_json FROM bots"
@@ -469,6 +851,18 @@ class ArgoRepository:
         for trow in bot_trigger_rows:
             if trow["bot_slug"] not in top_trigger_by_bot:
                 top_trigger_by_bot[trow["bot_slug"]] = str(trow["trigger_type"])
+
+        models_by_bot: dict[str, list[dict[str, Any]]] = {}
+        for mrow in bot_model_rows:
+            models_by_bot.setdefault(mrow["bot_slug"], []).append(
+                {
+                    "model_id": str(mrow["model_id"]),
+                    "runs_count": int(mrow["runs_count"]),
+                    "today_tokens": int(mrow["today_tokens"]),
+                    "month_tokens": int(mrow["month_tokens"]),
+                    "month_cost_usd": round(float(mrow["month_cost"]), 6),
+                }
+            )
 
         bot_lookup: dict[str, dict[str, Any]] = {}
         for brow in bot_meta_rows:
@@ -488,20 +882,37 @@ class ArgoRepository:
                 "bot_name": (bot_lookup.get(row["bot_slug"]) or {}).get("name") or row["bot_slug"],
                 "model": (bot_lookup.get(row["bot_slug"]) or {}).get("model") or "",
                 "enabled": (bot_lookup.get(row["bot_slug"]) or {}).get("enabled", False),
+                "exists": row["bot_slug"] in bot_lookup,
                 "runs_count": int(row["runs_count"]),
                 "today_tokens": int(row["today_tokens"]),
                 "month_tokens": int(row["month_tokens"]),
                 "month_cost_usd": round(float(row["month_cost"]), 6),
                 "top_trigger_type": top_trigger_by_bot.get(row["bot_slug"], "manual"),
+                "models_used": models_by_bot.get(row["bot_slug"], []),
             }
             for row in bot_usage_rows
+        ]
+        usage_by_user = [
+            {
+                "email": str(urow["user_email"]),
+                "runs_count": int(urow["runs_count"]),
+                "today_tokens": int(urow["today_tokens"]),
+                "month_tokens": int(urow["month_tokens"]),
+                "month_cost_usd": round(float(urow["month_cost"]), 6),
+            }
+            for urow in user_usage_rows
         ]
 
         providers = [
             self._serialize_model_row(row, per_model_usage.get(row["model_id"]))
             for row in rows
         ]
-        recent_runs = self.list_bot_runs(limit=20)
+        recent_runs = self.list_bot_runs(
+            model_id=clean_model_filter,
+            allowed_bot_slugs=allowed_bot_slugs,
+            triggered_by_email=clean_viewer or None,
+            limit=30,
+        )
         return {
             "providers": providers,
             "today_tokens": int(usage_row["today_tokens"]) if usage_row else 0,
@@ -512,6 +923,7 @@ class ArgoRepository:
             "deduplicated_runs_month": int(usage_row["deduplicated_runs_month"]) if usage_row else 0,
             "recent_runs": recent_runs,
             "usage_by_bot": usage_by_bot,
+            "usage_by_user": usage_by_user,
         }
 
     def list_model_provider_credentials(self) -> list[dict[str, Any]]:
@@ -520,7 +932,8 @@ class ArgoRepository:
             rows = self._conn.execute(
                 """
                 SELECT id, slug, provider_type, model_id, api_base, encrypted_api_key,
-                       is_default, daily_token_limit, monthly_budget_usd, created_at
+                       is_default, daily_token_limit, monthly_budget_usd,
+                       input_price_per_million, output_price_per_million, created_at
                 FROM model_providers
                 ORDER BY is_default DESC, created_at ASC
                 """
@@ -543,6 +956,16 @@ class ArgoRepository:
                     "is_default": bool(row["is_default"]),
                     "daily_token_limit": row["daily_token_limit"],
                     "monthly_budget_usd": row["monthly_budget_usd"],
+                    "input_price_per_million": (
+                        float(row["input_price_per_million"])
+                        if row["input_price_per_million"] is not None
+                        else None
+                    ),
+                    "output_price_per_million": (
+                        float(row["output_price_per_million"])
+                        if row["output_price_per_million"] is not None
+                        else None
+                    ),
                     "created_at": row["created_at"],
                 }
             )
@@ -571,6 +994,8 @@ class ArgoRepository:
         is_default: bool = False,
         daily_token_limit: int | None = None,
         monthly_budget_usd: float | None = None,
+        input_price_per_million: float | None = None,
+        output_price_per_million: float | None = None,
     ) -> dict[str, Any]:
         """Create or update an LLM provider configuration with encrypted API key storage."""
         now = utc_now()
@@ -595,8 +1020,9 @@ class ArgoRepository:
                 """
                 INSERT INTO model_providers(
                     id, slug, provider_type, model_id, api_base, encrypted_api_key,
-                    is_default, daily_token_limit, monthly_budget_usd, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_default, daily_token_limit, monthly_budget_usd,
+                    input_price_per_million, output_price_per_million, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(slug) DO UPDATE SET
                     provider_type = excluded.provider_type,
                     model_id = excluded.model_id,
@@ -604,7 +1030,9 @@ class ArgoRepository:
                     encrypted_api_key = COALESCE(excluded.encrypted_api_key, model_providers.encrypted_api_key),
                     is_default = excluded.is_default,
                     daily_token_limit = excluded.daily_token_limit,
-                    monthly_budget_usd = excluded.monthly_budget_usd
+                    monthly_budget_usd = excluded.monthly_budget_usd,
+                    input_price_per_million = excluded.input_price_per_million,
+                    output_price_per_million = excluded.output_price_per_million
                 """,
                 (
                     make_id("mdl"),
@@ -616,14 +1044,19 @@ class ArgoRepository:
                     1 if is_default else 0,
                     daily_token_limit,
                     monthly_budget_usd,
+                    input_price_per_million,
+                    output_price_per_million,
                     now,
                 ),
             )
             self._conn.commit()
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
             row = self._conn.execute(
                 """
                 SELECT id, slug, provider_type, model_id, api_base, encrypted_api_key,
-                       is_default, daily_token_limit, monthly_budget_usd, created_at
+                       is_default, daily_token_limit, monthly_budget_usd,
+                       input_price_per_million, output_price_per_million, created_at
                 FROM model_providers WHERE slug = ?
                 """,
                 (target_slug,),
@@ -652,7 +1085,8 @@ class ArgoRepository:
             updated = self._conn.execute(
                 """
                 SELECT id, slug, provider_type, model_id, api_base, encrypted_api_key,
-                       is_default, daily_token_limit, monthly_budget_usd, created_at
+                       is_default, daily_token_limit, monthly_budget_usd,
+                       input_price_per_million, output_price_per_million, created_at
                 FROM model_providers WHERE slug = ?
                 """,
                 (target_slug,),
@@ -669,6 +1103,8 @@ class ArgoRepository:
                 (slug, norm),
             )
             self._conn.commit()
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
             if cursor.rowcount == 0:
                 raise NotFoundError(f"Model provider '{slug}' not found.")
 
@@ -685,6 +1121,7 @@ class ArgoRepository:
         estimated_cost_usd: float = 0.0,
         status: str = "success",
         summary: str | None = None,
+        triggered_by_email: str = "",
         started_at: str | None = None,
         finished_at: str | None = None,
     ) -> dict[str, Any]:
@@ -692,14 +1129,15 @@ class ArgoRepository:
         run_id = make_id("run")
         start_ts = started_at or utc_now()
         end_ts = finished_at or utc_now()
+        clean_trigger_email = normalize_email(triggered_by_email)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO bot_runs(
                     id, correlation_id, bot_slug, trigger_type, hop_count,
                     llm_model_used, input_tokens, output_tokens, estimated_cost_usd,
-                    status, summary, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, summary, triggered_by_email, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -713,12 +1151,14 @@ class ArgoRepository:
                     round(float(estimated_cost_usd), 6),
                     status,
                     summary,
+                    clean_trigger_email,
                     start_ts,
                     end_ts,
                 ),
             )
             self._conn.commit()
             row = self._conn.execute("SELECT * FROM bot_runs WHERE id = ?", (run_id,)).fetchone()
+        row_keys = set(row.keys())
         return {
             "id": row["id"],
             "correlation_id": row["correlation_id"],
@@ -731,6 +1171,7 @@ class ArgoRepository:
             "estimated_cost_usd": float(row["estimated_cost_usd"] or 0.0),
             "status": row["status"],
             "summary": row["summary"],
+            "triggered_by_email": str(row["triggered_by_email"] or "") if "triggered_by_email" in row_keys else "",
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
         }
@@ -739,54 +1180,96 @@ class ArgoRepository:
         self,
         *,
         bot_slug: str | None = None,
+        model_id: str | None = None,
+        allowed_bot_slugs: set[str] | None = None,
+        triggered_by_email: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         """List recent bot_runs execution and token accounting records newest first."""
         capped = max(1, min(limit, 200))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if bot_slug:
+            clauses.append("bot_slug = ?")
+            params.append(bot_slug)
+        if model_id:
+            clauses.append("llm_model_used = ?")
+            params.append(model_id)
+        clean_trigger_filter = normalize_email(triggered_by_email) if triggered_by_email else ""
+        if allowed_bot_slugs is not None or clean_trigger_filter:
+            or_parts: list[str] = []
+            if allowed_bot_slugs is not None:
+                if allowed_bot_slugs:
+                    placeholders = ",".join("?" for _ in allowed_bot_slugs)
+                    or_parts.append(f"bot_slug IN ({placeholders})")
+                    params.extend(sorted(allowed_bot_slugs))
+                else:
+                    or_parts.append("1 = 0")
+            if clean_trigger_filter:
+                or_parts.append("LOWER(TRIM(triggered_by_email)) = ?")
+                params.append(clean_trigger_filter)
+            clauses.append(f"({' OR '.join(or_parts)})")
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(capped)
         with self._lock:
-            if bot_slug:
-                rows = self._conn.execute(
-                    """
-                    SELECT * FROM bot_runs
-                    WHERE bot_slug = ?
-                    ORDER BY started_at DESC, rowid DESC
-                    LIMIT ?
-                    """,
-                    (bot_slug, capped),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    """
-                    SELECT * FROM bot_runs
-                    ORDER BY started_at DESC, rowid DESC
-                    LIMIT ?
-                    """,
-                    (capped,),
-                ).fetchall()
-        return [
-            {
-                "id": row["id"],
-                "correlation_id": row["correlation_id"],
-                "bot_slug": row["bot_slug"],
-                "trigger_type": row["trigger_type"],
-                "hop_count": int(row["hop_count"]),
-                "llm_model_used": row["llm_model_used"],
-                "input_tokens": int(row["input_tokens"] or 0),
-                "output_tokens": int(row["output_tokens"] or 0),
-                "estimated_cost_usd": float(row["estimated_cost_usd"] or 0.0),
-                "status": row["status"],
-                "summary": row["summary"],
-                "started_at": row["started_at"],
-                "finished_at": row["finished_at"],
-            }
-            for row in rows
-        ]
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM bot_runs
+                {where_sql}
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            row_keys = set(row.keys())
+            out.append(
+                {
+                    "id": row["id"],
+                    "correlation_id": row["correlation_id"],
+                    "bot_slug": row["bot_slug"],
+                    "trigger_type": row["trigger_type"],
+                    "hop_count": int(row["hop_count"]),
+                    "llm_model_used": row["llm_model_used"],
+                    "input_tokens": int(row["input_tokens"] or 0),
+                    "output_tokens": int(row["output_tokens"] or 0),
+                    "estimated_cost_usd": float(row["estimated_cost_usd"] or 0.0),
+                    "status": row["status"],
+                    "summary": row["summary"],
+                    "triggered_by_email": str(row["triggered_by_email"] or "") if "triggered_by_email" in row_keys else "",
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                }
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Integrations (Primitive 1)
     # ------------------------------------------------------------------
     @staticmethod
-    def _serialize_integration_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _decode_groups(raw: Any) -> list[str]:
+        if isinstance(raw, list):
+            return normalize_group_slugs(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                return normalize_group_slugs(parsed)
+            except Exception:
+                return []
+        return []
+
+    @classmethod
+    def _serialize_integration_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        row_keys = set(row.keys())
+        vis = normalize_visibility(
+            row["visibility"] if "visibility" in row_keys else "shared", default="shared"
+        )
+        groups = (
+            cls._decode_groups(row["allowed_groups_json"])
+            if "allowed_groups_json" in row_keys and vis == "team"
+            else []
+        )
         return {
             "id": row["id"],
             "slug": row["slug"],
@@ -798,6 +1281,9 @@ class ArgoRepository:
             "has_secrets": bool(row["encrypted_secrets"]),
             "last_checked_at": row["last_checked_at"],
             "last_error": row["last_error"],
+            "owner_email": normalize_email(row["owner_email"]) if "owner_email" in row_keys else "",
+            "visibility": vis,
+            "allowed_groups": groups,
             "created_at": row["created_at"],
         }
 
@@ -808,7 +1294,7 @@ class ArgoRepository:
                 """
                 SELECT id, slug, provider, display_name, account_identifier,
                        scopes_json, encrypted_secrets, status, last_checked_at,
-                       last_error, created_at
+                       last_error, owner_email, visibility, allowed_groups_json, created_at
                 FROM oauth_accounts
                 ORDER BY created_at DESC
                 """
@@ -824,7 +1310,7 @@ class ArgoRepository:
                 """
                 SELECT id, slug, provider, display_name, account_identifier,
                        scopes_json, encrypted_secrets, status, last_checked_at,
-                       last_error, created_at
+                       last_error, owner_email, visibility, allowed_groups_json, created_at
                 FROM oauth_accounts
                 WHERE slug = ? OR slug = ?
                 """,
@@ -856,7 +1342,7 @@ class ArgoRepository:
                 """
                 SELECT id, slug, provider, display_name, account_identifier,
                        scopes_json, encrypted_secrets, status, last_checked_at,
-                       last_error, created_at
+                       last_error, owner_email, visibility, allowed_groups_json, created_at
                 FROM oauth_accounts
                 WHERE provider = ?
                 ORDER BY created_at ASC
@@ -892,6 +1378,9 @@ class ArgoRepository:
         scopes: list[str] | None = None,
         secrets: dict[str, Any] | None = None,
         status: str = "ok",
+        owner_email: str | None = None,
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create or update an integration account with Fernet-encrypted credentials."""
         now = utc_now()
@@ -900,7 +1389,7 @@ class ArgoRepository:
 
         with self._lock:
             existing = self._conn.execute(
-                "SELECT encrypted_secrets FROM oauth_accounts WHERE slug = ?",
+                "SELECT encrypted_secrets, owner_email, visibility, allowed_groups_json FROM oauth_accounts WHERE slug = ?",
                 (clean_slug,),
             ).fetchone()
             merged_secrets: dict[str, Any] = {}
@@ -909,14 +1398,43 @@ class ArgoRepository:
             if secrets:
                 merged_secrets.update(secrets)
 
+            existing_keys = set(existing.keys()) if existing else set()
+            existing_owner = (
+                normalize_email(existing["owner_email"])
+                if existing and "owner_email" in existing_keys
+                else ""
+            )
+            existing_vis = (
+                normalize_visibility(existing["visibility"], default="shared")
+                if existing and "visibility" in existing_keys
+                else "shared"
+            )
+            existing_groups = (
+                self._decode_groups(existing["allowed_groups_json"])
+                if existing and "allowed_groups_json" in existing_keys
+                else []
+            )
+            resolved_owner = (
+                normalize_email(owner_email) if owner_email is not None else existing_owner
+            )
+            resolved_vis = (
+                normalize_visibility(visibility) if visibility is not None else existing_vis
+            )
+            if resolved_vis != "team":
+                resolved_groups: list[str] = []
+            elif allowed_groups is not None:
+                resolved_groups = normalize_group_slugs(allowed_groups)
+            else:
+                resolved_groups = existing_groups
+
             encrypted_blob = self._vault.encrypt_json(merged_secrets)
             self._conn.execute(
                 """
                 INSERT INTO oauth_accounts(
                     id, slug, provider, display_name, account_identifier,
                     scopes_json, encrypted_secrets, status, last_checked_at,
-                    last_error, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_error, owner_email, visibility, allowed_groups_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(slug) DO UPDATE SET
                     provider = excluded.provider,
                     display_name = excluded.display_name,
@@ -925,7 +1443,10 @@ class ArgoRepository:
                     encrypted_secrets = excluded.encrypted_secrets,
                     status = excluded.status,
                     last_checked_at = excluded.last_checked_at,
-                    last_error = NULL
+                    last_error = NULL,
+                    owner_email = excluded.owner_email,
+                    visibility = excluded.visibility,
+                    allowed_groups_json = excluded.allowed_groups_json
                 """,
                 (
                     make_id("int"),
@@ -938,6 +1459,9 @@ class ArgoRepository:
                     status,
                     now,
                     None,
+                    resolved_owner,
+                    resolved_vis,
+                    json.dumps(resolved_groups),
                     now,
                 ),
             )
@@ -948,11 +1472,13 @@ class ArgoRepository:
                     created_at=now,
                 )
             self._conn.commit()
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
             row = self._conn.execute(
                 """
                 SELECT id, slug, provider, display_name, account_identifier,
                        scopes_json, encrypted_secrets, status, last_checked_at,
-                       last_error, created_at
+                       last_error, owner_email, visibility, allowed_groups_json, created_at
                 FROM oauth_accounts WHERE slug = ?
                 """,
                 (clean_slug,),
@@ -982,11 +1508,13 @@ class ArgoRepository:
             if cursor.rowcount == 0:
                 raise NotFoundError(f"Integration '{slug}' not found.")
             self._conn.commit()
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
             row = self._conn.execute(
                 """
                 SELECT id, slug, provider, display_name, account_identifier,
                        scopes_json, encrypted_secrets, status, last_checked_at,
-                       last_error, created_at
+                       last_error, owner_email, visibility, allowed_groups_json, created_at
                 FROM oauth_accounts WHERE slug = ? OR slug = ?
                 """,
                 (slug, norm),
@@ -1002,6 +1530,8 @@ class ArgoRepository:
                 (slug, norm),
             )
             self._conn.commit()
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
             if cursor.rowcount == 0:
                 raise NotFoundError(f"Integration '{slug}' not found.")
 
@@ -1010,7 +1540,15 @@ class ArgoRepository:
     # ------------------------------------------------------------------
     def _serialize_bot(self, row: sqlite3.Row) -> dict[str, Any]:
         card = json.loads(row["card_json"])
-        runtime = "desktop" if card.get("desktop_policy", "disabled") != "disabled" else "api"
+        raw_runtime = str(card.get("runtime") or "").strip().lower()
+        if raw_runtime in {"api", "sandbox", "desktop"}:
+            runtime = raw_runtime
+        elif card.get("desktop_policy", "disabled") != "disabled":
+            runtime = "desktop"
+        elif card.get("sandbox_policy", "disabled") != "disabled":
+            runtime = "sandbox"
+        else:
+            runtime = "api"
         tools_list = list(card.get("tools", []) or [])
         account_tools = [
             slugify(str(t.get("slug") or t.get("account") or ""))
@@ -1033,6 +1571,22 @@ class ArgoRepository:
             if isinstance(raw_boundaries, list)
             else []
         )
+        row_keys = set(row.keys())
+        owner_email = normalize_email(
+            (row["owner_email"] if "owner_email" in row_keys else None)
+            or card.get("owner_email")
+        )
+        visibility = normalize_visibility(
+            (row["visibility"] if "visibility" in row_keys else None)
+            or card.get("visibility"),
+            default="shared",
+        )
+        raw_groups = (
+            self._decode_groups(row["allowed_groups_json"])
+            if "allowed_groups_json" in row_keys
+            else normalize_group_slugs(card.get("allowed_groups"))
+        )
+        allowed_groups = raw_groups if visibility == "team" else []
         return {
             "id": row["id"],
             "slug": row["slug"],
@@ -1046,15 +1600,25 @@ class ArgoRepository:
             "boundaries": boundaries,
             "goal_metric": str(card.get("goal_metric") or ""),
             "handoff_bot_slug": str(card.get("handoff_bot_slug") or ""),
+            "owner_email": owner_email,
+            "visibility": visibility,
+            "allowed_groups": allowed_groups,
             "role": row["role"],
             "enabled": bool(row["enabled"]),
             "runtime": runtime,
             "desktop_policy": card.get("desktop_policy", "disabled"),
             "desktop_state": card.get("desktop_state", "none"),
+            "sandbox_policy": card.get(
+                "sandbox_policy", "on_demand" if runtime == "sandbox" else "disabled"
+            ),
+            "sandbox_state": card.get(
+                "sandbox_state", "hibernated" if runtime == "sandbox" else "none"
+            ),
             "ram_mb": int(card.get("ram_mb", 0)),
-            "ram_limit_mb": int(card.get("ram_limit_mb", 2048)),
+            "ram_limit_mb": int(card.get("ram_limit_mb", 512 if runtime == "sandbox" else 2048)),
             "outbound_rbac": card.get("outbound_rbac", "draft"),
             "daily_cap": int(card.get("daily_cap", 10)),
+            "max_steps_per_run": max(3, min(25, int(card.get("max_steps_per_run", 10) or 10))),
             "model": card.get("model", "google:gemini-3.8-flash"),
             "role_prompt": card.get("role_prompt", row["role"]),
             "routines": card.get("routines", []),
@@ -1073,7 +1637,7 @@ class ArgoRepository:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, slug, name, role, enabled, card_json, created_at, updated_at
+                SELECT id, slug, name, role, enabled, card_json, owner_email, visibility, allowed_groups_json, created_at, updated_at
                 FROM bots ORDER BY created_at ASC
                 """
             ).fetchall()
@@ -1084,7 +1648,7 @@ class ArgoRepository:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT id, slug, name, role, enabled, card_json, created_at, updated_at
+                SELECT id, slug, name, role, enabled, card_json, owner_email, visibility, allowed_groups_json, created_at, updated_at
                 FROM bots WHERE slug = ?
                 """,
                 (slug,),
@@ -1119,6 +1683,24 @@ class ArgoRepository:
                 for s in (item.get("skill_slugs") or [])
                 if str(s).strip()
             ]
+            sched_raw = str(
+                item.get("schedule")
+                or (
+                    f"on:{item['event']}"
+                    if r_type == "on_event" and item.get("event")
+                    else "Manual"
+                )
+            ).strip()
+            tz_val = str(item.get("timezone") or "UTC").strip() or "UTC"
+            one_shot_flag = bool(item.get("one_shot", False)) or r_type == "once"
+            if r_type != "on_event" and re.match(r"^(?:once\s+)?in\s+\d+\s*[smh]\b", sched_raw, re.IGNORECASE):
+                from argo_core.runner.scheduler import parse_routine_schedule
+
+                parsed_rel = parse_routine_schedule(sched_raw, tz_val)
+                if parsed_rel and parsed_rel.get("kind") == "date" and parsed_rel.get("normalized"):
+                    sched_raw = str(parsed_rel["normalized"])
+                    r_type = "once"
+                    one_shot_flag = True
             entry: dict[str, Any] = {
                 **item,
                 "id": str(item.get("id") or make_id("rtn")),
@@ -1131,17 +1713,12 @@ class ArgoRepository:
                         else f"Routine {idx + 1}"
                     )
                 ),
-                "schedule": str(
-                    item.get("schedule")
-                    or (
-                        f"on:{item['event']}"
-                        if r_type == "on_event" and item.get("event")
-                        else "Manual"
-                    )
-                ),
-                "timezone": str(item.get("timezone") or "UTC").strip() or "UTC",
+                "schedule": sched_raw,
+                "timezone": tz_val,
                 "enabled": bool(item.get("enabled", True)),
             }
+            if one_shot_flag:
+                entry["one_shot"] = True
             if item.get("prompt"):
                 entry["prompt"] = str(item["prompt"]).strip()
             if skill_slugs:
@@ -1154,9 +1731,26 @@ class ArgoRepository:
     @staticmethod
     def _normalize_collections(collections: dict[str, list[str]] | None) -> dict[str, list[str]]:
         if not collections:
-            return {"read": ["bot_threads"], "write": ["bot_threads"]}
-        read_list = [collection_slug(str(c)) for c in collections.get("read", []) if str(c).strip()]
-        write_list = [collection_slug(str(c)) for c in collections.get("write", []) if str(c).strip()]
+            return {"read": ["bot_threads"], "write": []}
+        read_forbidden = _READ_FORBIDDEN_SYSTEM_COLLECTIONS - {"bot_threads"}
+        read_list = list(
+            dict.fromkeys(
+                norm
+                for c in collections.get("read", [])
+                if str(c).strip()
+                for norm in (dataset_identifier(str(c)),)
+                if norm not in read_forbidden
+            )
+        )
+        write_list = list(
+            dict.fromkeys(
+                norm
+                for c in collections.get("write", [])
+                if str(c).strip()
+                for norm in (collection_slug(str(c)),)
+                if norm not in _INTERNAL_SYSTEM_COLLECTIONS
+            )
+        )
         return {"read": read_list, "write": write_list}
 
     @staticmethod
@@ -1206,6 +1800,7 @@ class ArgoRepository:
         outbound_rbac: str = "draft",
         model: str = "google:gemini-3.8-flash",
         daily_cap: int = 10,
+        max_steps_per_run: int = 10,
         slug: str | None = None,
         role_prompt: str | None = None,
         routines: list[dict[str, Any]] | None = None,
@@ -1221,12 +1816,26 @@ class ArgoRepository:
         goal_metric: str = "",
         handoff_bot_slug: str = "",
         onboarding_mode: str = "configured",
+        owner_email: str = "",
+        visibility: str = "shared",
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a new declarative bot record in SQLite without code edits or rebuilds."""
         now = utc_now()
+        clean_owner = normalize_email(owner_email)
+        clean_visibility = normalize_visibility(visibility, default="shared")
+        clean_allowed_groups = (
+            normalize_group_slugs(allowed_groups) if clean_visibility == "team" else []
+        )
+        runtime = str(runtime or "api").strip().lower()
+        if runtime not in {"api", "sandbox", "desktop"}:
+            runtime = "api"
         base_slug = slugify(slug or name)
         desktop_policy = "on_demand" if runtime == "desktop" else "disabled"
         desktop_state = "hibernated" if runtime == "desktop" else "none"
+        sandbox_policy = "on_demand" if runtime == "sandbox" else "disabled"
+        sandbox_state = "hibernated" if runtime == "sandbox" else "none"
+        ram_limit_mb = 512 if runtime == "sandbox" else 2048
         effective_cap = daily_cap if outbound_rbac == "execute" else (daily_cap if outbound_rbac == "draft" else 0)
         resolved_prompt = (role_prompt or role).strip()
         is_interview = onboarding_mode == "interview"
@@ -1256,6 +1865,8 @@ class ArgoRepository:
         )
         if runtime == "desktop":
             resolved_tools = _ensure_desktop_tools(resolved_tools)
+        elif runtime == "sandbox":
+            resolved_tools = _ensure_sandbox_tools(resolved_tools)
         clean_boundaries = [
             str(b).strip() for b in (boundaries or []) if str(b).strip()
         ]
@@ -1275,7 +1886,7 @@ class ArgoRepository:
                 if collections is not None
                 else {
                     "read": ["bot_threads", default_items_col],
-                    "write": ["bot_threads", default_items_col],
+                    "write": [default_items_col],
                 }
             )
 
@@ -1291,15 +1902,22 @@ class ArgoRepository:
                 "boundaries": clean_boundaries,
                 "goal_metric": (goal_metric or "").strip(),
                 "handoff_bot_slug": slugify(handoff_bot_slug) if handoff_bot_slug and handoff_bot_slug.strip() else "",
+                "owner_email": clean_owner,
+                "visibility": clean_visibility,
+                "allowed_groups": clean_allowed_groups,
                 "role": role.strip(),
                 "enabled": True,
                 "model": model,
+                "runtime": runtime,
                 "desktop_policy": desktop_policy,
                 "desktop_state": desktop_state,
+                "sandbox_policy": sandbox_policy,
+                "sandbox_state": sandbox_state,
                 "ram_mb": 0,
-                "ram_limit_mb": 2048,
+                "ram_limit_mb": ram_limit_mb,
                 "outbound_rbac": outbound_rbac,
                 "daily_cap": effective_cap,
+                "max_steps_per_run": max(3, min(25, int(max_steps_per_run or 10))),
                 "role_prompt": resolved_prompt,
                 "routines": resolved_routines,
                 "permissions": _default_permissions(outbound_rbac, runtime),
@@ -1307,16 +1925,27 @@ class ArgoRepository:
                 "collections": resolved_collections,
                 "onboarding_pending": bool(is_interview),
             }
+            has_account_tools = any(
+                isinstance(t, dict)
+                and t.get("type") in {"account", "connector"}
+                and str(t.get("slug") or t.get("account") or "").strip()
+                for t in resolved_tools
+            )
             if linked_accounts is not None:
                 card["linked_accounts"] = list(
                     dict.fromkeys(slugify(str(a)) for a in linked_accounts if str(a).strip())
                 )
                 card["linked_accounts_restricted"] = True
+            elif outbound_rbac == "internal" and not has_account_tools:
+                card["linked_accounts"] = []
+                card["linked_accounts_restricted"] = True
 
             self._conn.execute(
                 """
-                INSERT INTO bots(id, slug, name, role, enabled, card_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO bots(
+                    id, slug, name, role, enabled, card_json, owner_email, visibility, allowed_groups_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     make_id("bot"),
@@ -1325,6 +1954,9 @@ class ArgoRepository:
                     role.strip(),
                     1,
                     json.dumps(card),
+                    clean_owner,
+                    clean_visibility,
+                    json.dumps(clean_allowed_groups),
                     now,
                     now,
                 ),
@@ -1386,13 +2018,48 @@ class ArgoRepository:
         now = utc_now()
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, slug, name, role, enabled, card_json, created_at, updated_at FROM bots WHERE slug = ?",
+                """
+                SELECT id, slug, name, role, enabled, card_json, owner_email, visibility, allowed_groups_json, created_at, updated_at
+                FROM bots WHERE slug = ?
+                """,
                 (slug,),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"Bot '{slug}' not found.")
 
+            row_keys = set(row.keys())
             card = json.loads(row["card_json"])
+            owner_email_val = normalize_email(
+                (row["owner_email"] if "owner_email" in row_keys else None)
+                or card.get("owner_email")
+            )
+            visibility_val = normalize_visibility(
+                (row["visibility"] if "visibility" in row_keys else None)
+                or card.get("visibility"),
+                default="shared",
+            )
+            existing_groups = (
+                self._decode_groups(row["allowed_groups_json"])
+                if "allowed_groups_json" in row_keys
+                else normalize_group_slugs(card.get("allowed_groups"))
+            )
+            if updates.get("owner_email") is not None:
+                owner_email_val = normalize_email(str(updates["owner_email"]))
+                card["owner_email"] = owner_email_val
+            else:
+                card["owner_email"] = owner_email_val
+            if updates.get("visibility") is not None:
+                visibility_val = normalize_visibility(str(updates["visibility"]))
+                card["visibility"] = visibility_val
+            else:
+                card["visibility"] = visibility_val
+            if visibility_val != "team":
+                allowed_groups_val: list[str] = []
+            elif "allowed_groups" in updates and updates["allowed_groups"] is not None:
+                allowed_groups_val = normalize_group_slugs(updates["allowed_groups"])
+            else:
+                allowed_groups_val = existing_groups
+            card["allowed_groups"] = allowed_groups_val
             name_text = str(row["name"])
             enabled = bool(row["enabled"])
             role_text = str(row["role"])
@@ -1432,32 +2099,74 @@ class ArgoRepository:
             if "handoff_bot_slug" in updates and updates["handoff_bot_slug"] is not None:
                 raw_handoff = str(updates["handoff_bot_slug"]).strip()
                 card["handoff_bot_slug"] = slugify(raw_handoff) if raw_handoff else ""
-            if updates.get("runtime") in {"api", "desktop"}:
+            if updates.get("runtime") in {"api", "sandbox", "desktop"}:
                 new_rt = str(updates["runtime"])
+                card["runtime"] = new_rt
                 card["desktop_policy"] = "on_demand" if new_rt == "desktop" else "disabled"
+                card["sandbox_policy"] = "on_demand" if new_rt == "sandbox" else "disabled"
                 if new_rt == "desktop":
                     if card.get("desktop_state") in {None, "", "none"}:
                         card["desktop_state"] = "hibernated"
+                    card["sandbox_state"] = "none"
+                    card["ram_limit_mb"] = 2048
                     card["tools"] = _ensure_desktop_tools(list(card.get("tools", []) or []))
+                elif new_rt == "sandbox":
+                    card["desktop_state"] = "none"
+                    if card.get("sandbox_state") in {None, "", "none"}:
+                        card["sandbox_state"] = "hibernated"
+                    card["ram_mb"] = 0
+                    card["ram_limit_mb"] = 512
+                    card["tools"] = _ensure_sandbox_tools(list(card.get("tools", []) or []))
                 else:
                     card["desktop_state"] = "none"
+                    card["sandbox_state"] = "none"
                     card["ram_mb"] = 0
+                    card["ram_limit_mb"] = 2048
                 card["permissions"] = _default_permissions(
                     str(card.get("outbound_rbac") or "draft"),
                     new_rt,
                 )
             if updates.get("outbound_rbac"):
-                rbac = str(updates["outbound_rbac"])
+                prev_rbac = str(card.get("outbound_rbac") or "draft").lower()
+                rbac = str(updates["outbound_rbac"]).lower()
                 card["outbound_rbac"] = rbac
-                runtime = "desktop" if card.get("desktop_policy", "disabled") != "disabled" else "api"
+                runtime = (
+                    str(card.get("runtime"))
+                    if str(card.get("runtime")) in {"api", "sandbox", "desktop"}
+                    else ("desktop" if card.get("desktop_policy", "disabled") != "disabled" else "api")
+                )
                 card["permissions"] = _default_permissions(rbac, runtime)
                 if rbac == "execute" and int(card.get("daily_cap", 0)) < 1:
                     card["daily_cap"] = 10
+                if updates.get("tools") is None and "linked_accounts" not in updates:
+                    prev_cap = "read" if prev_rbac == "internal" else prev_rbac
+                    new_cap = "read" if rbac == "internal" else rbac
+                    updated_tools = []
+                    for item in card.get("tools", []) or []:
+                        if isinstance(item, dict) and item.get("type") in {"account", "connector"}:
+                            item_copy = dict(item)
+                            cur_cap = str(item_copy.get("capability") or item_copy.get("rbac") or "").lower()
+                            if cur_cap in {"", prev_cap}:
+                                item_copy["capability"] = new_cap
+                                if rbac == "execute" and int(item_copy.get("max_calls_per_day", 0)) < 1:
+                                    item_copy["max_calls_per_day"] = max(10, int(card.get("daily_cap") or 10))
+                            updated_tools.append(item_copy)
+                        else:
+                            updated_tools.append(item)
+                    card["tools"] = updated_tools
             if updates.get("daily_cap") is not None:
                 card["daily_cap"] = max(0, int(updates["daily_cap"]))
+            if "max_steps_per_run" in updates and updates["max_steps_per_run"] is not None:
+                card["max_steps_per_run"] = max(3, min(25, int(updates["max_steps_per_run"])))
             if updates.get("desktop_state"):
                 card["desktop_state"] = str(updates["desktop_state"])
                 card["ram_mb"] = 1380 if card["desktop_state"] == "running" else 0
+            if updates.get("sandbox_state"):
+                card["sandbox_state"] = str(updates["sandbox_state"])
+                if updates.get("ram_mb") is not None:
+                    card["ram_mb"] = max(0, int(updates["ram_mb"]))
+                else:
+                    card["ram_mb"] = 48 if card["sandbox_state"] == "running" else 0
             if updates.get("routines") is not None:
                 card["routines"] = self._normalize_routines(updates["routines"])
             if updates.get("tools") is not None:
@@ -1488,8 +2197,23 @@ class ArgoRepository:
                         break
 
             self._conn.execute(
-                "UPDATE bots SET name = ?, role = ?, enabled = ?, card_json = ?, updated_at = ? WHERE slug = ?",
-                (name_text, role_text, 1 if enabled else 0, json.dumps(card), now, slug),
+                """
+                UPDATE bots
+                SET name = ?, role = ?, enabled = ?, card_json = ?,
+                    owner_email = ?, visibility = ?, allowed_groups_json = ?, updated_at = ?
+                WHERE slug = ?
+                """,
+                (
+                    name_text,
+                    role_text,
+                    1 if enabled else 0,
+                    json.dumps(card),
+                    owner_email_val,
+                    visibility_val,
+                    json.dumps(allowed_groups_val),
+                    now,
+                    slug,
+                ),
             )
             self._register_collections_locked(
                 card.get("collections"),
@@ -1504,7 +2228,17 @@ class ArgoRepository:
         bot = self.get_bot(slug)
         clean_slug = bot["slug"]
         now = utc_now()
-        with self._lock:
+        superseded_approvals: list[dict[str, Any]] = []
+        with self._tx():
+            pending_aprs = self._conn.execute(
+                """
+                SELECT * FROM approvals_outbox
+                WHERE bot_slug = ? AND status = 'pending'
+                """,
+                (clean_slug,),
+            ).fetchall()
+            superseded_approvals = [self._serialize_approval(arow) for arow in pending_aprs]
+
             cursor = self._conn.execute("DELETE FROM bots WHERE slug = ?", (clean_slug,))
             if cursor.rowcount == 0:
                 raise NotFoundError(f"Bot '{slug}' not found.")
@@ -1563,7 +2297,7 @@ class ArgoRepository:
                         (json.dumps(card), now, brow["slug"]),
                     )
 
-            # Clean deleted bot out of any bot_rooms membership / stage order
+            # Clean deleted bot out of any bot_rooms membership / stage order (remove <2-member Rooms)
             room_rows = self._conn.execute(
                 """
                 SELECT id, external_key, doc_json
@@ -1583,7 +2317,7 @@ class ArgoRepository:
                     continue
                 remaining_members = [m for m in members if m != clean_slug]
                 room_slug_val = str(rdoc.get("slug") or rrow["external_key"] or "")
-                if not remaining_members:
+                if len(remaining_members) < 2:
                     self._conn.execute(
                         "DELETE FROM collection_documents WHERE collection = 'bot_rooms' AND id = ?",
                         (rrow["id"],),
@@ -1591,6 +2325,15 @@ class ArgoRepository:
                     if room_slug_val:
                         self._conn.execute(
                             "DELETE FROM collection_documents WHERE collection = 'room_threads' AND json_extract(doc_json, '$.room_slug') = ?",
+                            (room_slug_val,),
+                        )
+                        self._conn.execute(
+                            """
+                            DELETE FROM collection_documents
+                            WHERE collection = 'thread_read_cursors'
+                              AND json_extract(doc_json, '$.target_type') = 'room'
+                              AND json_extract(doc_json, '$.slug') = ?
+                            """,
                             (room_slug_val,),
                         )
                 else:
@@ -1614,7 +2357,7 @@ class ArgoRepository:
                         (json.dumps(rdoc), search_txt, now, rrow["id"]),
                     )
 
-            self._conn.commit()
+        bot["_superseded_approvals"] = superseded_approvals
         return bot
 
     @staticmethod
@@ -1719,6 +2462,228 @@ class ArgoRepository:
             ).fetchall()
 
         return [self._serialize_bot_message(slug, row) for row in rows]
+
+    def _clear_thread_messages(
+        self,
+        *,
+        collection: str,
+        slug_field: str,
+        target_type: str,
+        target_slug: str,
+        keep_last: int = 0,
+        older_than_days: int | None = None,
+    ) -> dict[str, int]:
+        """Delete matching bot/room thread transcript rows without touching non-transcript state."""
+        keep = max(0, int(keep_last))
+        cutoff_iso: str | None = None
+        if older_than_days is not None:
+            days = max(1, min(3650, int(older_than_days)))
+            cutoff_iso = (
+                (datetime.now(UTC) - timedelta(days=days))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        slug_expr = f"json_extract(doc_json, '$.{slug_field}') = ?"
+        with self._lock:
+            keep_ids: list[str] = []
+            if keep > 0:
+                keep_rows = self._conn.execute(
+                    f"""
+                    SELECT id
+                    FROM collection_documents
+                    WHERE collection = ?
+                      AND {slug_expr}
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (collection, target_slug, keep),
+                ).fetchall()
+                keep_ids = [str(r["id"]) for r in keep_rows]
+
+            clauses = ["collection = ?", slug_expr]
+            params: list[Any] = [collection, target_slug]
+            if cutoff_iso is not None:
+                clauses.append("created_at < ?")
+                params.append(cutoff_iso)
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                clauses.append(f"id NOT IN ({placeholders})")
+                params.extend(keep_ids)
+
+            if keep > 0 and not keep_ids:
+                deleted_count = 0
+            else:
+                cur = self._conn.execute(
+                    f"DELETE FROM collection_documents WHERE {' AND '.join(clauses)}",
+                    params,
+                )
+                deleted_count = int(cur.rowcount or 0)
+
+            rem_row = self._conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM collection_documents
+                WHERE collection = ?
+                  AND {slug_expr}
+                """,
+                (collection, target_slug),
+            ).fetchone()
+            remaining_count = int(rem_row[0]) if rem_row else 0
+
+            if remaining_count == 0:
+                self._conn.execute(
+                    """
+                    DELETE FROM collection_documents
+                    WHERE collection = 'thread_read_cursors'
+                      AND json_extract(doc_json, '$.target_type') = ?
+                      AND json_extract(doc_json, '$.slug') = ?
+                    """,
+                    (target_type, target_slug),
+                )
+            self._conn.commit()
+
+        return {
+            "deleted_count": deleted_count,
+            "remaining_count": remaining_count,
+        }
+
+    def clear_bot_messages(
+        self,
+        slug: str,
+        *,
+        keep_last: int = 0,
+        older_than_days: int | None = None,
+    ) -> dict[str, int]:
+        """Clear 1:1 bot chat transcript rows without touching skills, rules, routines, or data."""
+        bot = self.get_bot(slug)
+        return self._clear_thread_messages(
+            collection="bot_threads",
+            slug_field="bot_slug",
+            target_type="bot",
+            target_slug=bot["slug"],
+            keep_last=keep_last,
+            older_than_days=older_than_days,
+        )
+
+    def rewind_last_user_message(
+        self,
+        *,
+        target_type: str,
+        target_slug: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Remove the user's most recent message and any subsequent replies so it can be re-submitted."""
+        clean_type = "room" if target_type == "room" else "bot"
+        if clean_type == "room":
+            room = self.get_room(target_slug)
+            clean_slug = room["slug"]
+            collection = "room_threads"
+            slug_field = "room_slug"
+        else:
+            bot = self.get_bot(target_slug)
+            clean_slug = bot["slug"]
+            collection = "bot_threads"
+            slug_field = "bot_slug"
+
+        slug_expr = f"json_extract(doc_json, '$.{slug_field}') = ?"
+        with self._lock:
+            target_row = self._conn.execute(
+                f"""
+                SELECT rowid, id, doc_json, created_at
+                FROM collection_documents
+                WHERE collection = ?
+                  AND {slug_expr}
+                  AND id = ?
+                """,
+                (collection, clean_slug, message_id),
+            ).fetchone()
+            if target_row is None:
+                raise NotFoundError(f"Message '{message_id}' not found in {clean_type} '{clean_slug}'.")
+
+            try:
+                target_doc = json.loads(target_row["doc_json"])
+            except json.JSONDecodeError:
+                target_doc = {}
+            sender_val = str(target_doc.get("sender_type") or target_doc.get("sender") or "").strip().lower()
+            if sender_val != "user":
+                raise ValueError("Only your own user messages can be edited.")
+
+            later_user = self._conn.execute(
+                f"""
+                SELECT 1
+                FROM collection_documents
+                WHERE collection = ?
+                  AND {slug_expr}
+                  AND COALESCE(json_extract(doc_json, '$.sender_type'), json_extract(doc_json, '$.sender')) = 'user'
+                  AND (created_at > ? OR (created_at = ? AND rowid > ?))
+                LIMIT 1
+                """,
+                (collection, clean_slug, target_row["created_at"], target_row["created_at"], target_row["rowid"]),
+            ).fetchone()
+            if later_user is not None:
+                raise ValueError("Only your most recent message in this conversation can be edited.")
+
+            tail_rows = self._conn.execute(
+                f"""
+                SELECT id, doc_json
+                FROM collection_documents
+                WHERE collection = ?
+                  AND {slug_expr}
+                  AND (id = ? OR created_at > ? OR (created_at = ? AND rowid > ?))
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (
+                    collection,
+                    clean_slug,
+                    message_id,
+                    target_row["created_at"],
+                    target_row["created_at"],
+                    target_row["rowid"],
+                ),
+            ).fetchall()
+
+            deleted_ids = [str(r["id"]) for r in tail_rows]
+            corr_ids: list[str] = []
+            for r in tail_rows:
+                try:
+                    rdoc = json.loads(r["doc_json"])
+                except json.JSONDecodeError:
+                    continue
+                rmeta = rdoc.get("metadata") if isinstance(rdoc, dict) else None
+                cid = str(rmeta.get("correlation_id") or "").strip() if isinstance(rmeta, dict) else ""
+                if cid and cid not in corr_ids:
+                    corr_ids.append(cid)
+
+            superseded_approvals = 0
+            if corr_ids:
+                now = utc_now()
+                placeholders = ",".join("?" for _ in corr_ids)
+                cur_apr = self._conn.execute(
+                    f"""
+                    UPDATE approvals_outbox
+                    SET status = 'superseded', resolved_at = ?
+                    WHERE status = 'pending' AND correlation_id IN ({placeholders})
+                    """,
+                    [now, *corr_ids],
+                )
+                superseded_approvals = int(cur_apr.rowcount or 0)
+
+            if deleted_ids:
+                id_placeholders = ",".join("?" for _ in deleted_ids)
+                self._conn.execute(
+                    f"DELETE FROM collection_documents WHERE collection = ? AND id IN ({id_placeholders})",
+                    [collection, *deleted_ids],
+                )
+            self._conn.commit()
+
+        orig_meta = target_doc.get("metadata") if isinstance(target_doc.get("metadata"), dict) else {}
+        return {
+            "deleted_ids": deleted_ids,
+            "original_metadata": dict(orig_meta),
+            "superseded_approvals": superseded_approvals,
+        }
 
     def ensure_bot_data_collection(self, slug: str) -> str:
         """Ensure a source-polling bot has a non-internal SQLite data collection for storage and dedup."""
@@ -1987,12 +2952,27 @@ class ArgoRepository:
 
         required_providers: list[str] = []
         sanitized_tools: list[Any] = []
+        connector_policies: list[dict[str, Any]] = []
         for tool in bot.get("tools", []):
             if isinstance(tool, dict) and tool.get("type") in {"account", "connector"}:
                 acc_slug = slugify(str(tool.get("slug") or tool.get("account") or ""))
                 acc = integrations_by_slug.get(acc_slug)
+                prov = str(acc["provider"]) if acc else str(tool.get("provider") or "").strip().lower()
                 if acc and acc["provider"] not in required_providers:
                     required_providers.append(acc["provider"])
+                pol: dict[str, Any] = {}
+                if prov:
+                    pol["provider"] = prov
+                if tool.get("capability") or tool.get("rbac"):
+                    pol["capability"] = str(tool.get("capability") or tool.get("rbac")).strip().lower()
+                if tool.get("target") and str(tool.get("target")).strip():
+                    pol["target"] = str(tool["target"]).strip()
+                if isinstance(tool.get("targets"), list) and any(str(t).strip() for t in tool["targets"]):
+                    pol["targets"] = [str(t).strip() for t in tool["targets"] if str(t).strip()]
+                if tool.get("max_calls_per_day") is not None:
+                    pol["max_calls_per_day"] = int(tool["max_calls_per_day"])
+                if pol:
+                    connector_policies.append(pol)
                 continue
             sanitized_tools.append(tool)
 
@@ -2008,15 +2988,17 @@ class ArgoRepository:
         ]
         scoped_skills = [
             {
+                "slug": s["slug"],
                 "name": s["name"],
                 "description": s["description"],
                 "instructions": s["instructions"],
             }
             for s in self.list_skills()
-            if s["scope_slug"] == slug
+            if s["scope_slug"] == bot["slug"]
         ]
         return {
             "schema_version": "argo.bot_blueprint.v1",
+            "source_slug": bot["slug"],
             "name": bot["name"],
             "role": bot["role"],
             "role_prompt": bot["role_prompt"],
@@ -2032,8 +3014,9 @@ class ArgoRepository:
             "model": bot["model"],
             "routines": sanitized_routines,
             "tools": sanitized_tools,
-            "collections": bot.get("collections") or {"read": ["bot_threads"], "write": ["bot_threads"]},
+            "collections": bot.get("collections") or {"read": ["bot_threads"], "write": []},
             "required_providers": required_providers,
+            "connector_policies": connector_policies,
             "skills": scoped_skills,
         }
 
@@ -2042,6 +3025,9 @@ class ArgoRepository:
         blueprint: dict[str, Any],
         *,
         linked_accounts: list[str] | None = None,
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Instantiate a declarative bot and its bundled skills from a portable blueprint."""
         if not isinstance(blueprint, dict):
@@ -2057,10 +3043,41 @@ class ArgoRepository:
         if ":" not in model:
             model = "google:gemini-3.8-flash"
 
-        runtime = "desktop" if str(blueprint.get("runtime")) == "desktop" else "api"
+        raw_bp_rt = str(blueprint.get("runtime") or "api").strip().lower()
+        runtime = raw_bp_rt if raw_bp_rt in {"api", "sandbox", "desktop"} else "api"
         rbac = str(blueprint.get("outbound_rbac") or "draft")
         if rbac not in {"internal", "draft", "execute"}:
             rbac = "draft"
+
+        raw_daily_cap = blueprint.get("daily_cap")
+        parsed_daily_cap = max(0, min(500, int(10 if raw_daily_cap is None else raw_daily_cap)))
+        orig_slug = slugify(str(blueprint.get("source_slug") or blueprint.get("slug") or name))
+
+        raw_tools = list(blueprint.get("tools")) if isinstance(blueprint.get("tools"), list) else []
+        raw_policies = blueprint.get("connector_policies") if isinstance(blueprint.get("connector_policies"), list) else []
+        merged_tools: list[Any] = list(raw_tools)
+        if linked_accounts and raw_policies:
+            integrations_by_slug = {acc["slug"]: acc for acc in self.list_integrations()}
+            used_policies: set[int] = set()
+            for raw_acc in linked_accounts:
+                acc_slug = slugify(str(raw_acc))
+                acc = integrations_by_slug.get(acc_slug)
+                acc_prov = str(acc["provider"]).lower() if acc else ""
+                matched_pol = None
+                for p_idx, pol in enumerate(raw_policies):
+                    if not isinstance(pol, dict) or p_idx in used_policies:
+                        continue
+                    pol_prov = str(pol.get("provider") or "").strip().lower()
+                    if not pol_prov or not acc_prov or pol_prov == acc_prov:
+                        matched_pol = pol
+                        used_policies.add(p_idx)
+                        break
+                if matched_pol is not None:
+                    tool_entry: dict[str, Any] = {"type": "account", "slug": acc_slug}
+                    for fld in ("capability", "target", "targets", "max_calls_per_day"):
+                        if fld in matched_pol and matched_pol[fld] is not None:
+                            tool_entry[fld] = matched_pol[fld]
+                    merged_tools.append(tool_entry)
 
         created = self.create_bot(
             name=name[:120],
@@ -2069,9 +3086,9 @@ class ArgoRepository:
             runtime=runtime,
             outbound_rbac=rbac,
             model=model,
-            daily_cap=max(0, min(500, int(blueprint.get("daily_cap") or 10))),
+            daily_cap=parsed_daily_cap,
             routines=blueprint.get("routines") if isinstance(blueprint.get("routines"), list) else None,
-            tools=blueprint.get("tools") if isinstance(blueprint.get("tools"), list) else None,
+            tools=merged_tools if (blueprint.get("tools") is not None or raw_policies) else None,
             collections=blueprint.get("collections") if isinstance(blueprint.get("collections"), dict) else None,
             linked_accounts=linked_accounts if linked_accounts else None,
             avatar_color=str(blueprint.get("avatar_color") or "slate"),
@@ -2080,16 +3097,53 @@ class ArgoRepository:
             boundaries=blueprint.get("boundaries") if isinstance(blueprint.get("boundaries"), list) else None,
             goal_metric=str(blueprint.get("goal_metric") or ""),
             handoff_bot_slug=str(blueprint.get("handoff_bot_slug") or ""),
+            owner_email=owner_email,
+            visibility=visibility,
+            allowed_groups=allowed_groups,
         )
+        skill_slug_map: dict[str, str] = {}
         for skill in blueprint.get("skills") or []:
             if isinstance(skill, dict) and skill.get("name") and skill.get("instructions"):
-                self.upsert_skill(
+                old_sk_slug = slugify(str(skill.get("slug") or f"{orig_slug}-{skill['name']}"))
+                short_sk = f"{created['slug']}-{slugify(str(skill['name']))}"
+                saved_sk = self.upsert_skill(
                     name=str(skill["name"]),
                     description=str(skill.get("description") or ""),
                     instructions=str(skill["instructions"]),
                     scope_slug=created["slug"],
-                    skill_slug=f"{created['slug']}-{slugify(str(skill['name']))}",
+                    skill_slug=short_sk,
                 )
+                skill_slug_map[old_sk_slug] = saved_sk["slug"]
+                skill_slug_map[slugify(str(skill["name"]))] = saved_sk["slug"]
+
+        bot_updates: dict[str, Any] = {}
+        if orig_slug and orig_slug != created["slug"]:
+            old_items = f"bot_{orig_slug}_items"
+            new_items = f"bot_{created['slug']}_items"
+            cols = dict(created.get("collections") or {"read": ["bot_threads"], "write": []})
+            remapped_read = [new_items if c == old_items else c for c in cols.get("read", [])]
+            remapped_write = [new_items if c == old_items else c for c in cols.get("write", [])]
+            if remapped_read != cols.get("read") or remapped_write != cols.get("write"):
+                bot_updates["collections"] = {"read": remapped_read, "write": remapped_write}
+
+        if skill_slug_map and created.get("routines"):
+            new_routines = []
+            routines_changed = False
+            for rtn in created["routines"]:
+                if isinstance(rtn, dict) and rtn.get("skill_slugs"):
+                    remapped_sk = [
+                        skill_slug_map.get(slugify(str(s)), slugify(str(s)))
+                        for s in rtn["skill_slugs"]
+                    ]
+                    if remapped_sk != rtn["skill_slugs"]:
+                        rtn = {**rtn, "skill_slugs": remapped_sk}
+                        routines_changed = True
+                new_routines.append(rtn)
+            if routines_changed:
+                bot_updates["routines"] = new_routines
+
+        if bot_updates:
+            created = self.update_bot(created["slug"], bot_updates)
         return created
 
     # ------------------------------------------------------------------
@@ -2113,6 +3167,13 @@ class ArgoRepository:
             "pinned_page_slug": doc.get("pinned_page_slug") or None,
             "pinned": bool(doc.get("pinned", False)),
             "section": str(doc.get("section") or ""),
+            "owner_email": normalize_email(doc.get("owner_email")),
+            "visibility": normalize_visibility(doc.get("visibility"), default="shared"),
+            "allowed_groups": (
+                normalize_group_slugs(doc.get("allowed_groups"))
+                if normalize_visibility(doc.get("visibility"), default="shared") == "team"
+                else []
+            ),
             "created_at": item["created_at"],
             "updated_at": item["updated_at"],
         }
@@ -2146,6 +3207,9 @@ class ArgoRepository:
         pinned: bool = False,
         section: str = "",
         slug: str | None = None,
+        owner_email: str = "",
+        visibility: str = "shared",
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a shared multi-bot group chat Room (2 to 6 member bots)."""
         clean_title = title.strip()
@@ -2198,6 +3262,13 @@ class ArgoRepository:
             "pinned_page_slug": slugify(pinned_page_slug) if pinned_page_slug and pinned_page_slug.strip() else None,
             "pinned": bool(pinned),
             "section": section.strip(),
+            "owner_email": normalize_email(owner_email),
+            "visibility": normalize_visibility(visibility, default="shared"),
+            "allowed_groups": (
+                normalize_group_slugs(allowed_groups)
+                if normalize_visibility(visibility, default="shared") == "team"
+                else []
+            ),
         }
         saved = self.upsert_document(
             collection="bot_rooms",
@@ -2287,6 +3358,27 @@ class ArgoRepository:
             ),
             "pinned": bool(updates["pinned"]) if updates.get("pinned") is not None else current["pinned"],
             "section": str(updates["section"]).strip() if updates.get("section") is not None else current["section"],
+            "owner_email": (
+                normalize_email(updates["owner_email"])
+                if updates.get("owner_email") is not None
+                else normalize_email(current.get("owner_email"))
+            ),
+            "visibility": (
+                next_room_vis := (
+                    normalize_visibility(updates["visibility"])
+                    if updates.get("visibility") is not None
+                    else normalize_visibility(current.get("visibility"), default="shared")
+                )
+            ),
+            "allowed_groups": (
+                []
+                if next_room_vis != "team"
+                else (
+                    normalize_group_slugs(updates["allowed_groups"])
+                    if "allowed_groups" in updates and updates["allowed_groups"] is not None
+                    else list(current.get("allowed_groups") or [])
+                )
+            ),
         }
         saved = self.upsert_document(
             collection="bot_rooms",
@@ -2445,10 +3537,42 @@ class ArgoRepository:
         self,
         room_slug: str,
         *,
-        limit: int = 40,
+        limit: int | None = 40,
     ) -> list[dict[str, Any]]:
-        msgs, _, _ = self.list_room_messages_window(room_slug, limit=limit)
-        return msgs
+        clean_room = slugify(room_slug)
+        if limit is not None:
+            msgs, _, _ = self.list_room_messages_window(clean_room, limit=limit)
+            return msgs
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, doc_json, created_at
+                FROM collection_documents
+                WHERE collection = 'room_threads'
+                  AND json_extract(doc_json, '$.room_slug') = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (clean_room,),
+            ).fetchall()
+        return [self._serialize_room_message(clean_room, row) for row in rows]
+
+    def clear_room_messages(
+        self,
+        room_slug: str,
+        *,
+        keep_last: int = 0,
+        older_than_days: int | None = None,
+    ) -> dict[str, int]:
+        """Clear Team Room transcript rows without removing the Room or member bots."""
+        room = self.get_room(room_slug)
+        return self._clear_thread_messages(
+            collection="room_threads",
+            slug_field="room_slug",
+            target_type="room",
+            target_slug=room["slug"],
+            keep_last=keep_last,
+            older_than_days=older_than_days,
+        )
 
     # ------------------------------------------------------------------
     # Per-User Shared Workspace Files (10 MB cap, isolated namespaces)
@@ -2462,48 +3586,84 @@ class ArgoRepository:
         user_dir.mkdir(parents=True, exist_ok=True)
         return clean_email, user_ns, user_dir
 
-    def save_workspace_file(
+    def _finalize_workspace_file(
         self,
         *,
-        owner_email: str | None,
-        filename: str,
-        mime_type: str,
-        content_bytes: bytes,
-        uploaded_by: str = "user",
+        file_id: str,
+        clean_email: str,
+        user_ns: str,
+        user_dir: Path,
+        raw_name: str,
+        safe_name: str,
+        stored_filename: str,
+        target_path: Path,
+        clean_mime: str,
+        size_bytes: int,
+        digest: str,
+        uploaded_by: str,
     ) -> dict[str, Any]:
-        """Persist a file under the user's isolated directory up to 10 MB and index metadata."""
-        size_bytes = len(content_bytes)
-        if size_bytes > MAX_WORKSPACE_FILE_BYTES:
-            raise FileTooLargeError(
-                f"File exceeds the 10 MB limit ({size_bytes} bytes > {MAX_WORKSPACE_FILE_BYTES} bytes)."
-            )
-        clean_email, user_ns, user_dir = self._user_files_dir(owner_email)
-        file_id = make_id("file")
-        raw_name = Path(filename or "attachment.bin").name
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:120] or "attachment.bin"
-        stored_filename = f"{file_id}_{safe_name}"
-        target_path = (user_dir / stored_filename).resolve()
-        if not target_path.is_relative_to(user_dir):
-            raise ValueError("Invalid target file path.")
-
-        target_path.write_bytes(content_bytes)
-        digest = hashlib.sha256(content_bytes).hexdigest()
-        clean_mime = (mime_type or "application/octet-stream").strip()[:150]
         ext = Path(safe_name).suffix.lower()
         is_image = clean_mime in _IMAGE_MIME_TYPES or ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
         text_preview = ""
-        if not is_image and (
+        derived_datasets: list[dict[str, Any]] = []
+        default_parquet_rel: str | None = None
+        pages_parquet_rel: str | None = None
+        page_count: int | None = None
+        scanned_pages: list[int] = []
+        extracted_tables: list[dict[str, Any]] = []
+        secret_vals = self.collect_all_vault_secret_values()
+
+        if not is_image and is_analytics_or_document_file(safe_name, clean_mime):
+            derived_dir = (user_dir / ".derived" / file_id).resolve()
+            if not derived_dir.is_relative_to(user_dir):
+                raise ValueError("Invalid derived analytics path.")
+            try:
+                ingested = ingest_file_to_analytics(
+                    target_path,
+                    derived_dir,
+                    file_id=file_id,
+                    filename=safe_name,
+                    mime_type=clean_mime,
+                    vault_secrets=secret_vals,
+                )
+                for ds in ingested.get("derived_datasets") or []:
+                    fname = str(ds.get("filename") or "")
+                    ds_copy = dict(ds)
+                    if fname:
+                        ds_copy["rel_parquet"] = f"{user_ns}/.derived/{file_id}/{fname}"
+                    derived_datasets.append(ds_copy)
+                def_name = ingested.get("default_parquet_name")
+                if def_name:
+                    default_parquet_rel = f"{user_ns}/.derived/{file_id}/{def_name}"
+                pages_name = ingested.get("pages_parquet_name")
+                if pages_name:
+                    pages_parquet_rel = f"{user_ns}/.derived/{file_id}/{pages_name}"
+                page_count = ingested.get("page_count")
+                scanned_pages = [int(p) for p in (ingested.get("scanned_pages") or [])]
+                extracted_tables = list(ingested.get("extracted_tables") or [])
+                text_preview = str(ingested.get("text_preview") or "")[:24_000]
+            except Exception:
+                shutil.rmtree(derived_dir, ignore_errors=True)
+                if clean_mime.startswith("text/") or ext in _TEXT_PREVIEW_EXTENSIONS:
+                    try:
+                        with target_path.open("rb") as fh:
+                            decoded = fh.read(128_000).decode("utf-8", errors="replace")
+                        text_preview = redact_secrets(decoded, secret_vals)[:24_000]
+                    except Exception:
+                        text_preview = ""
+        elif not is_image and (
             clean_mime.startswith("text/")
             or clean_mime in {"application/json", "application/xml", "application/csv"}
             or ext in _TEXT_PREVIEW_EXTENSIONS
         ):
             try:
-                decoded = content_bytes[:128_000].decode("utf-8", errors="replace")
-                text_preview = redact_secrets(decoded, self.collect_all_vault_secret_values())[:24_000]
+                with target_path.open("rb") as fh:
+                    decoded = fh.read(128_000).decode("utf-8", errors="replace")
+                text_preview = redact_secrets(decoded, secret_vals)[:24_000]
             except Exception:
                 text_preview = ""
 
-        doc = {
+        doc: dict[str, Any] = {
             "id": file_id,
             "filename": safe_name,
             "original_filename": raw_name[:200],
@@ -2517,6 +3677,19 @@ class ArgoRepository:
             "is_image": is_image,
             "text_preview": text_preview,
         }
+        if derived_datasets:
+            doc["derived_datasets"] = derived_datasets
+        if default_parquet_rel:
+            doc["default_parquet_rel"] = default_parquet_rel
+        if pages_parquet_rel:
+            doc["pages_parquet_rel"] = pages_parquet_rel
+        if page_count is not None:
+            doc["page_count"] = page_count
+        if scanned_pages:
+            doc["scanned_pages"] = scanned_pages
+        if extracted_tables:
+            doc["extracted_tables"] = extracted_tables
+
         saved = self.upsert_document(
             collection="workspace_files",
             external_key=f"{user_ns}:{file_id}",
@@ -2527,11 +3700,102 @@ class ArgoRepository:
         )
         return self._serialize_workspace_file(saved)
 
+    def save_workspace_file(
+        self,
+        *,
+        owner_email: str | None,
+        filename: str,
+        mime_type: str,
+        content_bytes: bytes,
+        uploaded_by: str = "user",
+    ) -> dict[str, Any]:
+        """Persist a file under the user's isolated directory up to 10 MB (100 MB for analytics/docs)."""
+        size_bytes = len(content_bytes)
+        clean_mime = (mime_type or "application/octet-stream").strip()[:150]
+        raw_name = Path(filename or "attachment.bin").name
+        limit_bytes = max_workspace_file_bytes_for_name(raw_name, clean_mime)
+        if size_bytes > limit_bytes:
+            limit_mb = limit_bytes // (1024 * 1024)
+            raise FileTooLargeError(
+                f"File exceeds the {limit_mb} MB limit ({size_bytes} bytes > {limit_bytes} bytes)."
+            )
+        clean_email, user_ns, user_dir = self._user_files_dir(owner_email)
+        file_id = make_id("file")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:120] or "attachment.bin"
+        stored_filename = f"{file_id}_{safe_name}"
+        target_path = (user_dir / stored_filename).resolve()
+        if not target_path.is_relative_to(user_dir):
+            raise ValueError("Invalid target file path.")
+
+        target_path.write_bytes(content_bytes)
+        digest = hashlib.sha256(content_bytes).hexdigest()
+        return self._finalize_workspace_file(
+            file_id=file_id,
+            clean_email=clean_email,
+            user_ns=user_ns,
+            user_dir=user_dir,
+            raw_name=raw_name,
+            safe_name=safe_name,
+            stored_filename=stored_filename,
+            target_path=target_path,
+            clean_mime=clean_mime,
+            size_bytes=size_bytes,
+            digest=digest,
+            uploaded_by=uploaded_by,
+        )
+
+    def save_workspace_file_from_path(
+        self,
+        *,
+        owner_email: str | None,
+        filename: str,
+        mime_type: str,
+        source_path: Path,
+        size_bytes: int,
+        sha256_hex: str,
+        uploaded_by: str = "user",
+    ) -> dict[str, Any]:
+        """Atomically move a streamed temp file into user_dir and materialize Parquet sidecars."""
+        clean_mime = (mime_type or "application/octet-stream").strip()[:150]
+        raw_name = Path(filename or "attachment.bin").name
+        limit_bytes = max_workspace_file_bytes_for_name(raw_name, clean_mime)
+        if size_bytes > limit_bytes:
+            source_path.unlink(missing_ok=True)
+            limit_mb = limit_bytes // (1024 * 1024)
+            raise FileTooLargeError(
+                f"File exceeds the {limit_mb} MB limit ({size_bytes} bytes > {limit_bytes} bytes)."
+            )
+        clean_email, user_ns, user_dir = self._user_files_dir(owner_email)
+        file_id = make_id("file")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:120] or "attachment.bin"
+        stored_filename = f"{file_id}_{safe_name}"
+        target_path = (user_dir / stored_filename).resolve()
+        if not target_path.is_relative_to(user_dir):
+            source_path.unlink(missing_ok=True)
+            raise ValueError("Invalid target file path.")
+        shutil.move(str(source_path), str(target_path))
+        return self._finalize_workspace_file(
+            file_id=file_id,
+            clean_email=clean_email,
+            user_ns=user_ns,
+            user_dir=user_dir,
+            raw_name=raw_name,
+            safe_name=safe_name,
+            stored_filename=stored_filename,
+            target_path=target_path,
+            clean_mime=clean_mime,
+            size_bytes=size_bytes,
+            digest=sha256_hex,
+            uploaded_by=uploaded_by,
+        )
+
     @staticmethod
     def _serialize_workspace_file(item: dict[str, Any], *, include_preview: bool = False) -> dict[str, Any]:
         doc = item.get("doc") or {}
-        res = {
+        derived = list(doc.get("derived_datasets") or [])
+        res: dict[str, Any] = {
             "id": item["id"],
+            "dataset_id": f"file:{item['id']}",
             "filename": str(doc.get("filename") or "file"),
             "original_filename": str(doc.get("original_filename") or doc.get("filename") or "file"),
             "mime_type": str(doc.get("mime_type") or "application/octet-stream"),
@@ -2540,10 +3804,30 @@ class ArgoRepository:
             "owner_email": str(doc.get("owner_email") or ""),
             "uploaded_by": str(doc.get("uploaded_by") or "user"),
             "is_image": bool(doc.get("is_image", False)),
+            "is_analytics": bool(derived),
             "has_text_preview": bool(doc.get("text_preview")),
             "created_at": item["created_at"],
             "updated_at": item["updated_at"],
         }
+        if derived:
+            res["derived_datasets"] = [
+                {
+                    "id": ds.get("id"),
+                    "alias": ds.get("alias"),
+                    "kind": ds.get("kind"),
+                    "sheet_name": ds.get("sheet_name"),
+                    "page_num": ds.get("page_num"),
+                    "row_count": ds.get("row_count", 0),
+                    "columns": list(ds.get("columns") or []),
+                }
+                for ds in derived
+            ]
+        if doc.get("page_count") is not None:
+            res["page_count"] = int(doc["page_count"])
+        if doc.get("scanned_pages"):
+            res["scanned_pages"] = [int(p) for p in doc["scanned_pages"]]
+        if doc.get("extracted_tables"):
+            res["extracted_tables"] = list(doc["extracted_tables"])
         if include_preview:
             res["text_preview"] = str(doc.get("text_preview") or "")
         return res
@@ -2615,13 +3899,70 @@ class ArgoRepository:
         return meta, file_path
 
     def delete_workspace_file(self, file_id: str, *, owner_email: str | None) -> None:
-        """Delete a user's workspace file from disk and SQLite."""
+        """Delete a user's workspace file and derived Parquet sidecars from disk and SQLite."""
+        _, _, user_dir = self._user_files_dir(owner_email)
         meta, file_path = self.get_workspace_file(file_id, owner_email=owner_email)
         try:
             file_path.unlink(missing_ok=True)
         except Exception:
             pass
+        derived_dir = (user_dir / ".derived" / meta["id"]).resolve()
+        if derived_dir.is_relative_to(user_dir):
+            shutil.rmtree(derived_dir, ignore_errors=True)
         self.delete_document("workspace_files", meta["id"])
+
+    def get_workspace_file_derived_paths(
+        self,
+        file_id: str,
+        *,
+        owner_email: str | None,
+    ) -> dict[str, Any]:
+        """Return verified disk paths for a file's derived Parquet artifacts (enforcing SSO ownership)."""
+        clean_email, _, user_dir = self._user_files_dir(owner_email)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, doc_json
+                FROM collection_documents
+                WHERE collection = 'workspace_files' AND id = ?
+                LIMIT 1
+                """,
+                (file_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Workspace file '{file_id}' not found.")
+        doc = json.loads(row["doc_json"])
+        if str(doc.get("owner_email") or "") != clean_email:
+            raise PermissionError(
+                f"User '{clean_email}' does not own workspace file '{file_id}'."
+            )
+        root_dir = self._workspace_files_root.resolve()
+        derived_entries: list[dict[str, Any]] = []
+        for ds in doc.get("derived_datasets") or []:
+            rel = str(ds.get("rel_parquet") or "")
+            if not rel:
+                continue
+            p = (root_dir / rel).resolve()
+            if p.is_relative_to(user_dir) and p.is_file():
+                derived_entries.append({**ds, "parquet_path": str(p)})
+        def_rel = str(doc.get("default_parquet_rel") or "")
+        def_path = (root_dir / def_rel).resolve() if def_rel else None
+        if def_path and not (def_path.is_relative_to(user_dir) and def_path.is_file()):
+            def_path = None
+        pages_rel = str(doc.get("pages_parquet_rel") or "")
+        pages_path = (root_dir / pages_rel).resolve() if pages_rel else None
+        if pages_path and not (pages_path.is_relative_to(user_dir) and pages_path.is_file()):
+            pages_path = None
+        return {
+            "file_id": file_id,
+            "filename": str(doc.get("filename") or file_id),
+            "default_parquet_path": str(def_path) if def_path else None,
+            "pages_parquet_path": str(pages_path) if pages_path else None,
+            "derived_datasets": derived_entries,
+            "page_count": doc.get("page_count"),
+            "scanned_pages": list(doc.get("scanned_pages") or []),
+            "extracted_tables": list(doc.get("extracted_tables") or []),
+        }
 
     # ------------------------------------------------------------------
     # Per-User Thread Read Cursors & Delegation Plans
@@ -2804,6 +4145,9 @@ class ArgoRepository:
         *,
         linked_accounts: list[str] | None = None,
         section_override: str | None = None,
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Import a multi-bot Team Pack with automatic slug-collision remapping across bots, rooms & pages."""
         if not isinstance(pack, dict):
@@ -2828,6 +4172,9 @@ class ArgoRepository:
             created = self.import_bot_blueprint(
                 bp_copy,
                 linked_accounts=linked_accounts if linked_accounts else None,
+                owner_email=owner_email,
+                visibility=visibility,
+                allowed_groups=allowed_groups,
             )
             if orig_slug:
                 slug_map[orig_slug] = created["slug"]
@@ -2843,13 +4190,34 @@ class ArgoRepository:
                 except Exception:
                     pass
 
+        remapped_created_bots: list[dict[str, Any]] = []
+        for cb in created_bots:
+            cols = dict(cb.get("collections") or {"read": ["bot_threads"], "write": []})
+            new_read = list(cols.get("read") or [])
+            new_write = list(cols.get("write") or [])
+            changed_cols = False
+            for old_s, new_s in slug_map.items():
+                if old_s != new_s:
+                    old_col = f"bot_{old_s}_items"
+                    new_col = f"bot_{new_s}_items"
+                    if old_col in new_read:
+                        new_read = [new_col if c == old_col else c for c in new_read]
+                        changed_cols = True
+                    if old_col in new_write:
+                        new_write = [new_col if c == old_col else c for c in new_write]
+                        changed_cols = True
+            if changed_cols:
+                cb = self.update_bot(cb["slug"], {"collections": {"read": new_read, "write": new_write}})
+            remapped_created_bots.append(cb)
+        created_bots = remapped_created_bots
+
         page_slug_map: dict[str, str] = {}
         created_pages: list[dict[str, Any]] = []
         for pg in pack.get("pages") or []:
             if not isinstance(pg, dict) or not pg.get("title"):
                 continue
             orig_owner = slugify(str(pg.get("owner_bot_slug") or ""))
-            mapped_owner = slug_map.get(orig_owner) or (created_bots[0]["slug"] if created_bots else "operations-coordinator")
+            mapped_owner = slug_map.get(orig_owner) or (created_bots[0]["slug"] if created_bots else "")
             remapped_cols: list[str] = []
             for c in pg.get("allowed_collections") or []:
                 col_str = str(c)
@@ -2858,6 +4226,15 @@ class ArgoRepository:
                         col_str = f"bot_{new_s}_items"
                 remapped_cols.append(col_str)
             page_payload = pg.get("content_payload")
+            if page_payload is not None:
+                payload_str = str(page_payload)
+                for old_s, new_s in slug_map.items():
+                    if old_s != new_s:
+                        old_col = f"bot_{old_s}_items"
+                        new_col = f"bot_{new_s}_items"
+                        if old_col in payload_str:
+                            payload_str = payload_str.replace(old_col, new_col)
+                page_payload = payload_str
             if page_payload is None and pg.get("template_key"):
                 page_payload = self.build_interactive_page_html(
                     template_key=str(pg["template_key"]),
@@ -2872,6 +4249,9 @@ class ArgoRepository:
                 content_payload=str(page_payload) if page_payload is not None else None,
                 allowed_collections=remapped_cols,
                 owner_bot_slug=mapped_owner,
+                created_by_email=owner_email,
+                visibility=visibility or "shared",
+                allowed_groups=allowed_groups,
                 pinned=bool(pg.get("pinned", True)),
             )
             src_pg = slugify(str(pg.get("source_slug") or pg.get("slug") or pg["title"]))
@@ -2907,6 +4287,9 @@ class ArgoRepository:
                 max_bot_turns_per_message=int(rm.get("max_bot_turns_per_message") or 3),
                 pinned_page_slug=mapped_pinned_pg,
                 section=str(rm.get("section") or override_sec),
+                owner_email=owner_email,
+                visibility=visibility,
+                allowed_groups=allowed_groups,
             )
             created_rooms.append(created_rm)
 
@@ -2919,231 +4302,8 @@ class ArgoRepository:
 
     @staticmethod
     def list_starter_team_packs() -> list[dict[str, Any]]:
-        """Return built-in, credential-free multi-bot Team Packs ready for 1-click installation."""
-        return [
-            {
-                "id": "operations-coordinator-crew",
-                "schema_version": "argo.team_pack.v1",
-                "title": "Operations Coordinator Crew",
-                "description": "Lead Coordinator + Source Scout + Briefing Writer inside a shared Room with a live Bot Hub Board.",
-                "section": "Operations",
-                "required_providers": [],
-                "bots": [
-                    {
-                        "source_slug": "operations-lead",
-                        "name": "Operations Lead",
-                        "role": "Coordinate specialists, propose delegation plans, and synthesize one final reply",
-                        "role_prompt": "Act as the Team Coordinator. When given a multi-step goal, propose a clear delegation plan across @source-scout and @briefing-writer, wait for results, and return one unified answer.",
-                        "avatar_color": "indigo",
-                        "avatar_icon": "shield",
-                        "pinned": True,
-                        "section": "Operations",
-                        "runtime": "api",
-                        "outbound_rbac": "draft",
-                        "daily_cap": 10,
-                        "model": "google:gemini-4-argon",
-                        "boundaries": ["Never send external messages without approval"],
-                        "routines": [{"type": "manual_trigger", "label": "Manual Run", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "platform_status"}, {"type": "builtin", "name": "request_human_approval"}],
-                    },
-                    {
-                        "source_slug": "source-scout",
-                        "name": "Source Scout",
-                        "role": "Monitor configured websites and feeds for unseen items",
-                        "role_prompt": "Check configured sources for unseen updates, skip marketing promos, save structured findings, and hand off relevant items.",
-                        "avatar_color": "blue",
-                        "avatar_icon": "rss",
-                        "section": "Operations",
-                        "runtime": "api",
-                        "outbound_rbac": "internal",
-                        "daily_cap": 0,
-                        "model": "google:gemini-3.8-flash",
-                        "boundaries": ["Never send external messages", "Skip duplicate items"],
-                        "routines": [{"type": "manual_trigger", "label": "Manual Check", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "fetch_rss_feed"}, {"type": "builtin", "name": "fetch_public_webpage"}],
-                    },
-                    {
-                        "source_slug": "briefing-writer",
-                        "name": "Briefing Writer",
-                        "role": "Draft crisp bulleted briefings and queue outbound updates for review",
-                        "role_prompt": "Turn collected findings into concise, cited briefings and queue outbound drafts in Approvals for human review.",
-                        "avatar_color": "violet",
-                        "avatar_icon": "pen",
-                        "section": "Operations",
-                        "runtime": "api",
-                        "outbound_rbac": "draft",
-                        "daily_cap": 10,
-                        "model": "google:gemini-4-argon",
-                        "boundaries": ["Always cite source URLs", "Ask before sending externally"],
-                        "routines": [{"type": "manual_trigger", "label": "Manual Draft", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "request_human_approval"}],
-                    },
-                ],
-                "pages": [
-                    {
-                        "source_slug": "team-hub-board",
-                        "title": "Team Hub Board",
-                        "description": "Live status board for the Operations Coordinator Crew",
-                        "render_mode": "sandboxed_html",
-                        "template_key": "bot_hub_board",
-                        "owner_bot_slug": "operations-lead",
-                        "allowed_collections": [],
-                        "pinned": True,
-                    }
-                ],
-                "rooms": [
-                    {
-                        "source_slug": "operations-room",
-                        "title": "Operations Room",
-                        "member_bot_slugs": ["operations-lead", "source-scout", "briefing-writer"],
-                        "coordinator_bot_slug": "operations-lead",
-                        "stage_order": ["operations-lead", "source-scout", "briefing-writer"],
-                        "ask_before_bot_handoff": False,
-                        "max_bot_turns_per_message": 3,
-                        "pinned_page_slug": "team-hub-board",
-                        "section": "Operations",
-                    }
-                ],
-            },
-            {
-                "id": "website-release-qa-crew",
-                "schema_version": "argo.team_pack.v1",
-                "title": "Website & Release QA Crew",
-                "description": "Release Watcher + Visual Inspector + QA Summary Writer collaborating in a dedicated QA Room.",
-                "section": "QA",
-                "required_providers": [],
-                "bots": [
-                    {
-                        "source_slug": "release-watcher",
-                        "name": "Release Watcher",
-                        "role": "Track changelog pages and release feeds for new versions",
-                        "role_prompt": "Monitor release feeds and websites, record version changes, and tag @visual-inspector when live UI verification is needed.",
-                        "avatar_color": "emerald",
-                        "avatar_icon": "rss",
-                        "section": "QA",
-                        "runtime": "api",
-                        "outbound_rbac": "internal",
-                        "daily_cap": 0,
-                        "model": "google:gemini-3.8-flash",
-                        "boundaries": ["Ignore non-release marketing posts"],
-                        "routines": [{"type": "manual_trigger", "label": "Manual Check", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "fetch_public_webpage"}, {"type": "builtin", "name": "fetch_rss_feed"}],
-                    },
-                    {
-                        "source_slug": "visual-inspector",
-                        "name": "Visual Inspector",
-                        "role": "Verify pages, links, and layout health on request",
-                        "role_prompt": "Inspect requested URLs, check status and structure cleanly, and report verified findings back to the Room.",
-                        "avatar_color": "amber",
-                        "avatar_icon": "globe",
-                        "section": "QA",
-                        "runtime": "api",
-                        "outbound_rbac": "internal",
-                        "daily_cap": 0,
-                        "model": "google:gemini-3.8-flash",
-                        "boundaries": ["Never attempt to bypass login gates or CAPTCHAs"],
-                        "routines": [{"type": "manual_trigger", "label": "Inspect URL", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "fetch_public_webpage"}],
-                    },
-                    {
-                        "source_slug": "qa-reporter",
-                        "name": "QA Reporter",
-                        "role": "Compile verified checks into a clean report or Page",
-                        "role_prompt": "Summarize findings from @release-watcher and @visual-inspector into a concise report or interactive Page.",
-                        "avatar_color": "slate",
-                        "avatar_icon": "bot",
-                        "section": "QA",
-                        "runtime": "api",
-                        "outbound_rbac": "draft",
-                        "daily_cap": 10,
-                        "model": "google:gemini-4-argon",
-                        "boundaries": ["Only report directly observed checks"],
-                        "routines": [{"type": "manual_trigger", "label": "Build QA Report", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "request_human_approval"}],
-                    },
-                ],
-                "pages": [
-                    {
-                        "source_slug": "qa-status-board",
-                        "title": "Release QA Board",
-                        "description": "Live status across QA watchers and inspectors",
-                        "render_mode": "sandboxed_html",
-                        "template_key": "bot_hub_board",
-                        "owner_bot_slug": "qa-reporter",
-                        "allowed_collections": [],
-                        "pinned": True,
-                    }
-                ],
-                "rooms": [
-                    {
-                        "source_slug": "release-qa-room",
-                        "title": "Release QA Room",
-                        "member_bot_slugs": ["release-watcher", "visual-inspector", "qa-reporter"],
-                        "coordinator_bot_slug": "qa-reporter",
-                        "stage_order": ["release-watcher", "visual-inspector", "qa-reporter"],
-                        "ask_before_bot_handoff": False,
-                        "max_bot_turns_per_message": 3,
-                        "pinned_page_slug": "qa-status-board",
-                        "section": "QA",
-                    }
-                ],
-            },
-            {
-                "id": "inbox-briefing-crew",
-                "schema_version": "argo.team_pack.v1",
-                "title": "Inbox & Briefing Crew",
-                "description": "Inbox Triage + Follow-Up Drafter working together with human-approved drafts.",
-                "section": "Inbox",
-                "required_providers": ["google"],
-                "bots": [
-                    {
-                        "source_slug": "inbox-triage",
-                        "name": "Inbox Triage",
-                        "role": "Screen unread messages, filter automated noise, and surface priorities",
-                        "role_prompt": "Check unread inbox threads, ignore automated receipts and newsletters, and flag messages needing replies.",
-                        "avatar_color": "blue",
-                        "avatar_icon": "mail",
-                        "section": "Inbox",
-                        "runtime": "api",
-                        "outbound_rbac": "internal",
-                        "daily_cap": 0,
-                        "model": "google:gemini-3.8-flash",
-                        "boundaries": ["Never send replies autonomously", "Skip promotional newsletters"],
-                        "routines": [{"type": "manual_trigger", "label": "Triage Inbox", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "gmail_search"}],
-                    },
-                    {
-                        "source_slug": "follow-up-drafter",
-                        "name": "Follow-Up Drafter",
-                        "role": "Draft concise replies in Approvals matching operator writing style",
-                        "role_prompt": "Draft clear, polite replies for flagged messages and queue them in Approvals for sign-off.",
-                        "avatar_color": "violet",
-                        "avatar_icon": "pen",
-                        "section": "Inbox",
-                        "runtime": "api",
-                        "outbound_rbac": "draft",
-                        "daily_cap": 10,
-                        "model": "google:gemini-4-argon",
-                        "boundaries": ["Always queue drafts in Approvals before sending"],
-                        "routines": [{"type": "manual_trigger", "label": "Draft Replies", "schedule": "Manual", "enabled": True}],
-                        "tools": [{"type": "builtin", "name": "request_human_approval"}],
-                    },
-                ],
-                "pages": [],
-                "rooms": [
-                    {
-                        "source_slug": "inbox-team-room",
-                        "title": "Inbox Team Room",
-                        "member_bot_slugs": ["inbox-triage", "follow-up-drafter"],
-                        "coordinator_bot_slug": "inbox-triage",
-                        "stage_order": ["inbox-triage", "follow-up-drafter"],
-                        "ask_before_bot_handoff": False,
-                        "max_bot_turns_per_message": 2,
-                        "section": "Inbox",
-                    }
-                ],
-            },
-        ]
+        """Return starter Team Packs (empty by default; packs are imported via JSON)."""
+        return []
 
     # ------------------------------------------------------------------
     # Activity / Events Log (Primitive 2)
@@ -3319,6 +4479,46 @@ class ArgoRepository:
             raise NotFoundError(f"Approval '{approval_id}' not found.")
         return self._serialize_approval(row)
 
+    def list_approvals_by_correlation(
+        self,
+        correlation_id: str,
+        *,
+        bot_slug: str | None = None,
+        batch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List approvals matching correlation_id (optionally filtered by bot_slug and payload.batch_id)."""
+        clean_corr = str(correlation_id or "").strip()
+        if not clean_corr:
+            return []
+        with self._lock:
+            if bot_slug and bot_slug.strip():
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM approvals_outbox
+                    WHERE correlation_id = ? AND bot_slug = ?
+                    ORDER BY created_at ASC, rowid ASC
+                    """,
+                    (clean_corr, bot_slug.strip()),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM approvals_outbox
+                    WHERE correlation_id = ?
+                    ORDER BY created_at ASC, rowid ASC
+                    """,
+                    (clean_corr,),
+                ).fetchall()
+        items = [self._serialize_approval(row) for row in rows]
+        if batch_id and batch_id.strip():
+            target_batch = batch_id.strip()
+            items = [
+                it
+                for it in items
+                if str((it.get("payload") or {}).get("batch_id") or "").strip() == target_batch
+            ]
+        return items
+
     def get_pending_approval_by_telegram_message(
         self,
         *,
@@ -3362,26 +4562,65 @@ class ArgoRepository:
         *,
         executed: bool,
         error_message: str | None = None,
+        execution_result: dict[str, Any] | None = None,
+        revert_to_pending: bool = False,
     ) -> dict[str, Any]:
-        """Record downstream connector execution success ('executed') or error note."""
-        with self._lock:
-            if executed:
-                self._conn.execute(
-                    "UPDATE approvals_outbox SET status = 'executed', error_message = NULL WHERE id = ?",
+        """Record downstream connector execution success ('executed') or failure/retryable state."""
+        with self._tx():
+            updated_payload_json: str | None = None
+            if execution_result is not None:
+                row = self._conn.execute(
+                    "SELECT payload_json FROM approvals_outbox WHERE id = ?",
                     (approval_id,),
-                )
+                ).fetchone()
+                if row is not None:
+                    try:
+                        existing_payload = json.loads(row["payload_json"] or "{}")
+                    except json.JSONDecodeError:
+                        existing_payload = {}
+                    if not isinstance(existing_payload, dict):
+                        existing_payload = {}
+                    existing_payload["execution_result"] = execution_result
+                    updated_payload_json = json.dumps(existing_payload)
+            if executed:
+                if updated_payload_json is not None:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET status = 'executed', error_message = NULL, payload_json = ? WHERE id = ?",
+                        (updated_payload_json, approval_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET status = 'executed', error_message = NULL WHERE id = ?",
+                        (approval_id,),
+                    )
+            elif revert_to_pending:
+                if updated_payload_json is not None:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET status = 'pending', approved_by = NULL, resolved_at = NULL, error_message = ?, payload_json = ? WHERE id = ?",
+                        (error_message, updated_payload_json, approval_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET status = 'pending', approved_by = NULL, resolved_at = NULL, error_message = ? WHERE id = ?",
+                        (error_message, approval_id),
+                    )
             else:
-                self._conn.execute(
-                    "UPDATE approvals_outbox SET error_message = ? WHERE id = ?",
-                    (error_message, approval_id),
-                )
-            self._conn.commit()
+                if updated_payload_json is not None:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET error_message = ?, payload_json = ? WHERE id = ?",
+                        (error_message, updated_payload_json, approval_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE approvals_outbox SET error_message = ? WHERE id = ?",
+                        (error_message, approval_id),
+                    )
         return self.get_approval(approval_id)
 
     def supersede_approval(self, approval_id: str, *, actor: str) -> dict[str, Any]:
         """Atomically mark a pending approval as superseded by a revised draft."""
         now = utc_now()
-        with self._lock:
+        with self._tx():
             cursor = self._conn.execute(
                 """
                 UPDATE approvals_outbox
@@ -3391,9 +4630,7 @@ class ArgoRepository:
                 (actor, now, approval_id),
             )
             if cursor.rowcount == 0:
-                self._conn.rollback()
                 raise AlreadyResolvedError("Already resolved.")
-            self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM approvals_outbox WHERE id = ?", (approval_id,)
             ).fetchone()
@@ -3444,7 +4681,7 @@ class ArgoRepository:
         target_status = "rejected" if action == "reject" else "approved"
         now = utc_now()
 
-        with self._lock:
+        with self._tx():
             existing = self._conn.execute(
                 "SELECT payload_json, bot_slug FROM approvals_outbox WHERE id = ?",
                 (approval_id,),
@@ -3474,7 +4711,6 @@ class ArgoRepository:
                 (target_status, edited_payload_json, actor, now, approval_id),
             )
             if cursor.rowcount == 0:
-                self._conn.rollback()
                 raise AlreadyResolvedError("Already resolved.")
 
             resolved_rule = (style_rule or "").strip()
@@ -3496,7 +4732,6 @@ class ArgoRepository:
                     ),
                 )
 
-            self._conn.commit()
             updated = self._conn.execute(
                 "SELECT * FROM approvals_outbox WHERE id = ?", (approval_id,)
             ).fetchone()
@@ -3569,6 +4804,15 @@ class ArgoRepository:
     # Pages & Collections (Primitives 3 & 5)
     # ------------------------------------------------------------------
     def _serialize_page(self, row: sqlite3.Row) -> dict[str, Any]:
+        cols_present = set(row.keys())
+        vis = normalize_visibility(
+            row["visibility"] if "visibility" in cols_present else "shared", default="shared"
+        )
+        groups = (
+            self._decode_groups(row["allowed_groups_json"])
+            if "allowed_groups_json" in cols_present and vis == "team"
+            else []
+        )
         return {
             "id": row["id"],
             "slug": row["slug"],
@@ -3578,6 +4822,9 @@ class ArgoRepository:
             "content_payload": row["content_payload"],
             "allowed_collections": json.loads(row["allowed_collections_json"]),
             "owner_bot_slug": row["owner_bot_slug"],
+            "created_by_email": str(row["created_by_email"] or "") if "created_by_email" in cols_present else "",
+            "visibility": vis,
+            "allowed_groups": groups,
             "pinned": bool(row["pinned"]),
             "updated_at": row["updated_at"],
         }
@@ -3611,16 +4858,16 @@ class ArgoRepository:
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>{safe_title}</title></head>
-<body style="font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:#f8fafc;color:#0f172a;">
+<body style="font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:var(--bg,#161920);color:var(--text,#f3f4f6);">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
     <div>
-      <h3 style="margin:0;font-size:14px;">{safe_title}</h3>
-      <p style="margin:2px 0 0;font-size:11px;color:#475569;">{safe_desc}</p>
+      <h3 style="margin:0;font-size:14px;color:var(--text,#f3f4f6);">{safe_title}</h3>
+      <p style="margin:2px 0 0;font-size:11px;color:var(--muted,#9ca3af);">{safe_desc}</p>
     </div>
-    <span style="font-size:10px;padding:2px 8px;border-radius:999px;background:#e2e8f0;color:#334155;">sandbox="allow-scripts allow-downloads" · postMessage</span>
+    <span style="font-size:10px;padding:2px 8px;border-radius:999px;background:var(--surface,#181c23);border:1px solid var(--border,#2d3440);color:var(--muted,#9ca3af);">sandbox="allow-scripts allow-downloads" · postMessage</span>
   </div>
   <div id="kpiRow" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px;"></div>
-  <div id="recordsBox" style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-size:12px;color:#334155;">
+  <div id="recordsBox" style="background:var(--card,#1e232c);border:1px solid var(--border,#2d3440);border-radius:8px;padding:10px;font-size:12px;color:var(--text,#f3f4f6);">
     Waiting for parent postMessage payload...
   </div>
   <script>
@@ -3636,12 +4883,12 @@ class ArgoRepository:
       ];
       for (const [label, val] of cards) {{
         const card = document.createElement("div");
-        card.style.cssText = "background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px;";
+        card.style.cssText = "background:var(--card,#1e232c);border:1px solid var(--border,#2d3440);border-radius:8px;padding:8px;";
         const l = document.createElement("div");
-        l.style.cssText = "font-size:10px;color:#64748b;";
+        l.style.cssText = "font-size:10px;color:var(--muted,#9ca3af);";
         l.textContent = label;
         const v = document.createElement("div");
-        v.style.cssText = "font-size:15px;font-weight:600;color:#0f172a;margin-top:2px;";
+        v.style.cssText = "font-size:15px;font-weight:600;color:var(--text,#f3f4f6);margin-top:2px;";
         v.textContent = val;
         card.appendChild(l);
         card.appendChild(v);
@@ -3654,7 +4901,7 @@ class ArgoRepository:
       box.innerHTML = "";
       for (const item of records.slice(0, 12)) {{
         const row = document.createElement("div");
-        row.style.cssText = "padding:6px 0;border-bottom:1px solid #f1f5f9;";
+        row.style.cssText = "padding:6px 0;border-bottom:1px solid var(--border,#2d3440);";
         const doc = item.doc || {{}};
         row.textContent = (doc.title || doc.name || item.external_key || item.id) + " — " + (item.collection || "");
         box.appendChild(row);
@@ -3684,12 +4931,566 @@ class ArgoRepository:
         title: str,
         description: str = "",
         allowed_collections: list[str] | None = None,
+        dashboard_spec: dict[str, Any] | None = None,
     ) -> str:
-        """Build a clean, sandbox-safe interactive HTML5 Page template in dark executive style."""
+        """Build a clean, sandbox-safe interactive HTML5 Page template respecting Light/Dark theme tokens."""
         safe_title = html.escape(title.strip() or "Interactive View")
         safe_desc = html.escape(description.strip() or "Live workspace view powered by Argo data")
-        cols = list(allowed_collections or [])
+        cols = [
+            collection_slug(str(c))
+            for c in (allowed_collections or [])
+            if str(c).strip() and collection_slug(str(c)) not in _READ_FORBIDDEN_SYSTEM_COLLECTIONS
+        ]
         primary_coll = cols[0] if cols else ""
+
+        if template_key == "data_dashboard":
+            raw_spec = dict(dashboard_spec or {})
+            subtitle_text = str(raw_spec.get("subtitle") or description or "Live SQLite JSON1 workspace dashboard").strip()
+            safe_sub = html.escape(subtitle_text)
+            normalized_spec = {
+                "subtitle": subtitle_text,
+                "allowed_collections": cols,
+                "source_bots": list(raw_spec.get("source_bots") or []),
+                "kpis": list(raw_spec.get("kpis") or []),
+                "charts": list(raw_spec.get("charts") or []),
+                "filters": list(raw_spec.get("filters") or []),
+                "table_sql": str(raw_spec.get("table_sql") or "").strip(),
+            }
+            spec_json = json.dumps(normalized_spec, ensure_ascii=False).replace("</", "<\\/")
+            return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{safe_title}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; padding:22px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:13px; line-height:1.5; background:var(--bg,#161920); color:var(--text,#f3f4f6); -webkit-font-smoothing:antialiased; }}
+  .wrap {{ max-width:1240px; margin:0 auto; display:grid; gap:16px; }}
+  .top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }}
+  .title-col {{ min-width:240px; flex:1; }}
+  h1 {{ margin:0; font-size:20px; font-weight:600; color:var(--text,#f3f4f6); letter-spacing:-0.01em; }}
+  .sub {{ margin:4px 0 0; font-size:13px; color:var(--muted,#9ca3af); }}
+  .controls {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+  .source-pills {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:8px; }}
+  .bot-pill {{ display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px; border:1px solid var(--border,#2d3440); background:var(--card,#1e232c); font-size:12px; color:var(--text,#e5e7eb); }}
+  .bot-pill button {{ background:none; border:0; color:var(--accent,#3b72b2); font-size:12px; font-weight:600; cursor:pointer; padding:0 2px; }}
+  .bot-pill button:hover {{ text-decoration:underline; }}
+  input[type=search] {{ background:var(--surface,#181c23); color:var(--text,#f3f4f6); border:1px solid var(--border,#2d3440); border-radius:8px; padding:7px 11px; font-size:12px; min-width:210px; outline:none; }}
+  input[type=search]:focus {{ border-color:var(--accent,#3b72b2); }}
+  button.btn {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); color:var(--text,#e5e7eb); border-radius:8px; padding:7px 11px; font-size:12px; font-weight:500; cursor:pointer; }}
+  button.btn:hover {{ background:var(--surface,#252b36); }}
+  button.primary {{ background:var(--accent,#3b72b2); border-color:var(--accent,#3b72b2); color:#ffffff; }}
+  button.primary:hover {{ filter:brightness(0.92); }}
+  .filter-bar {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; }}
+  .chip {{ background:var(--surface,#181c23); border:1px solid var(--border,#2d3440); color:var(--text,#d1d5db); border-radius:999px; padding:4px 10px; font-size:12px; cursor:pointer; }}
+  .chip.active {{ background:var(--accent,#3b72b2); border-color:var(--accent,#3b72b2); color:#ffffff; font-weight:600; }}
+  .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }}
+  .card {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:16px; }}
+  .k-label {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted,#9ca3af); }}
+  .k-val {{ font-size:24px; font-weight:600; color:var(--text,#f3f4f6); margin-top:6px; }}
+  .k-hint {{ font-size:12px; color:var(--muted,#9ca3af); margin-top:4px; }}
+  .charts-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }}
+  .chart-head {{ display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }}
+  .chart-title {{ font-size:13px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .legend {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
+  .legend-item {{ display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--text,#d1d5db); cursor:pointer; padding:2px 6px; border-radius:6px; }}
+  .legend-item.active {{ background:var(--accent,#3b72b2); color:#ffffff; }}
+  .swatch {{ width:9px; height:9px; border-radius:2px; display:inline-block; }}
+  .table-wrap {{ overflow-x:auto; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  th {{ text-align:left; padding:9px 10px; font-size:12px; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted,#9ca3af); border-bottom:1px solid var(--border,#2d3440); background:var(--surface,#181c23); }}
+  td {{ padding:9px 10px; border-bottom:1px solid var(--border,#2d3440); color:var(--text,#e5e7eb); max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  tbody tr {{ cursor:pointer; }}
+  tbody tr:hover {{ background:var(--surface,#181c23); }}
+  .empty {{ background:var(--card,#1e232c); border:1px dashed var(--border,#2d3440); border-radius:12px; padding:28px; text-align:center; display:grid; gap:10px; justify-items:center; }}
+  .drawer-backdrop {{ position:fixed; inset:0; background:rgba(10,12,16,0.65); display:none; justify-content:flex-end; z-index:40; }}
+  .drawer-backdrop.open {{ display:flex; }}
+  .drawer {{ width:min(480px,94vw); height:100%; background:var(--card,#1e232c); border-left:1px solid var(--border,#2d3440); padding:18px; overflow-y:auto; display:grid; gap:12px; align-content:start; }}
+  .drawer pre {{ margin:0; background:var(--surface,#181c23); border:1px solid var(--border,#2d3440); border-radius:8px; padding:12px; font-size:12px; line-height:1.45; color:var(--text,#d1d5db); white-space:pre-wrap; word-break:break-word; }}
+  .err-banner {{ background:var(--surface,#2c1b20); border:1px solid var(--bad,#c24b4b); color:var(--text,#f3f4f6); border-radius:8px; padding:8px 12px; font-size:12px; display:none; }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="title-col">
+        <h1>{safe_title}</h1>
+        <p class="sub">{safe_sub}</p>
+        <div id="sourcePills" class="source-pills"></div>
+      </div>
+      <div class="controls">
+        <input id="searchInput" type="search" placeholder="Search records & fields...">
+        <button id="refreshBtn" class="btn" type="button">Refresh</button>
+        <button id="exportBtn" class="btn" type="button">Export CSV</button>
+      </div>
+    </div>
+    <div id="errBanner" class="err-banner"></div>
+    <div id="filterBar" class="filter-bar"></div>
+    <div id="emptyState" class="empty" style="display:none;"></div>
+    <div id="kpiGrid" class="kpis"></div>
+    <div id="chartsGrid" class="charts-grid"></div>
+    <div id="tableCard" class="card">
+      <div class="chart-head">
+        <div class="chart-title" id="tableTitle">Records</div>
+        <div class="sub" id="tableMeta" style="margin:0;">Waiting for data...</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead id="tableHead"></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div id="drawerBackdrop" class="drawer-backdrop">
+    <div class="drawer">
+      <div class="chart-head" style="margin:0;">
+        <div class="chart-title" id="drawerTitle">Record Detail</div>
+        <button id="drawerClose" class="btn" type="button">Close</button>
+      </div>
+      <div class="sub" id="drawerMeta" style="margin:0;"></div>
+      <pre id="drawerJson"></pre>
+    </div>
+  </div>
+  <script>
+    const SPEC = {spec_json};
+    const PALETTE = ["#3b72b2", "#3b8c62", "#c98a2c", "#64748b", "#2b8a8e", "#7c6f9f"];
+    const state = {{
+      records: [],
+      collectionCounts: {{}},
+      totalRecords: 0,
+      kpiResults: {{}},
+      chartResults: {{}},
+      tableResult: null,
+      activeCollection: "",
+      activeCrossFilter: "",
+      activePresetFilter: "",
+      pendingSql: new Map(),
+      reqSeq: 0,
+    }};
+
+    function esc(v) {{
+      return String(v == null ? "" : v)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }}
+
+    function showErr(msg) {{
+      const el = document.getElementById("errBanner");
+      if (!msg) {{
+        el.style.display = "none";
+        el.textContent = "";
+        return;
+      }}
+      el.style.display = "block";
+      el.textContent = String(msg);
+    }}
+
+    function runSql(sql, params, onResult) {{
+      if (!sql || !String(sql).trim()) return;
+      const requestId = "sql_" + (++state.reqSeq);
+      state.pendingSql.set(requestId, onResult);
+      window.parent.postMessage({{
+        type: "ARGO_QUERY_SQL",
+        requestId,
+        sql: String(sql),
+        params: Array.isArray(params) ? params : [],
+      }}, "*");
+    }}
+
+    function renderSourcePills() {{
+      const host = document.getElementById("sourcePills");
+      host.innerHTML = "";
+      const bots = Array.isArray(SPEC.source_bots) ? SPEC.source_bots : [];
+      for (const b of bots) {{
+        const slug = String(b.slug || "").trim();
+        const name = String(b.name || slug || "Source Bot");
+        if (!slug) continue;
+        const pill = document.createElement("span");
+        pill.className = "bot-pill";
+        const lbl = document.createElement("span");
+        lbl.textContent = name;
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.textContent = "Open Bot";
+        openBtn.addEventListener("click", () => window.parent.postMessage({{ type: "ARGO_OPEN_BOT", botSlug: slug }}, "*"));
+        const syncBtn = document.createElement("button");
+        syncBtn.type = "button";
+        syncBtn.textContent = "Sync Now";
+        syncBtn.addEventListener("click", () => window.parent.postMessage({{ type: "ARGO_TRIGGER_BOT", botSlug: slug }}, "*"));
+        pill.appendChild(lbl);
+        pill.appendChild(openBtn);
+        pill.appendChild(syncBtn);
+        host.appendChild(pill);
+      }}
+    }}
+
+    function renderFilters() {{
+      const bar = document.getElementById("filterBar");
+      bar.innerHTML = "";
+      const cols = Object.keys(state.collectionCounts);
+      if (cols.length > 1) {{
+        const allChip = document.createElement("button");
+        allChip.type = "button";
+        allChip.className = "chip" + (!state.activeCollection ? " active" : "");
+        allChip.textContent = "All Sources (" + state.totalRecords + ")";
+        allChip.addEventListener("click", () => {{ state.activeCollection = ""; renderAll(); }});
+        bar.appendChild(allChip);
+        for (const c of cols) {{
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "chip" + (state.activeCollection === c ? " active" : "");
+          chip.textContent = c + " (" + state.collectionCounts[c] + ")";
+          chip.addEventListener("click", () => {{ state.activeCollection = state.activeCollection === c ? "" : c; renderAll(); }});
+          bar.appendChild(chip);
+        }}
+      }}
+      const presets = Array.isArray(SPEC.filters) ? SPEC.filters : [];
+      for (const f of presets) {{
+        const label = typeof f === "string" ? f : String(f.label || f.value || "Filter");
+        const val = typeof f === "string" ? f : String(f.value || f.label || "");
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chip" + (state.activePresetFilter === val ? " active" : "");
+        chip.textContent = label;
+        chip.addEventListener("click", () => {{ state.activePresetFilter = state.activePresetFilter === val ? "" : val; renderAll(); }});
+        bar.appendChild(chip);
+      }}
+      if (state.activeCrossFilter) {{
+        const clr = document.createElement("button");
+        clr.type = "button";
+        clr.className = "chip active";
+        clr.textContent = "Filtered: " + state.activeCrossFilter + " ×";
+        clr.addEventListener("click", () => {{ state.activeCrossFilter = ""; renderAll(); }});
+        bar.appendChild(clr);
+      }}
+    }}
+
+    function renderKpis() {{
+      const grid = document.getElementById("kpiGrid");
+      grid.innerHTML = "";
+      const kpis = Array.isArray(SPEC.kpis) && SPEC.kpis.length ? SPEC.kpis : [
+        {{ label: "Total Records", value: String(state.totalRecords), hint: "Across bound collections" }},
+        {{ label: "Active Sources", value: String(Object.keys(state.collectionCounts).length || (SPEC.allowed_collections || []).length), hint: "Scoped collections" }},
+        {{ label: "Loaded Rows", value: String(state.records.length), hint: "Live SQLite snapshot" }},
+      ];
+      kpis.forEach((k, idx) => {{
+        const res = state.kpiResults[idx];
+        let displayVal = k.value != null ? String(k.value) : "—";
+        if (res && Array.isArray(res.rows) && res.rows.length) {{
+          const firstRow = res.rows[0];
+          const firstKey = Object.keys(firstRow)[0];
+          if (firstKey !== undefined && firstRow[firstKey] !== null && firstRow[firstKey] !== undefined) {{
+            displayVal = String(firstRow[firstKey]);
+          }}
+        }}
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `<div class="k-label">${{esc(k.label || "Metric")}}</div><div class="k-val">${{esc(displayVal)}}</div>${{k.hint ? `<div class="k-hint">${{esc(k.hint)}}</div>` : ""}}`;
+        grid.appendChild(card);
+      }});
+    }}
+
+    function normalizeSeriesRows(rows) {{
+      if (!Array.isArray(rows) || !rows.length) return [];
+      const keys = Object.keys(rows[0]);
+      if (keys.length === 1) {{
+        return rows.map((r, i) => ({{ label: String(r[keys[0]] ?? ("Item " + (i + 1))), value: 1 }}));
+      }}
+      const lKey = keys[0];
+      const vKey = keys[1];
+      return rows.map((r) => ({{
+        label: String(r[lKey] ?? "Unknown"),
+        value: Number(r[vKey] ?? 0) || 0,
+      }}));
+    }}
+
+    function buildChartSvg(type, series) {{
+      if (!series.length) return "<div class='sub'>No chart data yet.</div>";
+      const w = 380, h = 175;
+      if (type === "donut") {{
+        const total = Math.max(1, series.reduce((a, s) => a + Math.max(0, s.value), 0));
+        const cx = 86, cy = 88, r = 56;
+        let angle = -Math.PI / 2;
+        const paths = series.slice(0, 6).map((s, idx) => {{
+          const slice = (Math.max(0, s.value) / total) * Math.PI * 2;
+          const x1 = cx + r * Math.cos(angle), y1 = cy + r * Math.sin(angle);
+          const end = angle + slice;
+          const x2 = cx + r * Math.cos(end), y2 = cy + r * Math.sin(end);
+          const large = slice > Math.PI ? 1 : 0;
+          angle = end;
+          const color = PALETTE[idx % PALETTE.length];
+          if (slice >= Math.PI * 1.999) {{
+            return `<circle cx="${{cx}}" cy="${{cy}}" r="${{r}}" fill="none" stroke="${{color}}" stroke-width="20" data-filter="${{esc(s.label)}}"></circle>`;
+          }}
+          return `<path d="M ${{x1.toFixed(1)}} ${{y1.toFixed(1)}} A ${{r}} ${{r}} 0 ${{large}} 1 ${{x2.toFixed(1)}} ${{y2.toFixed(1)}}" fill="none" stroke="${{color}}" stroke-width="20" data-filter="${{esc(s.label)}}"><title>${{esc(s.label)}}: ${{s.value}}</title></path>`;
+        }}).join("");
+        return `<svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="${{h}}"><circle cx="${{cx}}" cy="${{cy}}" r="${{r}}" fill="none" stroke="var(--surface,#181c23)" stroke-width="20"/>${{paths}}<text x="${{cx}}" y="${{cy + 4}}" text-anchor="middle" fill="var(--text,#f3f4f6)" font-size="14" font-weight="600">${{total}}</text></svg>`;
+      }}
+      if (type === "line") {{
+        const maxV = Math.max(1, ...series.map((s) => s.value));
+        const padX = 28, padY = 20, plotW = w - padX * 2, plotH = h - padY * 2;
+        const pts = series.map((s, i) => {{
+          const x = padX + (series.length === 1 ? plotW / 2 : (i / (series.length - 1)) * plotW);
+          const y = padY + plotH - (Math.max(0, s.value) / maxV) * plotH;
+          return {{ x, y, s }};
+        }});
+        const poly = pts.map((p) => `${{p.x.toFixed(1)}},${{p.y.toFixed(1)}}`).join(" ");
+        const dots = pts.map((p) => `<circle cx="${{p.x.toFixed(1)}}" cy="${{p.y.toFixed(1)}}" r="4" fill="var(--accent,#3b72b2)" data-filter="${{esc(p.s.label)}}"><title>${{esc(p.s.label)}}: ${{p.s.value}}</title></circle>`).join("");
+        const labels = pts.filter((_, i) => i === 0 || i === pts.length - 1 || i === Math.floor(pts.length / 2))
+          .map((p) => `<text x="${{p.x.toFixed(1)}}" y="${{h - 4}}" text-anchor="middle" fill="var(--muted,#9ca3af)" font-size="12">${{esc(p.s.label.slice(0, 12))}}</text>`).join("");
+        return `<svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="${{h}}"><line x1="${{padX}}" y1="${{padY + plotH}}" x2="${{w - padX}}" y2="${{padY + plotH}}" stroke="var(--border,#2d3440)"/><polyline fill="none" stroke="var(--accent,#3b72b2)" stroke-width="2.5" points="${{poly}}"/>${{dots}}${{labels}}</svg>`;
+      }}
+      const items = series.slice(0, 8);
+      const maxV = Math.max(1, ...items.map((s) => s.value));
+      const padL = 12, padB = 28, plotW = w - padL * 2, plotH = h - padB - 14;
+      const bw = Math.max(14, Math.floor(plotW / Math.max(1, items.length)) - 8);
+      const bars = items.map((s, idx) => {{
+        const bh = Math.max(4, Math.round((Math.max(0, s.value) / maxV) * plotH));
+        const x = padL + idx * (plotW / items.length) + 4;
+        const y = 14 + (plotH - bh);
+        const color = PALETTE[idx % PALETTE.length];
+        return `<rect x="${{x.toFixed(1)}}" y="${{y}}" width="${{bw}}" height="${{bh}}" rx="4" fill="${{color}}" data-filter="${{esc(s.label)}}"><title>${{esc(s.label)}}: ${{s.value}}</title></rect><text x="${{(x + bw / 2).toFixed(1)}}" y="${{h - 8}}" text-anchor="middle" fill="var(--muted,#9ca3af)" font-size="12">${{esc(s.label.slice(0, 9))}}</text>`;
+      }}).join("");
+      return `<svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="${{h}}">${{bars}}</svg>`;
+    }}
+
+    function renderCharts() {{
+      const grid = document.getElementById("chartsGrid");
+      grid.innerHTML = "";
+      const charts = Array.isArray(SPEC.charts) ? SPEC.charts : [];
+      if (!charts.length && !state.records.length) return;
+      const effectiveCharts = charts.length ? charts : [
+        {{ type: "bar", title: "Records by Collection", sql: null }},
+      ];
+      effectiveCharts.forEach((ch, idx) => {{
+        let series = [];
+        const res = state.chartResults[idx];
+        if (res && Array.isArray(res.rows)) {{
+          series = normalizeSeriesRows(res.rows);
+        }} else {{
+          const counts = new Map();
+          for (const r of state.records) {{
+            const k = String(r.collection || "items");
+            counts.set(k, (counts.get(k) || 0) + 1);
+          }}
+          series = Array.from(counts.entries()).map(([label, value]) => ({{ label, value }}));
+        }}
+        const card = document.createElement("div");
+        card.className = "card";
+        const type = ch.type === "line" || ch.type === "donut" ? ch.type : "bar";
+        card.innerHTML = `<div class="chart-head"><div class="chart-title">${{esc(ch.title || "Breakdown")}}</div><span class="sub" style="margin:0;">Click to filter</span></div><div>${{buildChartSvg(type, series)}}</div>`;
+        const legend = document.createElement("div");
+        legend.className = "legend";
+        series.slice(0, 6).forEach((s, sIdx) => {{
+          const btn = document.createElement("span");
+          btn.className = "legend-item" + (state.activeCrossFilter === s.label ? " active" : "");
+          btn.innerHTML = `<span class="swatch" style="background:${{PALETTE[sIdx % PALETTE.length]}}"></span><span>${{esc(s.label)}} (${{s.value}})</span>`;
+          btn.addEventListener("click", () => {{
+            state.activeCrossFilter = state.activeCrossFilter === s.label ? "" : s.label;
+            renderAll();
+          }});
+          legend.appendChild(btn);
+        }});
+        card.querySelectorAll("[data-filter]").forEach((node) => {{
+          node.style.cursor = "pointer";
+          node.addEventListener("click", () => {{
+            const val = node.getAttribute("data-filter") || "";
+            state.activeCrossFilter = state.activeCrossFilter === val ? "" : val;
+            renderAll();
+          }});
+        }});
+        card.appendChild(legend);
+        grid.appendChild(card);
+      }});
+    }}
+
+    function getDisplayTable() {{
+      const q = (document.getElementById("searchInput").value || "").trim().toLowerCase();
+      const hasSqlTable = state.tableResult && Array.isArray(state.tableResult.rows) && Array.isArray(state.tableResult.columns);
+      let columns = [];
+      let rows = [];
+      let rawByRow = [];
+      if (hasSqlTable) {{
+        columns = state.tableResult.columns;
+        rows = state.tableResult.rows;
+        rawByRow = rows;
+      }} else {{
+        columns = ["collection", "title", "source", "updated_at"];
+        rows = state.records.map((r) => {{
+          const d = r.doc || {{}};
+          return {{
+            collection: r.collection || "",
+            title: d.subject || d.name || d.summary || d.title || r.external_key || r.id,
+            source: d.from || d.mimeType || (d.organizer && d.organizer.email) || d.source_type || "",
+            updated_at: String(r.updated_at || "").slice(0, 16),
+          }};
+        }});
+        rawByRow = state.records;
+      }}
+      const paired = rows.map((row, i) => ({{ row, raw: rawByRow[i] }})).filter(({{ row, raw }}) => {{
+        const hay = (JSON.stringify(row) + " " + JSON.stringify(raw)).toLowerCase();
+        if (state.activeCollection && String((raw && raw.collection) || row.collection || "") !== state.activeCollection) return false;
+        if (state.activeCrossFilter && !hay.includes(state.activeCrossFilter.toLowerCase())) return false;
+        if (state.activePresetFilter && !hay.includes(state.activePresetFilter.toLowerCase())) return false;
+        if (q && !hay.includes(q)) return false;
+        return true;
+      }});
+      return {{ columns, paired }};
+    }}
+
+    function openDrawer(raw) {{
+      const d = (raw && raw.doc) ? raw.doc : raw;
+      document.getElementById("drawerTitle").textContent = String((d && (d.subject || d.name || d.summary || d.title)) || (raw && raw.external_key) || "Record Detail");
+      document.getElementById("drawerMeta").textContent = raw && raw.collection ? `${{raw.collection}} · ${{raw.updated_at || ""}}` : "";
+      document.getElementById("drawerJson").textContent = JSON.stringify(raw, null, 2);
+      document.getElementById("drawerBackdrop").classList.add("open");
+    }}
+
+    function renderTable() {{
+      const {{ columns, paired }} = getDisplayTable();
+      const head = document.getElementById("tableHead");
+      const body = document.getElementById("tableBody");
+      const meta = document.getElementById("tableMeta");
+      head.innerHTML = "";
+      body.innerHTML = "";
+      meta.textContent = `${{paired.length}} row(s)`;
+      if (!columns.length) return;
+      const trH = document.createElement("tr");
+      for (const col of columns) {{
+        const th = document.createElement("th");
+        th.textContent = col;
+        trH.appendChild(th);
+      }}
+      head.appendChild(trH);
+      if (!paired.length) {{
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = columns.length;
+        td.textContent = "No matching rows.";
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+      }}
+      for (const item of paired.slice(0, 200)) {{
+        const tr = document.createElement("tr");
+        for (const col of columns) {{
+          const td = document.createElement("td");
+          const val = item.row[col];
+          td.textContent = typeof val === "object" && val !== null ? JSON.stringify(val) : String(val ?? "");
+          tr.appendChild(td);
+        }}
+        tr.addEventListener("click", () => openDrawer(item.raw));
+        body.appendChild(tr);
+      }}
+    }}
+
+    function renderEmptyState() {{
+      const empty = document.getElementById("emptyState");
+      const hasData = state.totalRecords > 0 || state.records.length > 0;
+      empty.style.display = hasData ? "none" : "grid";
+      document.getElementById("tableCard").style.display = hasData ? "block" : "none";
+      if (hasData) return;
+      const bots = Array.isArray(SPEC.source_bots) ? SPEC.source_bots : [];
+      const firstBot = bots[0];
+      empty.innerHTML = `
+        <div class="chart-title">No records ingested yet</div>
+        <div class="sub" style="margin:0;max-width:460px;">Run a Source Bot sync to populate its collection, then refresh this live SQLite dashboard at 0 LLM tokens.</div>
+      `;
+      if (firstBot && firstBot.slug) {{
+        const actions = document.createElement("div");
+        actions.className = "controls";
+        const syncBtn = document.createElement("button");
+        syncBtn.type = "button";
+        syncBtn.className = "btn primary";
+        syncBtn.textContent = "Sync " + (firstBot.name || firstBot.slug);
+        syncBtn.addEventListener("click", () => window.parent.postMessage({{ type: "ARGO_TRIGGER_BOT", botSlug: firstBot.slug }}, "*"));
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "btn";
+        openBtn.textContent = "Open Bot";
+        openBtn.addEventListener("click", () => window.parent.postMessage({{ type: "ARGO_OPEN_BOT", botSlug: firstBot.slug }}, "*"));
+        actions.appendChild(syncBtn);
+        actions.appendChild(openBtn);
+        empty.appendChild(actions);
+      }}
+    }}
+
+    function renderAll() {{
+      renderSourcePills();
+      renderFilters();
+      renderEmptyState();
+      renderKpis();
+      renderCharts();
+      renderTable();
+    }}
+
+    function executeSpecQueries() {{
+      if (Array.isArray(SPEC.kpis)) {{
+        SPEC.kpis.forEach((k, idx) => {{
+          if (k && k.sql) runSql(k.sql, [], (res) => {{ state.kpiResults[idx] = res; renderKpis(); }});
+        }});
+      }}
+      if (Array.isArray(SPEC.charts)) {{
+        SPEC.charts.forEach((ch, idx) => {{
+          if (ch && ch.sql) runSql(ch.sql, [], (res) => {{ state.chartResults[idx] = res; renderCharts(); }});
+        }});
+      }}
+      if (SPEC.table_sql) {{
+        runSql(SPEC.table_sql, [], (res) => {{ state.tableResult = res; renderTable(); }});
+      }}
+    }}
+
+    document.getElementById("searchInput").addEventListener("input", renderTable);
+    document.getElementById("refreshBtn").addEventListener("click", executeSpecQueries);
+    document.getElementById("drawerClose").addEventListener("click", () => document.getElementById("drawerBackdrop").classList.remove("open"));
+    document.getElementById("drawerBackdrop").addEventListener("click", (ev) => {{
+      if (ev.target === ev.currentTarget) ev.currentTarget.classList.remove("open");
+    }});
+    document.getElementById("exportBtn").addEventListener("click", () => {{
+      const {{ columns, paired }} = getDisplayTable();
+      const csvCell = (v) => '"' + String(v ?? "").replace(/"/g, '""') + '"';
+      const lines = [columns.map(csvCell).join(",")];
+      for (const item of paired) {{
+        lines.push(columns.map((c) => csvCell(typeof item.row[c] === "object" ? JSON.stringify(item.row[c]) : item.row[c])).join(","));
+      }}
+      window.parent.postMessage({{
+        type: "ARGO_DOWNLOAD_FILE",
+        filename: "dashboard-export.csv",
+        mimeType: "text/csv",
+        data: lines.join("\\n"),
+      }}, "*");
+    }});
+
+    window.addEventListener("message", function (ev) {{
+      const msg = ev.data || {{}};
+      if (msg.type === "ARGO_PAGE_DATA") {{
+        const data = msg.data || {{}};
+        state.records = Array.isArray(data.records) ? data.records : (Array.isArray(msg.records) ? msg.records : []);
+        state.collectionCounts = data.collection_counts && typeof data.collection_counts === "object" ? data.collection_counts : {{}};
+        state.totalRecords = typeof data.total_records === "number" ? data.total_records : state.records.length;
+        renderAll();
+        executeSpecQueries();
+      }} else if (msg.type === "ARGO_SQL_RESULT") {{
+        const reqId = String(msg.requestId || "");
+        const cb = state.pendingSql.get(reqId);
+        state.pendingSql.delete(reqId);
+        showErr("");
+        if (cb) cb(msg.result || msg);
+      }} else if (msg.type === "ARGO_SQL_ERROR") {{
+        const reqId = String(msg.requestId || "");
+        state.pendingSql.delete(reqId);
+        showErr(msg.error || "SQL query error");
+      }}
+    }});
+
+    renderAll();
+    window.parent.postMessage({{ type: "ARGO_READY" }}, "*");
+  </script>
+</body>
+</html>"""
 
         if template_key == "bot_hub_board":
             return f"""<!DOCTYPE html>
@@ -3699,37 +5500,32 @@ class ArgoRepository:
 <title>{safe_title}</title>
 <style>
   * {{ box-sizing: border-box; }}
-  html {{ color-scheme: dark; scrollbar-width: thin; scrollbar-color: #363e4d #161920; }}
-  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-  ::-webkit-scrollbar-track {{ background: #161920; }}
-  ::-webkit-scrollbar-thumb {{ background: #363e4d; border-radius: 9999px; }}
-  ::-webkit-scrollbar-thumb:hover {{ background: #4b5563; }}
-  body {{ margin:0; padding:22px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:#161920; color:#f3f4f6; -webkit-font-smoothing:antialiased; }}
+  body {{ margin:0; padding:22px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:var(--bg,#161920); color:var(--text,#f3f4f6); -webkit-font-smoothing:antialiased; }}
   .wrap {{ max-width:1180px; margin:0 auto; display:grid; gap:18px; }}
   .top {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }}
-  h1 {{ margin:0; font-size:20px; font-weight:600; color:#f3f4f6; }}
-  .sub {{ margin:4px 0 0; font-size:13px; color:#9ca3af; }}
+  h1 {{ margin:0; font-size:20px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .sub {{ margin:4px 0 0; font-size:13px; color:var(--muted,#9ca3af); }}
   .bar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
-  input[type=search] {{ background:#141820; color:#f3f4f6; border:1px solid #2d3440; border-radius:8px; padding:7px 11px; font-size:13px; min-width:210px; outline:none; }}
-  input[type=search]:focus {{ border-color:#3b72b2; }}
+  input[type=search] {{ background:var(--surface,#181c23); color:var(--text,#f3f4f6); border:1px solid var(--border,#2d3440); border-radius:8px; padding:7px 11px; font-size:13px; min-width:210px; outline:none; }}
+  input[type=search]:focus {{ border-color:var(--accent,#3b72b2); }}
   .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; }}
-  .kpi {{ background:#1e232c; border:1px solid #2d3440; border-radius:12px; padding:14px; }}
-  .k-lbl {{ font-size:12px; text-transform:uppercase; letter-spacing:0.04em; color:#9ca3af; font-weight:600; }}
-  .k-val {{ font-size:22px; font-weight:600; color:#f3f4f6; margin-top:4px; }}
-  .sec-title {{ font-size:12px; text-transform:uppercase; letter-spacing:0.05em; color:#9ca3af; font-weight:600; margin:4px 0 8px; }}
+  .kpi {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:14px; }}
+  .k-lbl {{ font-size:12px; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted,#9ca3af); font-weight:600; }}
+  .k-val {{ font-size:22px; font-weight:600; color:var(--text,#f3f4f6); margin-top:4px; }}
+  .sec-title {{ font-size:12px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted,#9ca3af); font-weight:600; margin:4px 0 8px; }}
   .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:12px; }}
-  .card {{ background:#1e232c; border:1px solid #2d3440; border-radius:12px; padding:15px; display:flex; flex-direction:column; gap:10px; }}
+  .card {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:15px; display:flex; flex-direction:column; gap:10px; }}
   .row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
-  .title {{ font-size:14px; font-weight:600; color:#f3f4f6; }}
-  .meta {{ font-size:12px; color:#9ca3af; }}
-  .body {{ font-size:13px; color:#d1d5db; min-height:36px; }}
-  .pill {{ display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:600; border:1px solid #2d3440; background:#181c23; color:#e5e7eb; }}
+  .title {{ font-size:14px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .meta {{ font-size:12px; color:var(--muted,#9ca3af); }}
+  .body {{ font-size:13px; color:var(--text,#d1d5db); min-height:36px; }}
+  .pill {{ display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:600; border:1px solid var(--border,#2d3440); background:var(--surface,#181c23); color:var(--text,#e5e7eb); }}
   .dot {{ width:8px; height:8px; border-radius:999px; display:inline-block; }}
-  .btns {{ display:flex; gap:7px; flex-wrap:wrap; padding-top:8px; border-top:1px solid #2d3440; }}
-  button.btn {{ background:#181c23; border:1px solid #353f50; color:#e5e7eb; border-radius:8px; padding:5px 10px; font-size:12px; font-weight:500; cursor:pointer; }}
-  button.btn:hover {{ background:#252b36; }}
-  button.primary {{ background:#3b72b2; border-color:#3b72b2; color:#ffffff; }}
-  button.primary:hover {{ background:#31629c; }}
+  .btns {{ display:flex; gap:7px; flex-wrap:wrap; padding-top:8px; border-top:1px solid var(--border,#2d3440); }}
+  button.btn {{ background:var(--surface,#181c23); border:1px solid var(--border,#353f50); color:var(--text,#e5e7eb); border-radius:8px; padding:5px 10px; font-size:12px; font-weight:500; cursor:pointer; }}
+  button.btn:hover {{ background:var(--card,#252b36); }}
+  button.primary {{ background:var(--accent,#3b72b2); border-color:var(--accent,#3b72b2); color:#ffffff; }}
+  button.primary:hover {{ filter:brightness(0.92); }}
 </style>
 </head>
 <body>
@@ -3874,39 +5670,34 @@ class ArgoRepository:
 <title>{safe_title}</title>
 <style>
   * {{ box-sizing: border-box; }}
-  html {{ color-scheme: dark; scrollbar-width: thin; scrollbar-color: #363e4d #161920; }}
-  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-  ::-webkit-scrollbar-track {{ background: #161920; }}
-  ::-webkit-scrollbar-thumb {{ background: #363e4d; border-radius: 9999px; }}
-  ::-webkit-scrollbar-thumb:hover {{ background: #4b5563; }}
-  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:#161920; color:#f3f4f6; -webkit-font-smoothing:antialiased; }}
+  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:var(--bg,#161920); color:var(--text,#f3f4f6); -webkit-font-smoothing:antialiased; }}
   .wrap {{ max-width:1120px; margin:0 auto; }}
   .top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap; margin-bottom:20px; }}
-  h1 {{ margin:0; font-size:20px; font-weight:600; letter-spacing:-0.01em; color:#f3f4f6; }}
-  .sub {{ margin:5px 0 0; font-size:13px; color:#9ca3af; }}
+  h1 {{ margin:0; font-size:20px; font-weight:600; letter-spacing:-0.01em; color:var(--text,#f3f4f6); }}
+  .sub {{ margin:5px 0 0; font-size:13px; color:var(--muted,#9ca3af); }}
   .stats {{ display:flex; gap:8px; flex-wrap:wrap; }}
-  .pill {{ background:#1e232c; border:1px solid #2d3440; border-radius:999px; padding:6px 12px; font-size:12px; font-weight:600; color:#e5e7eb; display:inline-flex; align-items:center; gap:7px; }}
+  .pill {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:999px; padding:6px 12px; font-size:12px; font-weight:600; color:var(--text,#e5e7eb); display:inline-flex; align-items:center; gap:7px; }}
   button.pill {{ cursor:pointer; }}
-  button.pill:hover {{ border-color:#4b7bec; background:#252b36; }}
+  button.pill:hover {{ border-color:var(--accent,#4b7bec); background:var(--surface,#252b36); }}
   .dot {{ width:8px; height:8px; border-radius:999px; display:inline-block; flex-shrink:0; }}
   .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(265px,1fr)); gap:12px; }}
-  .group-title {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:#9ca3af; margin:20px 0 10px; }}
-  .station {{ background:#1e232c; border:1px solid #2d3440; border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:11px; transition:border-color .15s, background .15s; }}
-  .station:hover {{ border-color:#3d4759; background:#222833; }}
+  .group-title {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted,#9ca3af); margin:20px 0 10px; }}
+  .station {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:11px; transition:border-color .15s, background .15s; }}
+  .station:hover {{ border-color:var(--accent,#3d4759); }}
   .row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
-  .avatar {{ width:34px; height:34px; border-radius:10px; background:#252b36; border:1px solid #353f50; color:#93b4dc; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }}
-  .name {{ font-size:14px; font-weight:600; color:#f3f4f6; }}
-  .meta {{ font-size:12px; color:#9ca3af; margin-top:2px; }}
-  .summary {{ font-size:13px; color:#d1d5db; line-height:1.45; min-height:36px; }}
-  .actions {{ display:flex; gap:7px; padding-top:8px; border-top:1px solid #2d3440; }}
-  button.act {{ border:1px solid #353f50; background:#181c23; color:#e5e7eb; border-radius:8px; padding:6px 11px; font-size:12px; font-weight:500; cursor:pointer; }}
-  button.act:hover {{ background:#252b36; border-color:#4b5568; }}
-  button.primary {{ background:#3b72b2; color:#ffffff; border-color:#3b72b2; }}
-  button.primary:hover {{ background:#31629c; }}
-  .badge-run {{ background:#1f3329; color:#a8d5ba; border-color:#2e4d3e; }}
-  .badge-wait {{ background:#362c1c; color:#e6c88a; border-color:#524229; }}
-  .badge-warn {{ background:#382326; color:#e8a8ad; border-color:#543439; }}
-  .badge-idle {{ background:#213047; color:#b6cff0; border-color:#324869; }}
+  .avatar {{ width:34px; height:34px; border-radius:10px; background:var(--surface,#252b36); border:1px solid var(--border,#353f50); color:var(--accent,#93b4dc); font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }}
+  .name {{ font-size:14px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .meta {{ font-size:12px; color:var(--muted,#9ca3af); margin-top:2px; }}
+  .summary {{ font-size:13px; color:var(--text,#d1d5db); line-height:1.45; min-height:36px; }}
+  .actions {{ display:flex; gap:7px; padding-top:8px; border-top:1px solid var(--border,#2d3440); }}
+  button.act {{ border:1px solid var(--border,#353f50); background:var(--surface,#181c23); color:var(--text,#e5e7eb); border-radius:8px; padding:6px 11px; font-size:12px; font-weight:500; cursor:pointer; }}
+  button.act:hover {{ border-color:var(--accent,#4b5568); }}
+  button.primary {{ background:var(--accent,#3b72b2); color:#ffffff; border-color:var(--accent,#3b72b2); }}
+  button.primary:hover {{ filter:brightness(0.92); }}
+  .badge-run {{ border-color:var(--good,#2e4d3e); }}
+  .badge-wait {{ border-color:var(--warn,#524229); }}
+  .badge-warn {{ border-color:var(--bad,#543439); }}
+  .badge-idle {{ border-color:var(--border,#324869); }}
 </style>
 </head>
 <body>
@@ -4048,23 +5839,18 @@ class ArgoRepository:
 <title>{safe_title}</title>
 <style>
   * {{ box-sizing: border-box; }}
-  html {{ color-scheme: dark; scrollbar-width: thin; scrollbar-color: #363e4d #161920; }}
-  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-  ::-webkit-scrollbar-track {{ background: #161920; }}
-  ::-webkit-scrollbar-thumb {{ background: #363e4d; border-radius: 9999px; }}
-  ::-webkit-scrollbar-thumb:hover {{ background: #4b5563; }}
-  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:#161920; color:#f3f4f6; -webkit-font-smoothing:antialiased; }}
+  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:var(--bg,#161920); color:var(--text,#f3f4f6); -webkit-font-smoothing:antialiased; }}
   .wrap {{ max-width:920px; margin:0 auto; display:grid; gap:14px; }}
-  .card {{ background:#1e232c; border:1px solid #2d3440; border-radius:12px; padding:18px; }}
+  .card {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:18px; }}
   .head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
-  .badge {{ background:#213047; border:1px solid #324869; color:#b6cff0; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:600; letter-spacing:0.03em; text-transform:uppercase; }}
-  h1 {{ margin:0; font-size:20px; font-weight:600; color:#f3f4f6; }}
-  .sub {{ margin:5px 0 0; font-size:13px; color:#9ca3af; }}
+  .badge {{ background:var(--surface,#181c23); border:1px solid var(--border,#2d3440); color:var(--accent,#3b72b2); border-radius:999px; padding:4px 10px; font-size:12px; font-weight:600; letter-spacing:0.03em; text-transform:uppercase; }}
+  h1 {{ margin:0; font-size:20px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .sub {{ margin:5px 0 0; font-size:13px; color:var(--muted,#9ca3af); }}
   .controls {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; margin-top:16px; }}
-  label {{ display:flex; flex-direction:column; gap:7px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:#9ca3af; }}
-  select {{ background:#141820; color:#f3f4f6; border:1px solid #323a48; border-radius:8px; padding:7px 10px; font-size:13px; outline:none; }}
-  input[type=range] {{ width:100%; accent-color:#3b72b2; }}
-  canvas {{ width:100%; height:260px; display:block; background:#141820; border-radius:10px; border:1px solid #2d3440; }}
+  label {{ display:flex; flex-direction:column; gap:7px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted,#9ca3af); }}
+  select {{ background:var(--surface,#141820); color:var(--text,#f3f4f6); border:1px solid var(--border,#323a48); border-radius:8px; padding:7px 10px; font-size:13px; outline:none; }}
+  input[type=range] {{ width:100%; accent-color:var(--accent,#3b72b2); }}
+  canvas {{ width:100%; height:260px; display:block; background:var(--surface,#141820); border-radius:10px; border:1px solid var(--border,#2d3440); }}
 </style>
 </head>
 <body>
@@ -4118,13 +5904,14 @@ class ArgoRepository:
       document.getElementById("durVal").textContent = durEl.value;
       const w = canvas.width, h = canvas.height, pad = 32;
       ctx.clearRect(0, 0, w, h);
-      ctx.strokeStyle = "#2d3440";
+      const cs = getComputedStyle(document.documentElement);
+      ctx.strokeStyle = cs.getPropertyValue("--border").trim() || "#2d3440";
       ctx.lineWidth = 1;
       for (let i = 0; i <= 4; i++) {{
         const y = pad + (h - pad * 2) * (i / 4);
         ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
       }}
-      ctx.strokeStyle = "#5c8cc7";
+      ctx.strokeStyle = cs.getPropertyValue("--accent").trim() || "#3b72b2";
       ctx.lineWidth = 2.5;
       ctx.beginPath();
       for (let i = 0; i <= 120; i++) {{
@@ -4150,41 +5937,36 @@ class ArgoRepository:
 <title>{safe_title}</title>
 <style>
   * {{ box-sizing: border-box; }}
-  html {{ color-scheme: dark; scrollbar-width: thin; scrollbar-color: #363e4d #161920; }}
-  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-  ::-webkit-scrollbar-track {{ background: #161920; }}
-  ::-webkit-scrollbar-thumb {{ background: #363e4d; border-radius: 9999px; }}
-  ::-webkit-scrollbar-thumb:hover {{ background: #4b5563; }}
-  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:#161920; color:#f3f4f6; -webkit-font-smoothing:antialiased; }}
+  body {{ margin:0; padding:24px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:14px; line-height:1.5; background:var(--bg,#161920); color:var(--text,#f3f4f6); -webkit-font-smoothing:antialiased; }}
   .wrap {{ max-width:980px; margin:0 auto; display:grid; gap:16px; }}
   .head {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }}
   .title-wrap {{ min-width:0; }}
-  h1 {{ margin:0; font-size:20px; font-weight:600; letter-spacing:-0.01em; color:#f3f4f6; }}
-  .sub {{ margin:5px 0 0; font-size:13px; color:#9ca3af; }}
+  h1 {{ margin:0; font-size:20px; font-weight:600; letter-spacing:-0.01em; color:var(--text,#f3f4f6); }}
+  .sub {{ margin:5px 0 0; font-size:13px; color:var(--muted,#9ca3af); }}
   .head-right {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
-  .status-pill {{ background:#1f3329; border:1px solid #2e4d3e; color:#a8d5ba; border-radius:999px; padding:5px 11px; font-size:12px; font-weight:600; letter-spacing:0.03em; text-transform:uppercase; }}
+  .status-pill {{ background:var(--surface,#181c23); border:1px solid var(--good,#3b8c62); color:var(--good,#3b8c62); border-radius:999px; padding:5px 11px; font-size:12px; font-weight:600; letter-spacing:0.03em; text-transform:uppercase; }}
   .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:12px; }}
-  .card {{ background:#1e232c; border:1px solid #2d3440; border-radius:12px; padding:16px; }}
-  .kpi-accent-green {{ border-color:#2e4d3e; }}
-  .kpi-accent-sky {{ border-color:#324869; }}
-  .k-label {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:#9ca3af; }}
-  .k-val {{ font-size:24px; font-weight:600; margin-top:6px; color:#f3f4f6; }}
-  .k-val.green {{ color:#7ec298; }}
-  .k-val.sky {{ color:#8eb2db; }}
+  .card {{ background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); border-radius:12px; padding:16px; }}
+  .kpi-accent-green {{ border-color:var(--good,#3b8c62); }}
+  .kpi-accent-sky {{ border-color:var(--accent,#3b72b2); }}
+  .k-label {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted,#9ca3af); }}
+  .k-val {{ font-size:24px; font-weight:600; margin-top:6px; color:var(--text,#f3f4f6); }}
+  .k-val.green {{ color:var(--good,#3b8c62); }}
+  .k-val.sky {{ color:var(--accent,#3b72b2); }}
   .bars {{ display:flex; align-items:flex-end; gap:10px; height:128px; padding-top:14px; }}
   .bar-col {{ flex:1; display:flex; flex-direction:column; align-items:center; gap:5px; height:100%; justify-content:flex-end; }}
-  .bar {{ width:100%; max-width:52px; background:#3b72b2; border-radius:4px 4px 2px 2px; min-height:4px; }}
-  .bar-lbl {{ font-size:12px; color:#9ca3af; }}
-  .section-lbl {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#9ca3af; margin-bottom:10px; }}
-  .item {{ padding:12px 14px; margin-bottom:8px; background:#181c23; border:1px solid #2d3440; border-radius:10px; }}
+  .bar {{ width:100%; max-width:52px; background:var(--accent,#3b72b2); border-radius:4px 4px 2px 2px; min-height:4px; }}
+  .bar-lbl {{ font-size:12px; color:var(--muted,#9ca3af); }}
+  .section-lbl {{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted,#9ca3af); margin-bottom:10px; }}
+  .item {{ padding:12px 14px; margin-bottom:8px; background:var(--surface,#181c23); border:1px solid var(--border,#2d3440); border-radius:10px; }}
   .item:last-child {{ margin-bottom:0; }}
   .item-top {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }}
-  .item-t {{ font-size:14px; font-weight:600; color:#f3f4f6; }}
-  .item-tag {{ font-size:12px; font-weight:500; padding:2px 8px; border-radius:999px; background:#213047; border:1px solid #324869; color:#b6cff0; white-space:nowrap; }}
-  .item-m {{ font-size:13px; color:#d1d5db; margin-top:5px; line-height:1.45; }}
-  input[type=search] {{ border:1px solid #323a48; border-radius:8px; padding:7px 12px; font-size:13px; background:#141820; color:#f3f4f6; min-width:220px; outline:none; }}
-  input[type=search]::placeholder {{ color:#9ca3af; }}
-  input[type=search]:focus {{ border-color:#5c8cc7; }}
+  .item-t {{ font-size:14px; font-weight:600; color:var(--text,#f3f4f6); }}
+  .item-tag {{ font-size:12px; font-weight:500; padding:2px 8px; border-radius:999px; background:var(--card,#1e232c); border:1px solid var(--border,#2d3440); color:var(--accent,#3b72b2); white-space:nowrap; }}
+  .item-m {{ font-size:13px; color:var(--muted,#9ca3af); margin-top:5px; line-height:1.45; }}
+  input[type=search] {{ border:1px solid var(--border,#323a48); border-radius:8px; padding:7px 12px; font-size:13px; background:var(--surface,#141820); color:var(--text,#f3f4f6); min-width:220px; outline:none; }}
+  input[type=search]::placeholder {{ color:var(--muted,#9ca3af); }}
+  input[type=search]:focus {{ border-color:var(--accent,#3b72b2); }}
 </style>
 </head>
 <body>
@@ -4290,11 +6072,49 @@ class ArgoRepository:
         if render_mode not in {"declarative_json", "sandboxed_html"}:
             raise ValueError(f"Unsupported page render_mode '{render_mode}'.")
         if render_mode == "sandboxed_html":
-            if "allow-same-origin" in payload.lower():
+            lowered = payload.lower()
+            if "allow-same-origin" in lowered:
                 raise ValueError(
                     "Sandboxed HTML pages must not declare 'allow-same-origin'."
                 )
+            if re.search(r"<meta\b[^>]*http-equiv\s*=\s*(['\"]?)refresh\1", payload, flags=re.IGNORECASE):
+                raise ValueError(
+                    "Sandboxed HTML pages must not declare meta refresh redirects."
+                )
         return payload
+
+    def _verify_page_file_bindings(
+        self,
+        allowed_collections: list[str],
+        *,
+        owner_email: str,
+    ) -> None:
+        clean_email = str(owner_email or "").strip().lower()
+        file_refs = [
+            str(c or "").strip()
+            for c in allowed_collections
+            if str(c or "").strip().lower().startswith("file:")
+        ]
+        if not file_refs:
+            return
+        if not clean_email:
+            raise PermissionError(
+                "Authenticated owner email is required to bind workspace files to a Page."
+            )
+        for ident in file_refs:
+            normalized = dataset_identifier(ident)
+            if not normalized.startswith("file:"):
+                raise PermissionError(f"Invalid workspace file dataset reference '{ident}'.")
+            parts = normalized.split(":", 2)
+            file_id = parts[1] if len(parts) > 1 else ""
+            if not file_id:
+                raise PermissionError(f"Invalid workspace file dataset reference '{ident}'.")
+            try:
+                self.get_workspace_file_derived_paths(file_id, owner_email=clean_email)
+            except NotFoundError as exc:
+                raise PermissionError(
+                    f"User '{clean_email}' does not own or cannot bind workspace file '{file_id}'."
+                ) from exc
 
     @staticmethod
     def _normalize_page_collections(allowed_collections: list[str] | None) -> list[str]:
@@ -4302,7 +6122,11 @@ class ArgoRepository:
             return []
         return list(
             dict.fromkeys(
-                collection_slug(str(c)) for c in allowed_collections if str(c).strip()
+                clean
+                for c in allowed_collections
+                if str(c).strip()
+                for clean in (dataset_identifier(str(c)),)
+                if clean not in _PAGE_FORBIDDEN_INTERNAL_COLLECTIONS
             )
         )
 
@@ -4314,13 +6138,22 @@ class ArgoRepository:
         render_mode: str = "declarative_json",
         content_payload: str | None = None,
         allowed_collections: list[str] | None = None,
-        owner_bot_slug: str = "operations-coordinator",
+        owner_bot_slug: str = "",
+        created_by_email: str = "",
+        visibility: str = "shared",
+        allowed_groups: list[str] | None = None,
         pinned: bool = True,
     ) -> dict[str, Any]:
         """Create a new declarative_json or sandboxed_html page."""
         now = utc_now()
         base_slug = slugify(title)
         normalized_collections = self._normalize_page_collections(allowed_collections)
+        clean_creator = normalize_email(created_by_email)
+        clean_visibility = normalize_visibility(visibility, default="shared")
+        clean_allowed_groups = (
+            normalize_group_slugs(allowed_groups) if clean_visibility == "team" else []
+        )
+        self._verify_page_file_bindings(list(allowed_collections or []), owner_email=clean_creator)
         payload = content_payload
         if payload is None:
             if render_mode == "sandboxed_html":
@@ -4336,7 +6169,7 @@ class ArgoRepository:
                         "blocks": [
                             {"label": "Collection Status", "value": "Active", "hint": "SQLite WAL + FTS5"},
                             {"label": "Render Mode", "value": "Declarative", "hint": "Zero runtime JSX"},
-                            {"label": "Owner Bot", "value": owner_bot_slug, "hint": "Dynamic view binding"},
+                            {"label": "Owner Bot", "value": owner_bot_slug or "Unassigned", "hint": "Dynamic view binding"},
                         ],
                         "rows": [],
                     }
@@ -4358,8 +6191,8 @@ class ArgoRepository:
                 """
                 INSERT INTO pages(
                     id, slug, title, icon, render_mode, content_payload,
-                    allowed_collections_json, owner_bot_slug, pinned, updated_at
-                ) VALUES (?, ?, ?, 'file-text', ?, ?, ?, ?, ?, ?)
+                    allowed_collections_json, owner_bot_slug, created_by_email, visibility, allowed_groups_json, pinned, updated_at
+                ) VALUES (?, ?, ?, 'file-text', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     page_id,
@@ -4369,6 +6202,9 @@ class ArgoRepository:
                     payload,
                     json.dumps(normalized_collections),
                     owner_bot_slug,
+                    clean_creator,
+                    clean_visibility,
+                    json.dumps(clean_allowed_groups),
                     1 if pinned else 0,
                     now,
                 ),
@@ -4376,21 +6212,76 @@ class ArgoRepository:
             self._conn.commit()
         return self.get_page(candidate_slug)
 
-    def update_page(self, slug: str, updates: dict[str, Any]) -> dict[str, Any]:
+    def update_page(
+        self,
+        slug: str,
+        updates: dict[str, Any],
+        *,
+        caller_email: str = "",
+        is_admin: bool = False,
+    ) -> dict[str, Any]:
         """Update an existing declarative_json or sandboxed_html page without container rebuilds."""
         now = utc_now()
+        clean_caller = str(caller_email or "").strip().lower()
         with self._lock:
             row = self._conn.execute("SELECT * FROM pages WHERE slug = ?", (slug,)).fetchone()
             if row is None:
                 raise NotFoundError(f"Page '{slug}' not found.")
 
+            row_keys = set(row.keys())
+            existing_cols = json.loads(row["allowed_collections_json"])
+            existing_creator = (
+                str(row["created_by_email"] or "").strip().lower()
+                if "created_by_email" in row_keys
+                else ""
+            )
+            existing_vis = normalize_visibility(
+                row["visibility"] if "visibility" in row_keys else "shared", default="shared"
+            )
             title = str(updates["title"]).strip() if updates.get("title") else str(row["title"])
             render_mode = str(updates.get("render_mode") or row["render_mode"])
+            raw_updates_cols = updates.get("allowed_collections")
             allowed_collections = (
-                self._normalize_page_collections(updates["allowed_collections"])
-                if updates.get("allowed_collections") is not None
-                else json.loads(row["allowed_collections_json"])
+                self._normalize_page_collections(raw_updates_cols)
+                if raw_updates_cols is not None
+                else existing_cols
             )
+            has_file_refs = any(
+                str(c or "").strip().lower().startswith("file:")
+                for c in [*existing_cols, *(raw_updates_cols or []), *allowed_collections]
+            )
+            if (
+                not is_admin
+                and has_file_refs
+                and existing_creator
+                and clean_caller
+                and clean_caller != existing_creator
+            ):
+                raise PermissionError(
+                    f"User '{clean_caller}' is not permitted to modify file-bound Page '{slug}'."
+                )
+            refs_to_verify = list(raw_updates_cols) if raw_updates_cols is not None else list(allowed_collections)
+            if not is_admin and any(str(c or "").strip().lower().startswith("file:") for c in refs_to_verify):
+                effective_owner = clean_caller or existing_creator
+                self._verify_page_file_bindings(refs_to_verify, owner_email=effective_owner)
+            next_creator = existing_creator or clean_caller
+            next_vis = (
+                normalize_visibility(str(updates["visibility"]))
+                if updates.get("visibility") is not None
+                else existing_vis
+            )
+            existing_groups = (
+                self._decode_groups(row["allowed_groups_json"])
+                if "allowed_groups_json" in row_keys
+                else []
+            )
+            if next_vis != "team":
+                next_groups: list[str] = []
+            elif "allowed_groups" in updates and updates["allowed_groups"] is not None:
+                next_groups = normalize_group_slugs(updates["allowed_groups"])
+            else:
+                next_groups = existing_groups
+
             owner_bot_slug = str(updates.get("owner_bot_slug") or row["owner_bot_slug"])
             pinned = bool(updates["pinned"]) if updates.get("pinned") is not None else bool(row["pinned"])
 
@@ -4413,7 +6304,7 @@ class ArgoRepository:
                             "blocks": [
                                 {"label": "Collection Status", "value": "Active", "hint": "SQLite WAL + FTS5"},
                                 {"label": "Render Mode", "value": "Declarative", "hint": "Zero runtime JSX"},
-                                {"label": "Owner Bot", "value": owner_bot_slug, "hint": "Dynamic view binding"},
+                                {"label": "Owner Bot", "value": owner_bot_slug or "Unassigned", "hint": "Dynamic view binding"},
                             ],
                             "rows": [],
                         }
@@ -4425,7 +6316,8 @@ class ArgoRepository:
                 """
                 UPDATE pages
                 SET title = ?, render_mode = ?, content_payload = ?,
-                    allowed_collections_json = ?, owner_bot_slug = ?, pinned = ?, updated_at = ?
+                    allowed_collections_json = ?, owner_bot_slug = ?, created_by_email = ?,
+                    visibility = ?, allowed_groups_json = ?, pinned = ?, updated_at = ?
                 WHERE slug = ?
                 """,
                 (
@@ -4434,6 +6326,9 @@ class ArgoRepository:
                     content_payload,
                     json.dumps(allowed_collections),
                     owner_bot_slug,
+                    next_creator,
+                    next_vis,
+                    json.dumps(next_groups),
                     1 if pinned else 0,
                     now,
                     slug,
@@ -4450,13 +6345,22 @@ class ArgoRepository:
         render_mode: str = "declarative_json",
         content_payload: str | None = None,
         allowed_collections: list[str] | None = None,
-        owner_bot_slug: str = "operations-coordinator",
+        owner_bot_slug: str = "",
+        created_by_email: str = "",
+        visibility: str = "shared",
+        allowed_groups: list[str] | None = None,
         description: str = "",
         pinned: bool = True,
     ) -> dict[str, Any]:
         """Idempotently create or update a dynamic Page by slug for runtime bot updates."""
         clean_slug = slugify(slug)
-        normalized_collections = self._normalize_page_collections(allowed_collections)
+        raw_collections = list(allowed_collections or [])
+        normalized_collections = self._normalize_page_collections(raw_collections)
+        clean_creator = normalize_email(created_by_email)
+        clean_visibility = normalize_visibility(visibility, default="shared")
+        clean_allowed_groups = (
+            normalize_group_slugs(allowed_groups) if clean_visibility == "team" else []
+        )
         with self._lock:
             exists = self._conn.execute(
                 "SELECT 1 FROM pages WHERE slug = ?", (clean_slug,)
@@ -4469,11 +6373,15 @@ class ArgoRepository:
                     "description": description,
                     "render_mode": render_mode,
                     "content_payload": content_payload,
-                    "allowed_collections": normalized_collections,
+                    "allowed_collections": raw_collections if allowed_collections is not None else None,
                     "owner_bot_slug": owner_bot_slug,
+                    "visibility": visibility,
+                    "allowed_groups": clean_allowed_groups,
                     "pinned": pinned,
                 },
+                caller_email=clean_creator,
             )
+        self._verify_page_file_bindings(raw_collections, owner_email=clean_creator)
         now = utc_now()
         payload = (
             self._validate_page_payload(render_mode, content_payload)
@@ -4499,8 +6407,8 @@ class ArgoRepository:
                 """
                 INSERT INTO pages(
                     id, slug, title, icon, render_mode, content_payload,
-                    allowed_collections_json, owner_bot_slug, pinned, updated_at
-                ) VALUES (?, ?, ?, 'file-text', ?, ?, ?, ?, ?, ?)
+                    allowed_collections_json, owner_bot_slug, created_by_email, visibility, allowed_groups_json, pinned, updated_at
+                ) VALUES (?, ?, ?, 'file-text', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     make_id("pg"),
@@ -4510,6 +6418,9 @@ class ArgoRepository:
                     payload,
                     json.dumps(normalized_collections),
                     owner_bot_slug,
+                    clean_creator,
+                    clean_visibility,
+                    json.dumps(clean_allowed_groups),
                     1 if pinned else 0,
                     now,
                 ),
@@ -4517,9 +6428,29 @@ class ArgoRepository:
             self._conn.commit()
         return self.get_page(clean_slug)
 
-    def delete_page(self, slug: str) -> None:
+    def delete_page(self, slug: str, *, caller_email: str = "", is_admin: bool = False) -> None:
         """Delete a dynamic page by slug."""
+        clean_caller = str(caller_email or "").strip().lower()
         with self._lock:
+            row = self._conn.execute("SELECT * FROM pages WHERE slug = ?", (slug,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"Page '{slug}' not found.")
+            existing_cols = json.loads(row["allowed_collections_json"])
+            existing_creator = (
+                str(row["created_by_email"] or "").strip().lower()
+                if "created_by_email" in row.keys()
+                else ""
+            )
+            if (
+                not is_admin
+                and any(str(c).startswith("file:") for c in existing_cols)
+                and existing_creator
+                and clean_caller
+                and clean_caller != existing_creator
+            ):
+                raise PermissionError(
+                    f"User '{clean_caller}' is not permitted to delete file-bound Page '{slug}'."
+                )
             cur = self._conn.execute("DELETE FROM pages WHERE slug = ?", (slug,))
             self._conn.commit()
             if cur.rowcount == 0:
@@ -4535,30 +6466,626 @@ class ArgoRepository:
     ) -> list[dict[str, Any]]:
         """Query an allowed collection scoped to page.allowed_collections."""
         page = self.get_page(slug)
-        clean_col = collection_slug(collection)
-        allowed = {collection_slug(c) for c in page["allowed_collections"]}
+        clean_col = dataset_identifier(collection)
+        allowed = {dataset_identifier(c) for c in page["allowed_collections"]}
         if clean_col not in allowed:
             raise PermissionError(
                 f"Page '{slug}' is not permitted to query collection '{clean_col}'."
             )
         return self.search_documents(collection=clean_col, query=query, limit=limit)
 
+    def register_analytics_collection(
+        self,
+        slug: str,
+        *,
+        parquet_path: Path,
+        row_count: int,
+        columns: list[str],
+        source_url: str = "",
+        description: str = "Extracted Parquet dataset",
+    ) -> str:
+        """Register or update an analytics Parquet collection in SQLite schema_hint_json."""
+        clean_coll = collection_slug(slug)
+        if clean_coll in _INTERNAL_SYSTEM_COLLECTIONS:
+            raise PermissionError(
+                f"Cannot overwrite internal system collection '{clean_coll}'."
+            )
+        resolved_p = parquet_path.resolve()
+        if not resolved_p.is_relative_to(self._analytics_root):
+            raise ValueError("Analytics parquet path must live under analytics root.")
+        rel_p = str(resolved_p.relative_to(self._analytics_root))
+        hint_json = json.dumps(
+            {
+                "kind": "parquet",
+                "rel_parquet": rel_p,
+                "row_count": int(row_count),
+                "columns": list(columns),
+                "source_url": str(source_url)[:500],
+            }
+        )
+        now = utc_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO collections(slug, description, schema_hint_json, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    description = excluded.description,
+                    schema_hint_json = excluded.schema_hint_json
+                """,
+                (clean_coll, description[:300], hint_json, now),
+            )
+            self._conn.commit()
+        return clean_coll
+
+    def resolve_authorized_datasets(
+        self,
+        identifiers: list[str],
+        *,
+        owner_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve authorized file:<id>[:<sub>] and collection identifiers to DuckDB dataset specs."""
+        clean_ids = [
+            c
+            for c in self._normalize_page_collections(identifiers)
+            if c not in _READ_FORBIDDEN_SYSTEM_COLLECTIONS
+        ]
+        specs: list[dict[str, Any]] = []
+        file_cache: dict[str, dict[str, Any]] = {}
+
+        for ident in clean_ids:
+            if ident.startswith("file:"):
+                parts = ident.split(":", 2)
+                file_id = parts[1]
+                sub_alias = parts[2] if len(parts) > 2 else None
+                if file_id not in file_cache:
+                    file_cache[file_id] = self.get_workspace_file_derived_paths(
+                        file_id,
+                        owner_email=owner_email,
+                    )
+                finfo = file_cache[file_id]
+                derived = finfo.get("derived_datasets") or []
+                matched: dict[str, Any] | None = None
+                if sub_alias:
+                    for ds in derived:
+                        if str(ds.get("alias") or "").lower() == sub_alias or str(ds.get("id") or "").lower() == ident:
+                            matched = ds
+                            break
+                    if matched is None:
+                        raise NotFoundError(f"Derived dataset '{ident}' not found.")
+                    p_path = str(matched.get("parquet_path") or "")
+                    aliases = [sub_alias, f"{file_id}_{sub_alias}"]
+                    if sub_alias == "pages":
+                        aliases.append("pages")
+                    specs.append(
+                        {
+                            "id": ident,
+                            "parquet_path": p_path,
+                            "kind": matched.get("kind") or "parquet",
+                            "aliases": aliases,
+                            "alias": sub_alias,
+                            "file_id": file_id,
+                            "row_count": matched.get("row_count"),
+                            "columns": list(matched.get("columns") or []),
+                        }
+                    )
+                else:
+                    p_path = str(finfo.get("default_parquet_path") or "")
+                    if not p_path and derived:
+                        p_path = str(derived[0].get("parquet_path") or "")
+                    if not p_path:
+                        raise NotFoundError(f"No tabular or document dataset derived for '{ident}'.")
+                    first_ds = next(
+                        (d for d in derived if str(d.get("parquet_path") or "") == p_path),
+                        derived[0] if derived else {},
+                    )
+                    specs.append(
+                        {
+                            "id": ident,
+                            "parquet_path": p_path,
+                            "pages_parquet_path": finfo.get("pages_parquet_path"),
+                            "kind": first_ds.get("kind") or "parquet",
+                            "aliases": [file_id],
+                            "alias": str(first_ds.get("alias") or "main"),
+                            "file_id": file_id,
+                            "row_count": first_ds.get("row_count"),
+                            "columns": list(first_ds.get("columns") or []),
+                        }
+                    )
+                continue
+
+            # Regular SQLite or analytics Parquet collection
+            with self._lock:
+                col_row = self._conn.execute(
+                    "SELECT slug, schema_hint_json FROM collections WHERE slug = ?",
+                    (ident,),
+                ).fetchone()
+                hint: dict[str, Any] = {}
+                if col_row and col_row["schema_hint_json"]:
+                    try:
+                        parsed_hint = json.loads(col_row["schema_hint_json"])
+                        if isinstance(parsed_hint, dict):
+                            hint = parsed_hint
+                    except json.JSONDecodeError:
+                        hint = {}
+                rel_parquet = str(hint.get("rel_parquet") or "")
+                parquet_file: Path | None = None
+                if rel_parquet:
+                    cand = (self._analytics_root / rel_parquet).resolve()
+                    if cand.is_relative_to(self._analytics_root) and cand.is_file():
+                        parquet_file = cand
+
+                if parquet_file is not None:
+                    specs.append(
+                        {
+                            "id": ident,
+                            "parquet_path": str(parquet_file),
+                            "kind": "parquet_collection",
+                            "aliases": [ident],
+                            "alias": ident,
+                            "row_count": hint.get("row_count"),
+                            "columns": list(hint.get("columns") or []),
+                        }
+                    )
+                    continue
+
+                cnt_row = self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM collection_documents WHERE collection = ?",
+                    (ident,),
+                ).fetchone()
+                total_cnt = int(cnt_row["cnt"] or 0) if cnt_row else 0
+                raw_rows = self._conn.execute(
+                    """
+                    SELECT id, collection, external_key, search_text, doc_json, created_at, updated_at
+                    FROM collection_documents
+                    WHERE collection = ?
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT 2000
+                    """,
+                    (ident,),
+                ).fetchall()
+            parsed_docs: list[dict[str, Any]] = []
+            for row in raw_rows:
+                try:
+                    doc_obj = json.loads(row["doc_json"])
+                except json.JSONDecodeError:
+                    doc_obj = {}
+                parsed_docs.append(
+                    {
+                        "id": str(row["id"]),
+                        "collection": str(row["collection"]),
+                        "external_key": row["external_key"],
+                        "search_text": row["search_text"],
+                        "doc": doc_obj,
+                        "created_at": str(row["created_at"]),
+                        "updated_at": str(row["updated_at"]),
+                    }
+                )
+            specs.append(
+                {
+                    "id": ident,
+                    "rows": parsed_docs,
+                    "total_count": total_cnt,
+                    "kind": "collection",
+                    "aliases": [ident],
+                    "alias": ident,
+                }
+            )
+        return specs
+
+    def describe_collections(
+        self,
+        allowed_collections: list[str] | None = None,
+        sample_limit: int = 30,
+        *,
+        owner_email: str | None = None,
+    ) -> dict[str, Any]:
+        """Schema-on-read profiler over SQLite collections + DuckDB SUMMARIZE for Parquet/files."""
+        normalized = [
+            c
+            for c in self._normalize_page_collections(allowed_collections)
+            if c not in _READ_FORBIDDEN_SYSTEM_COLLECTIONS
+        ]
+        clean_cols = [c for c in normalized if not c.startswith("file:")]
+        capped_sample = max(1, min(int(sample_limit), 100))
+        secret_vals = self.collect_all_vault_secret_values()
+
+        owners_write: dict[str, tuple[str, str]] = {}
+        with self._lock:
+            bot_rows = self._conn.execute(
+                "SELECT slug, name, card_json FROM bots ORDER BY created_at ASC"
+            ).fetchall()
+            for brow in bot_rows:
+                try:
+                    card = json.loads(brow["card_json"])
+                except json.JSONDecodeError:
+                    card = {}
+                cols_cfg = card.get("collections") if isinstance(card, dict) else {}
+                if not isinstance(cols_cfg, dict):
+                    continue
+                for raw_c in cols_cfg.get("write") or []:
+                    c_slug = collection_slug(str(raw_c))
+                    if c_slug not in _INTERNAL_SYSTEM_COLLECTIONS:
+                        owners_write.setdefault(c_slug, (str(brow["slug"]), str(brow["name"])))
+
+            descriptions: list[dict[str, Any]] = []
+            total_documents = 0
+            for col in clean_cols:
+                agg = self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS doc_count, MAX(updated_at) AS last_updated_at
+                    FROM collection_documents
+                    WHERE collection = ?
+                    """,
+                    (col,),
+                ).fetchone()
+                doc_count = int(agg["doc_count"] or 0) if agg else 0
+                last_updated_at = agg["last_updated_at"] if agg else None
+                total_documents += doc_count
+
+                rows = self._conn.execute(
+                    """
+                    SELECT id, collection, external_key, doc_json, updated_at
+                    FROM collection_documents
+                    WHERE collection = ?
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (col, capped_sample),
+                ).fetchall()
+
+                path_types: dict[str, set[str]] = {}
+                path_doc_hits: dict[str, int] = {}
+                path_samples: dict[str, list[str]] = {}
+                sample_rows: list[dict[str, Any]] = []
+                parsed_count = 0
+
+                for idx, row in enumerate(rows):
+                    try:
+                        doc = json.loads(row["doc_json"])
+                    except json.JSONDecodeError:
+                        doc = {}
+                    if not isinstance(doc, dict):
+                        doc = {"value": doc}
+                    parsed_count += 1
+                    flattened = _flatten_json_paths(doc)
+                    for path, vals in flattened.items():
+                        path_doc_hits[path] = path_doc_hits.get(path, 0) + 1
+                        types_set = path_types.setdefault(path, set())
+                        samples_list = path_samples.setdefault(path, [])
+                        for val in vals:
+                            v_type = _json_value_type(val)
+                            if v_type != "null":
+                                types_set.add(v_type)
+                            if v_type in {"string", "number", "boolean"} and len(samples_list) < 5:
+                                rendered = redact_secrets(str(val)[:120], secret_vals)
+                                if rendered not in samples_list:
+                                    samples_list.append(rendered)
+                    if idx < 2:
+                        sample_rows.append(
+                            {
+                                "id": row["id"],
+                                "collection": row["collection"],
+                                "external_key": redact_secrets(str(row["external_key"] or ""), secret_vals)
+                                if row["external_key"] is not None
+                                else None,
+                                "updated_at": row["updated_at"],
+                                "doc": _compact_scrubbed_doc(doc, secret_vals),
+                            }
+                        )
+
+                denom = max(1, parsed_count)
+                fields_meta: list[dict[str, Any]] = []
+                for path in sorted(path_doc_hits.keys()):
+                    types_sorted = sorted(path_types.get(path) or {"string"})
+                    fields_meta.append(
+                        {
+                            "path": path,
+                            "type": types_sorted[0] if len(types_sorted) == 1 else "mixed",
+                            "types": types_sorted,
+                            "coverage_pct": round((path_doc_hits[path] / denom) * 100.0, 1),
+                            "sample_values": path_samples.get(path, [])[:5],
+                        }
+                    )
+
+                owner = owners_write.get(col)
+                descriptions.append(
+                    {
+                        "collection": col,
+                        "label": self._humanize_collection_label(col, owner[1] if owner else None),
+                        "owner_bot_slug": owner[0] if owner else None,
+                        "owner_bot_name": owner[1] if owner else None,
+                        "doc_count": doc_count,
+                        "sampled_docs": parsed_count,
+                        "last_updated_at": last_updated_at,
+                        "fields": fields_meta,
+                        "sample_rows": sample_rows,
+                    }
+                )
+
+        dataset_profiles: list[dict[str, Any]] = []
+        if normalized:
+            specs = self.resolve_authorized_datasets(normalized, owner_email=owner_email)
+            parquet_specs = [s for s in specs if s.get("parquet_path")]
+            if parquet_specs:
+                dataset_profiles = profile_datasets(parquet_specs, secret_values=secret_vals)
+                for prof in dataset_profiles:
+                    if str(prof.get("dataset_id") or "").startswith("file:"):
+                        total_documents += int(prof.get("row_count") or 0)
+                    else:
+                        # Analytics parquet collection row count
+                        for desc in descriptions:
+                            if desc["collection"] == prof.get("dataset_id") and desc["doc_count"] == 0:
+                                desc["doc_count"] = int(prof.get("row_count") or 0)
+                                total_documents += desc["doc_count"]
+
+        return {
+            "collections": descriptions,
+            "datasets": dataset_profiles,
+            "total_documents": total_documents,
+        }
+
+    def execute_analytics_query(
+        self,
+        sql: str,
+        *,
+        allowed_collections: list[str],
+        owner_email: str | None = None,
+        params: list[Any] | None = None,
+        row_cap: int = 500,
+        engine: str = "auto",
+    ) -> dict[str, Any]:
+        """Validate SQL + ownership, then route between DuckDB 2.0 and legacy SQLite JSON1."""
+        _validate_readonly_sandbox_sql(sql)
+        clean_ids = [
+            c
+            for c in self._normalize_page_collections(allowed_collections)
+            if c not in _READ_FORBIDDEN_SYSTEM_COLLECTIONS
+        ]
+        dataset_specs = self.resolve_authorized_datasets(clean_ids, owner_email=owner_email)
+        has_parquet = any(d.get("parquet_path") for d in dataset_specs)
+
+        wants_sqlite = engine == "sqlite" or (
+            engine == "auto"
+            and not has_parquet
+            and bool(
+                re.search(
+                    r"\b(?:from\s+docs|json_extract|json_each|json_tree|strftime)\b",
+                    sql,
+                    re.IGNORECASE,
+                )
+            )
+        )
+        if wants_sqlite:
+            if any(c.startswith("file:") for c in clean_ids) or has_parquet:
+                raise ValueError(
+                    "SQLite engine cannot query Parquet or workspace file datasets; use engine='duckdb' or 'auto'."
+                )
+            return self.execute_sandboxed_json_query(
+                sql,
+                allowed_collections=clean_ids,
+                owner_email=owner_email,
+                params=params,
+                row_cap=row_cap,
+            )
+
+        secret_vals = self.collect_all_vault_secret_values()
+        return execute_duckdb_query(
+            sql,
+            datasets=dataset_specs,
+            secret_values=secret_vals,
+            params=params,
+            row_cap=row_cap,
+        )
+
+    def execute_sandboxed_json_query(
+        self,
+        sql: str,
+        *,
+        allowed_collections: list[str],
+        owner_email: str | None = None,
+        params: list[Any] | None = None,
+        row_cap: int = 500,
+    ) -> dict[str, Any]:
+        """Run SELECT/WITH SQLite JSON1 queries inside an ephemeral :memory: sandbox over scrubbed docs."""
+        del owner_email  # Reserved for multi-tenant scoping; rows strictly bound to allowed_collections.
+        validated_sql = _validate_readonly_sandbox_sql(sql)
+        clean_cols = [
+            c
+            for c in self._normalize_page_collections(allowed_collections)
+            if c not in _READ_FORBIDDEN_SYSTEM_COLLECTIONS
+        ]
+        capped_rows = max(1, min(int(row_cap), 500))
+        secret_vals = self.collect_all_vault_secret_values()
+
+        collection_counts: dict[str, int] = {}
+        loaded_rows: list[tuple[str, str, str | None, str, str, str, str]] = []
+        with self._lock:
+            for col in clean_cols:
+                cnt_row = self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM collection_documents WHERE collection = ?",
+                    (col,),
+                ).fetchone()
+                collection_counts[col] = int(cnt_row["cnt"] or 0) if cnt_row else 0
+
+            if clean_cols:
+                placeholders = ", ".join("?" for _ in clean_cols)
+                raw_rows = self._conn.execute(
+                    f"""
+                    SELECT id, collection, external_key, search_text, doc_json, created_at, updated_at
+                    FROM collection_documents
+                    WHERE collection IN ({placeholders})
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT 2000
+                    """,
+                    tuple(clean_cols),
+                ).fetchall()
+                for row in raw_rows:
+                    scrubbed_ext = (
+                        redact_secrets(str(row["external_key"]), secret_vals)
+                        if row["external_key"] is not None
+                        else None
+                    )
+                    scrubbed_search = redact_secrets(str(row["search_text"] or ""), secret_vals)
+                    scrubbed_json = redact_secrets(str(row["doc_json"] or "{}"), secret_vals)
+                    loaded_rows.append(
+                        (
+                            str(row["id"]),
+                            str(row["collection"]),
+                            scrubbed_ext,
+                            scrubbed_search,
+                            scrubbed_json,
+                            str(row["created_at"]),
+                            str(row["updated_at"]),
+                        )
+                    )
+
+        mem_conn = sqlite3.connect(":memory:")
+        try:
+            mem_conn.execute(
+                """
+                CREATE TABLE docs (
+                    id TEXT,
+                    collection TEXT,
+                    external_key TEXT,
+                    search_text TEXT,
+                    doc_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            mem_conn.execute("CREATE INDEX idx_mem_docs_col ON docs(collection, updated_at)")
+            if loaded_rows:
+                mem_conn.executemany(
+                    """
+                    INSERT INTO docs (id, collection, external_key, search_text, doc_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    loaded_rows,
+                )
+            mem_conn.commit()
+
+            def _authorizer(
+                action: int,
+                arg1: str | None,
+                arg2: str | None,
+                db_name: str | None,
+                trigger_name: str | None,
+            ) -> int:
+                del db_name, trigger_name
+                if action == sqlite3.SQLITE_SELECT:
+                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_READ:
+                    if (arg1 or "").lower() in {"docs", "json_each", "json_tree"}:
+                        return sqlite3.SQLITE_OK
+                    return sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_FUNCTION:
+                    if (arg2 or "").lower() in _SAFE_SANDBOX_SQL_FUNCTIONS:
+                        return sqlite3.SQLITE_OK
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_DENY
+
+            deadline = time.monotonic() + 0.30
+            mem_conn.set_progress_handler(
+                lambda: 1 if time.monotonic() > deadline else 0,
+                1000,
+            )
+            mem_conn.set_authorizer(_authorizer)
+
+            try:
+                cur = mem_conn.execute(validated_sql, list(params or []))
+                fetched = cur.fetchmany(capped_rows + 1)
+            except sqlite3.DatabaseError as exc:
+                err_msg = str(exc)
+                lowered = err_msg.lower()
+                if "not authorized" in lowered:
+                    raise PermissionError(f"SQL sandbox blocked unauthorized operation: {err_msg}") from exc
+                if "interrupted" in lowered:
+                    raise TimeoutError("SQL sandbox query exceeded the 300 ms time limit.") from exc
+                raise
+
+            raw_cols = [desc[0] for desc in (cur.description or ())]
+            columns: list[str] = []
+            seen_cols: dict[str, int] = {}
+            for col_name in raw_cols:
+                cnt = seen_cols.get(col_name, 0) + 1
+                seen_cols[col_name] = cnt
+                columns.append(col_name if cnt == 1 else f"{col_name}_{cnt}")
+
+            truncated = len(fetched) > capped_rows
+            slice_rows = fetched[:capped_rows]
+            out_rows = [dict(zip(columns, row)) for row in slice_rows]
+            return {
+                "columns": columns,
+                "rows": out_rows,
+                "row_count": len(out_rows),
+                "truncated": truncated,
+                "collection_counts": collection_counts,
+            }
+        finally:
+            mem_conn.close()
+
     def resolve_page_data(
         self,
         slug: str,
         *,
         query: str | None = None,
-        limit: int = 50,
+        limit: int = 200,
+        owner_email: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve a dynamic page alongside its allowed SQLite collection records."""
+        """Resolve a dynamic page alongside SQLite collection records and DuckDB/Parquet datasets."""
         page = self.get_page(slug)
+        capped_limit = max(1, min(int(limit), 2000))
         collections_data: dict[str, list[dict[str, Any]]] = {}
+        collection_counts: dict[str, int] = {}
+        datasets_data: dict[str, list[dict[str, Any]]] = {}
+        dataset_profiles: dict[str, Any] = {}
         records: list[dict[str, Any]] = []
-        for col in self._normalize_page_collections(page["allowed_collections"]):
-            docs = self.search_documents(collection=col, query=query, limit=limit)
+        allowed_cols = self._normalize_page_collections(page["allowed_collections"])
+        regular_cols = [c for c in allowed_cols if not c.startswith("file:")]
+        clean_viewer = str(owner_email or "").strip().lower()
+        created_by_email = str(page.get("created_by_email") or "").strip().lower()
+        if (
+            any(c.startswith("file:") for c in allowed_cols)
+            and created_by_email
+            and created_by_email != clean_viewer
+        ):
+            raise PermissionError(
+                f"User '{clean_viewer or 'unknown'}' is not permitted to view files bound to Page '{slug}'."
+            )
+
+        for col in regular_cols:
+            docs = self.search_documents(collection=col, query=query, limit=capped_limit)
             collections_data[col] = docs
             records.extend(docs)
+        with self._lock:
+            for col in regular_cols:
+                cnt_row = self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM collection_documents WHERE collection = ?",
+                    (col,),
+                ).fetchone()
+                collection_counts[col] = int(cnt_row["cnt"] or 0) if cnt_row else 0
 
+        if allowed_cols:
+            specs = self.resolve_authorized_datasets(allowed_cols, owner_email=owner_email)
+            secret_vals = self.collect_all_vault_secret_values()
+            parquet_specs = [s for s in specs if s.get("parquet_path")]
+            if parquet_specs:
+                for prof in profile_datasets(parquet_specs, secret_values=secret_vals):
+                    ds_id = str(prof["dataset_id"])
+                    dataset_profiles[ds_id] = prof
+                    collection_counts[ds_id] = int(prof.get("row_count") or 0)
+                for spec in parquet_specs:
+                    ds_id = str(spec["id"])
+                    _, rows_out, _ = read_dataset_rows(
+                        Path(str(spec["parquet_path"])),
+                        limit=capped_limit,
+                        secret_values=secret_vals,
+                    )
+                    datasets_data[ds_id] = rows_out
+
+        records.sort(key=lambda rec: str(rec.get("updated_at") or ""), reverse=True)
         parsed_payload: dict[str, Any] = {}
         if page["render_mode"] == "declarative_json":
             try:
@@ -4568,18 +7095,24 @@ class ArgoRepository:
             except json.JSONDecodeError:
                 parsed_payload = {"description": page["content_payload"]}
 
+        total_records = sum(collection_counts.values()) if allowed_cols else 0
         return {
             "page": page,
             "parsed_payload": parsed_payload,
             "collections": collections_data,
-            "records": records[:limit],
-            "total_records": len(records),
+            "collection_counts": collection_counts,
+            "datasets": datasets_data,
+            "dataset_profiles": dataset_profiles,
+            "records": records[:capped_limit],
+            "total_records": total_records,
         }
 
     @staticmethod
     def _humanize_collection_label(slug: str, owner_bot_name: str | None) -> str:
         if slug == "telegram_channel_posts":
             return "Telegram Posts & DMs"
+        if slug == "ssh_audit_log":
+            return "SSH Terminal Audit Log"
         if slug.startswith("bot_") and slug.endswith("_items") and owner_bot_name:
             return f"{owner_bot_name} Items"
         return slug.replace("_", " ").replace("-", " ").title()
@@ -4604,10 +7137,16 @@ class ArgoRepository:
                 if not isinstance(cols_cfg, dict):
                     continue
                 for raw_c in cols_cfg.get("write") or []:
+                    ds_c = dataset_identifier(str(raw_c))
+                    if ds_c.startswith("file:"):
+                        continue
                     clean = collection_slug(str(raw_c))
                     if clean not in _INTERNAL_SYSTEM_COLLECTIONS:
                         owners_write.setdefault(clean, (bslug, bname))
                 for raw_c in cols_cfg.get("read") or []:
+                    ds_c = dataset_identifier(str(raw_c))
+                    if ds_c.startswith("file:"):
+                        continue
                     clean = collection_slug(str(raw_c))
                     if clean not in _INTERNAL_SYSTEM_COLLECTIONS:
                         owners_read.setdefault(clean, (bslug, bname))
@@ -4641,15 +7180,24 @@ class ArgoRepository:
             owner = owners_write.get(cslug) or owners_read.get(cslug)
             owner_slug = owner[0] if owner else None
             owner_name = owner[1] if owner else None
+            hint_count = 0
+            if row["schema_hint_json"]:
+                try:
+                    hint_obj = json.loads(row["schema_hint_json"])
+                    if isinstance(hint_obj, dict):
+                        hint_count = int(hint_obj.get("row_count") or 0)
+                except json.JSONDecodeError:
+                    hint_count = 0
             result.append(
                 {
                     "slug": cslug,
                     "label": self._humanize_collection_label(cslug, owner_name),
                     "description": row["description"],
-                    "doc_count": int(row["doc_count"]),
+                    "doc_count": max(int(row["doc_count"]), hint_count),
                     "owner_bot_slug": owner_slug,
                     "owner_bot_name": owner_name,
-                    "is_internal": cslug in _INTERNAL_SYSTEM_COLLECTIONS,
+                    "is_internal": cslug in _READ_FORBIDDEN_SYSTEM_COLLECTIONS,
+                    "read_only_system": cslug in _BOT_READABLE_SYSTEM_COLLECTIONS,
                     "created_at": row["created_at"],
                 }
             )
@@ -4762,6 +7310,59 @@ class ArgoRepository:
             placeholders.append(f"${prefix}_{k_upper}")
         return list(dict.fromkeys(placeholders))
 
+    @staticmethod
+    def _compute_ssh_key_fingerprint(key_b64: str) -> str:
+        raw_str = str(key_b64 or "").strip()
+        try:
+            raw_bytes = base64.b64decode(raw_str.encode("ascii"), validate=True)
+        except Exception:
+            raw_bytes = raw_str.encode("utf-8")
+        digest = hashlib.sha256(raw_bytes).digest()
+        b64_fp = base64.b64encode(digest).decode("ascii").rstrip("=")
+        return f"SHA256:{b64_fp}"
+
+    @classmethod
+    def _extract_host_key_fingerprints(cls, doc: dict[str, Any]) -> dict[str, str]:
+        raw_pinned = doc.get("pinned_host_keys")
+        if not isinstance(raw_pinned, dict):
+            return {}
+        out: dict[str, str] = {}
+        for hp, entry in raw_pinned.items():
+            key_str = str(hp).strip()
+            if not key_str:
+                continue
+            if isinstance(entry, dict):
+                k_type = str(entry.get("key_type") or "").strip()
+                fp = str(entry.get("fingerprint") or "").strip()
+                if not fp and entry.get("key_b64"):
+                    fp = cls._compute_ssh_key_fingerprint(str(entry["key_b64"]))
+                if fp:
+                    out[key_str] = f"{k_type} {fp}".strip()
+            elif isinstance(entry, str) and entry.strip():
+                parts = entry.strip().split(None, 1)
+                if len(parts) == 2:
+                    out[key_str] = f"{parts[0]} {cls._compute_ssh_key_fingerprint(parts[1])}"
+                else:
+                    out[key_str] = cls._compute_ssh_key_fingerprint(parts[0])
+        return out
+
+    @classmethod
+    def _normalize_vault_trust_prefixes(cls, raw_prefixes: Any) -> list[str]:
+        if not isinstance(raw_prefixes, (list, tuple)):
+            return []
+        from argo_core.ssh.manager import normalize_and_validate_trust_prefix
+
+        out: list[str] = []
+        seen_lower: set[str] = set()
+        for raw in raw_prefixes:
+            norm = normalize_and_validate_trust_prefix(str(raw or ""))
+            if norm and norm.lower() not in seen_lower:
+                seen_lower.add(norm.lower())
+                out.append(norm)
+            if len(out) >= 200:
+                break
+        return out
+
     @classmethod
     def _sanitize_vault_item(cls, saved: dict[str, Any]) -> dict[str, Any]:
         doc = saved.get("doc") or {}
@@ -4775,6 +7376,12 @@ class ArgoRepository:
             allowed_bots = [str(b).strip() for b in raw_allowed if str(b).strip()]
         else:
             allowed_bots = ["*"]
+        raw_trusted = doc.get("trusted_command_prefixes")
+        trusted_prefixes = (
+            [str(p).strip() for p in raw_trusted if str(p).strip()]
+            if isinstance(raw_trusted, list)
+            else []
+        )
         return {
             "id": saved["id"],
             "slug": slug,
@@ -4785,12 +7392,21 @@ class ArgoRepository:
             "url": url,
             "secret_keys": secret_keys,
             "allowed_bots": allowed_bots,
+            "trusted_command_prefixes": trusted_prefixes,
+            "host_key_fingerprints": cls._extract_host_key_fingerprints(doc),
             "env_placeholders": cls._build_vault_placeholders(
                 slug=slug,
                 host=host,
                 port=port,
                 url=url,
                 secret_keys=secret_keys,
+            ),
+            "owner_email": normalize_email(doc.get("owner_email")),
+            "visibility": normalize_visibility(doc.get("visibility"), default="shared"),
+            "allowed_groups": (
+                normalize_group_slugs(doc.get("allowed_groups"))
+                if normalize_visibility(doc.get("visibility"), default="shared") == "team"
+                else []
             ),
             "created_at": saved["created_at"],
             "updated_at": saved["updated_at"],
@@ -4807,6 +7423,12 @@ class ArgoRepository:
         url: str = "",
         secrets: dict[str, str] | None = None,
         allowed_bots: list[str] | None = None,
+        pinned_host_keys: dict[str, Any] | None = None,
+        trusted_command_prefixes: list[str] | None = None,
+        clear_fields: list[str] | None = None,
+        owner_email: str | None = None,
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Encrypt and persist a sensitive credential entry in 'vault_secrets'."""
         clean_name = name.strip()
@@ -4820,6 +7442,10 @@ class ArgoRepository:
             merged_secrets.update(
                 {str(k): str(v) for k, v in existing["secrets"].items() if v is not None and str(v) != ""}
             )
+        for raw_cf in (clear_fields or []):
+            clean_cf = re.sub(r"[^a-z0-9_]+", "_", str(raw_cf).strip().lower()).strip("_")
+            if clean_cf:
+                merged_secrets.pop(clean_cf, None)
         for raw_k, raw_v in (secrets or {}).items():
             clean_k = re.sub(r"[^a-z0-9_]+", "_", str(raw_k).strip().lower()).strip("_")
             if not clean_k:
@@ -4842,6 +7468,41 @@ class ArgoRepository:
         else:
             clean_allowed = ["*"]
 
+        if pinned_host_keys is not None:
+            merged_pinned = dict(pinned_host_keys)
+        elif existing is not None and isinstance(existing.get("pinned_host_keys"), dict):
+            merged_pinned = dict(existing["pinned_host_keys"])
+        else:
+            merged_pinned = {}
+
+        if trusted_command_prefixes is not None:
+            clean_trusted = self._normalize_vault_trust_prefixes(trusted_command_prefixes)
+        elif existing is not None:
+            clean_trusted = self._normalize_vault_trust_prefixes(
+                existing.get("trusted_command_prefixes") or []
+            )
+        else:
+            clean_trusted = []
+
+        resolved_owner = (
+            normalize_email(owner_email)
+            if owner_email is not None
+            else normalize_email(existing.get("owner_email") if existing else "")
+        )
+        resolved_vis = (
+            normalize_visibility(visibility)
+            if visibility is not None
+            else normalize_visibility(existing.get("visibility") if existing else "shared", default="shared")
+        )
+        if resolved_vis != "team":
+            resolved_groups: list[str] = []
+        elif allowed_groups is not None:
+            resolved_groups = normalize_group_slugs(allowed_groups)
+        elif existing is not None:
+            resolved_groups = normalize_group_slugs(existing.get("allowed_groups") or [])
+        else:
+            resolved_groups = []
+
         doc = {
             "slug": clean_slug,
             "name": clean_name,
@@ -4851,6 +7512,11 @@ class ArgoRepository:
             "url": url.strip(),
             "secret_keys": sorted(merged_secrets.keys()),
             "allowed_bots": clean_allowed,
+            "trusted_command_prefixes": clean_trusted,
+            "pinned_host_keys": merged_pinned,
+            "owner_email": resolved_owner,
+            "visibility": resolved_vis,
+            "allowed_groups": resolved_groups,
             "ciphertext_b64": ciphertext_b64,
         }
         saved = self.upsert_document(
@@ -4861,6 +7527,39 @@ class ArgoRepository:
             description="Fernet-encrypted Secrets Vault entries for zero-AI credential injection",
         )
         return self._sanitize_vault_item(saved)
+
+    def add_vault_trusted_command_prefixes(
+        self,
+        slug: str,
+        prefixes: list[str],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Append validated dynamic command prefixes onto a Vault credential."""
+        clean_slug = slugify(slug)
+        saved = self.get_document_by_external_key("vault_secrets", clean_slug)
+        if saved is None:
+            raise NotFoundError(f"Vault secret '{clean_slug}' not found.")
+        doc = dict(saved.get("doc") or {})
+        existing_clean = self._normalize_vault_trust_prefixes(doc.get("trusted_command_prefixes") or [])
+        existing_lower = {p.lower() for p in existing_clean}
+        candidate_clean = self._normalize_vault_trust_prefixes(prefixes)
+        added: list[str] = []
+        merged = list(existing_clean)
+        for pref in candidate_clean:
+            if pref.lower() not in existing_lower and len(merged) < 200:
+                existing_lower.add(pref.lower())
+                merged.append(pref)
+                added.append(pref)
+        if not added:
+            return self._sanitize_vault_item(saved), []
+        doc["trusted_command_prefixes"] = merged
+        updated = self.upsert_document(
+            collection="vault_secrets",
+            external_key=clean_slug,
+            search_text="",
+            doc=doc,
+            description="Fernet-encrypted Secrets Vault entries for zero-AI credential injection",
+        )
+        return self._sanitize_vault_item(updated), added
 
     def list_vault_secrets(self) -> list[dict[str, Any]]:
         """List sanitized Vault secret metadata (never returning plaintext secrets or ciphertext)."""
@@ -4887,10 +7586,422 @@ class ArgoRepository:
             except Exception:
                 decrypted_secrets = {}
         meta = self._sanitize_vault_item(saved)
+        raw_pinned = doc.get("pinned_host_keys")
+        pinned_map = dict(raw_pinned) if isinstance(raw_pinned, dict) else {}
         return {
             **meta,
+            "pinned_host_keys": pinned_map,
             "secrets": decrypted_secrets,
         }
+
+    def pin_vault_host_key(
+        self,
+        slug: str,
+        host: str,
+        port: int,
+        key_type: str,
+        key_b64: str,
+    ) -> dict[str, Any]:
+        """Persist a TOFU-verified SSH host key under vault_secrets.pinned_host_keys."""
+        clean_slug = slugify(slug)
+        saved = self.get_document_by_external_key("vault_secrets", clean_slug)
+        if saved is None:
+            raise NotFoundError(f"Vault secret '{clean_slug}' not found.")
+        doc = dict(saved.get("doc") or {})
+        pinned = dict(doc.get("pinned_host_keys") or {}) if isinstance(doc.get("pinned_host_keys"), dict) else {}
+        host_port = f"{host.strip().lower()}:{int(port)}"
+        pinned[host_port] = {
+            "key_type": str(key_type).strip(),
+            "key_b64": str(key_b64).strip(),
+            "fingerprint": self._compute_ssh_key_fingerprint(key_b64),
+            "pinned_at": utc_now(),
+        }
+        doc["pinned_host_keys"] = pinned
+        updated = self.upsert_document(
+            collection="vault_secrets",
+            external_key=clean_slug,
+            search_text="",
+            doc=doc,
+            description="Fernet-encrypted Secrets Vault entries for zero-AI credential injection",
+        )
+        return self._sanitize_vault_item(updated)
+
+    def reset_vault_host_key(
+        self,
+        slug: str,
+        host_port: str | None = None,
+    ) -> dict[str, Any]:
+        """Clear one or all pinned SSH host keys on a Vault secret after verified key rotation."""
+        clean_slug = slugify(slug)
+        saved = self.get_document_by_external_key("vault_secrets", clean_slug)
+        if saved is None:
+            raise NotFoundError(f"Vault secret '{clean_slug}' not found.")
+        doc = dict(saved.get("doc") or {})
+        pinned = dict(doc.get("pinned_host_keys") or {}) if isinstance(doc.get("pinned_host_keys"), dict) else {}
+        if host_port and host_port.strip():
+            pinned.pop(host_port.strip().lower(), None)
+        else:
+            pinned.clear()
+        doc["pinned_host_keys"] = pinned
+        updated = self.upsert_document(
+            collection="vault_secrets",
+            external_key=clean_slug,
+            search_text="",
+            doc=doc,
+            description="Fernet-encrypted Secrets Vault entries for zero-AI credential injection",
+        )
+        return self._sanitize_vault_item(updated)
+
+    def bulk_create_ssh_vault_secrets(
+        self,
+        *,
+        name_prefix: str,
+        hosts: list[str],
+        port: str = "22",
+        secrets: dict[str, str],
+        allowed_bots: list[str] | None = None,
+        owner_email: str | None = None,
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Create one host-pinned SSH Vault entry per host target cleanly."""
+        clean_prefix = name_prefix.strip() or "SSH Server"
+        default_port = str(port or "22").strip() or "22"
+        clean_allowed = (
+            [str(b).strip() for b in allowed_bots if str(b).strip()]
+            if allowed_bots is not None
+            else []
+        )
+        existing_slugs = {item["slug"] for item in self.list_vault_secrets()}
+        created: list[dict[str, Any]] = []
+        seen_targets: set[str] = set()
+        for raw_entry in hosts:
+            entry = str(raw_entry or "").strip()
+            if not entry:
+                continue
+            target_host = entry
+            target_port = default_port
+            if entry.startswith("[") and "]:" in entry:
+                h_part, p_part = entry[1:].split("]:", 1)
+                target_host = h_part.strip()
+                target_port = p_part.strip() or default_port
+            elif entry.count(":") == 1 and not entry.startswith("["):
+                h_part, p_part = entry.split(":", 1)
+                if p_part.strip().isdigit():
+                    target_host = h_part.strip()
+                    target_port = p_part.strip()
+            target_host = target_host.strip("[]").strip()
+            if not target_host:
+                continue
+            dedup_key = f"{target_host.lower()}:{target_port}"
+            if dedup_key in seen_targets:
+                continue
+            seen_targets.add(dedup_key)
+
+            base_slug = slugify(f"{clean_prefix}-{target_host}")
+            candidate_slug = base_slug
+            suffix = 2
+            while candidate_slug in existing_slugs:
+                candidate_slug = f"{base_slug}-{suffix}"
+                suffix += 1
+            existing_slugs.add(candidate_slug)
+            created.append(
+                self.upsert_vault_secret(
+                    name=f"{clean_prefix} ({target_host})",
+                    slug=candidate_slug,
+                    secret_type="ssh",
+                    host=target_host,
+                    port=target_port,
+                    secrets=secrets,
+                    allowed_bots=clean_allowed,
+                    owner_email=owner_email,
+                    visibility=visibility,
+                    allowed_groups=allowed_groups,
+                )
+            )
+        return created
+
+    def get_ssh_audit_settings(self, default_retention_hours: int = 24) -> dict[str, Any]:
+        """Return SSH audit retention configuration and recording counts."""
+        clamped_default = max(1, min(8760, int(default_retention_hours)))
+        doc_rec = self.get_document_by_external_key("ssh_settings", "retention_config")
+        retention_hours = clamped_default
+        if doc_rec and isinstance(doc_rec.get("doc"), dict):
+            try:
+                retention_hours = max(1, min(8760, int(doc_rec["doc"].get("retention_hours") or clamped_default)))
+            except (TypeError, ValueError):
+                retention_hours = clamped_default
+
+        sessions: dict[str, bool] = {}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT doc_json FROM collection_documents WHERE collection = 'ssh_audit_log'"
+            ).fetchall()
+        for row in rows:
+            try:
+                doc = json.loads(row["doc_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            sid = str(doc.get("session_id") or "").strip()
+            if not sid:
+                continue
+            sessions[sid] = sessions.get(sid, False) or bool(doc.get("pinned"))
+        return {
+            "retention_hours": retention_hours,
+            "total_recordings": len(sessions),
+            "pinned_recordings": sum(1 for v in sessions.values() if v),
+        }
+
+    def update_ssh_audit_settings(self, retention_hours: int) -> dict[str, Any]:
+        """Persist customizable SSH audit retention TTL (1..8760 hours)."""
+        clamped = max(1, min(8760, int(retention_hours)))
+        self.upsert_document(
+            collection="ssh_settings",
+            external_key="retention_config",
+            search_text="",
+            doc={"retention_hours": clamped, "updated_at": utc_now()},
+            description="SSH audit recording retention configuration",
+        )
+        return self.get_ssh_audit_settings(default_retention_hours=clamped)
+
+    def get_chat_retention_settings(self) -> dict[str, Any]:
+        """Return workspace chat history retention configuration and saved message counts."""
+        doc_rec = self.get_document_by_external_key("chat_settings", "retention_config")
+        retention_days = 0
+        updated_at: str | None = None
+        if doc_rec and isinstance(doc_rec.get("doc"), dict):
+            try:
+                retention_days = max(0, min(3650, int(doc_rec["doc"].get("retention_days") or 0)))
+            except (TypeError, ValueError):
+                retention_days = 0
+            raw_updated = doc_rec["doc"].get("updated_at")
+            if isinstance(raw_updated, str) and raw_updated.strip():
+                updated_at = raw_updated.strip()
+
+        with self._lock:
+            bot_row = self._conn.execute(
+                "SELECT COUNT(*) FROM collection_documents WHERE collection = 'bot_threads'"
+            ).fetchone()
+            room_row = self._conn.execute(
+                "SELECT COUNT(*) FROM collection_documents WHERE collection = 'room_threads'"
+            ).fetchone()
+
+        return {
+            "retention_days": retention_days,
+            "bot_messages_count": int(bot_row[0]) if bot_row else 0,
+            "room_messages_count": int(room_row[0]) if room_row else 0,
+            "updated_at": updated_at,
+        }
+
+    def update_chat_retention_settings(self, retention_days: int) -> dict[str, Any]:
+        """Persist workspace chat history retention days (0 = keep forever, 1..3650)."""
+        clamped = max(0, min(3650, int(retention_days)))
+        self.upsert_document(
+            collection="chat_settings",
+            external_key="retention_config",
+            search_text="",
+            doc={"retention_days": clamped, "updated_at": utc_now()},
+            description="Workspace chat transcript retention configuration",
+        )
+        return self.get_chat_retention_settings()
+
+    def prune_expired_chat_messages(self, retention_days: int | None = None) -> dict[str, int]:
+        """Delete bot and room transcript rows older than retention_days when > 0."""
+        days = (
+            self.get_chat_retention_settings()["retention_days"]
+            if retention_days is None
+            else max(0, min(3650, int(retention_days)))
+        )
+        if days <= 0:
+            return {
+                "retention_days": 0,
+                "pruned_bot_messages": 0,
+                "pruned_room_messages": 0,
+                "pruned_total": 0,
+            }
+
+        cutoff_iso = (
+            (datetime.now(UTC) - timedelta(days=days))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        with self._lock:
+            cur_bot = self._conn.execute(
+                "DELETE FROM collection_documents WHERE collection = 'bot_threads' AND created_at < ?",
+                (cutoff_iso,),
+            )
+            cur_room = self._conn.execute(
+                "DELETE FROM collection_documents WHERE collection = 'room_threads' AND created_at < ?",
+                (cutoff_iso,),
+            )
+            pruned_bot = int(cur_bot.rowcount or 0)
+            pruned_room = int(cur_room.rowcount or 0)
+            self._conn.commit()
+
+        return {
+            "retention_days": days,
+            "pruned_bot_messages": pruned_bot,
+            "pruned_room_messages": pruned_room,
+            "pruned_total": pruned_bot + pruned_room,
+        }
+
+    def upsert_ssh_audit_turn(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Persist or update a sanitized SSH turn audit document in 'ssh_audit_log'."""
+        session_id = str(record.get("session_id") or "").strip()
+        turn_seq = int(record.get("turn_seq") or 0)
+        ext_key = f"{session_id}:{turn_seq}"
+        host = str(record.get("host") or "")
+        bot_slug = str(record.get("bot_slug") or "")
+        command = str(record.get("command") or "")
+        screen_excerpt = str(record.get("screen_excerpt") or "")
+        search_text = f"{host} {bot_slug} {command} {screen_excerpt[:500]}"[:1000]
+        return self.upsert_document(
+            collection="ssh_audit_log",
+            external_key=ext_key,
+            search_text=search_text,
+            doc=record,
+            description="Tamper-evident SSH terminal turn audit log",
+        )
+
+    def set_ssh_session_pinned(self, session_id: str, pinned: bool) -> int:
+        """Update pinned retention hold across all ssh_audit_log rows for session_id."""
+        now = utc_now()
+        updated = 0
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, doc_json
+                FROM collection_documents
+                WHERE collection = 'ssh_audit_log' AND external_key LIKE ?
+                """,
+                (f"{session_id}:%",),
+            ).fetchall()
+            for row in rows:
+                try:
+                    doc = json.loads(row["doc_json"])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                doc["pinned"] = bool(pinned)
+                self._conn.execute(
+                    "UPDATE collection_documents SET doc_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(doc), now, row["id"]),
+                )
+                updated += 1
+            if updated:
+                self._conn.commit()
+        return updated
+
+    def list_recent_ssh_sessions_from_log(
+        self,
+        *,
+        bot_slug: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Aggregate distinct retained SSH sessions from 'ssh_audit_log' newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT doc_json, created_at, updated_at
+                FROM collection_documents
+                WHERE collection = 'ssh_audit_log'
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 500
+                """
+            ).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                doc = json.loads(row["doc_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            sid = str(doc.get("session_id") or "").strip()
+            if not sid:
+                continue
+            b_slug = str(doc.get("bot_slug") or "")
+            if bot_slug and b_slug != bot_slug:
+                continue
+            existing = grouped.get(sid)
+            turn_seq = int(doc.get("turn_seq") or 0)
+            if existing is None:
+                grouped[sid] = {
+                    "session_id": sid,
+                    "bot_slug": b_slug,
+                    "vault_slug": str(doc.get("vault_slug") or ""),
+                    "host": str(doc.get("host") or ""),
+                    "port": int(doc.get("port") or 22),
+                    "correlation_id": str(doc.get("correlation_id") or ""),
+                    "status": "closed",
+                    "operator_takeover": False,
+                    "paused": False,
+                    "pinned": bool(doc.get("pinned")),
+                    "last_command": str(doc.get("command") or ""),
+                    "screen_text": str(doc.get("screen_excerpt") or ""),
+                    "cast_relpath": str(doc.get("cast_relpath") or ""),
+                    "cast_sha256": str(doc.get("cast_sha256") or ""),
+                    "created_at": str(doc.get("created_at") or row["created_at"]),
+                    "expires_at": str(doc.get("expires_at") or ""),
+                    "_max_turn": turn_seq,
+                    "_updated_at": str(row["updated_at"]),
+                }
+            else:
+                existing["pinned"] = existing["pinned"] or bool(doc.get("pinned"))
+                if str(doc.get("created_at") or "") < existing["created_at"]:
+                    existing["created_at"] = str(doc.get("created_at") or existing["created_at"])
+                if turn_seq >= existing["_max_turn"]:
+                    existing["_max_turn"] = turn_seq
+                    existing["last_command"] = str(doc.get("command") or existing["last_command"])
+                    existing["screen_text"] = str(doc.get("screen_excerpt") or existing["screen_text"])
+                    if doc.get("cast_sha256"):
+                        existing["cast_sha256"] = str(doc["cast_sha256"])
+                    if doc.get("expires_at"):
+                        existing["expires_at"] = str(doc["expires_at"])
+        out = sorted(grouped.values(), key=lambda x: x["_updated_at"], reverse=True)[:limit]
+        for item in out:
+            item.pop("_max_turn", None)
+            item.pop("_updated_at", None)
+        return out
+
+    def purge_expired_ssh_audit_logs(self, now_iso: str) -> list[str]:
+        """Delete expired unpinned rows from ssh_audit_log and return affected cast_relpaths."""
+        purged_casts: list[str] = []
+        ids_to_delete: list[str] = []
+        pinned_casts: set[str] = set()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, doc_json FROM collection_documents WHERE collection = 'ssh_audit_log'"
+            ).fetchall()
+            for row in rows:
+                try:
+                    doc = json.loads(row["doc_json"])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                cast_rel = str(doc.get("cast_relpath") or "").strip()
+                if doc.get("pinned"):
+                    if cast_rel:
+                        pinned_casts.add(cast_rel)
+                    continue
+                expires_at = str(doc.get("expires_at") or "").strip()
+                if expires_at and expires_at <= now_iso:
+                    ids_to_delete.append(str(row["id"]))
+                    if cast_rel and cast_rel not in purged_casts:
+                        purged_casts.append(cast_rel)
+            if ids_to_delete:
+                placeholders = ", ".join("?" for _ in ids_to_delete)
+                self._conn.execute(
+                    f"DELETE FROM collection_documents WHERE id IN ({placeholders})",
+                    tuple(ids_to_delete),
+                )
+                self._conn.commit()
+        return [p for p in purged_casts if p not in pinned_casts]
 
     def delete_vault_secret(self, slug: str) -> bool:
         """Delete a Vault secret entry by slug."""
@@ -4901,18 +8012,96 @@ class ArgoRepository:
         self.delete_document("vault_secrets", saved["id"])
         return True
 
+    _NON_SECRET_VAULT_KEYS = frozenset(
+        {"username", "user", "login", "email", "account", "host", "hostname", "domain", "url", "port"}
+    )
+    _NON_SECRET_OAUTH_KEYS = frozenset(
+        {
+            "email",
+            "account_identifier",
+            "client_id",
+            "operator_chat_id",
+            "bot_username",
+            "admin_channels",
+            "public_channels",
+            "scopes",
+            "token_expiry",
+            "redirect_uri",
+            "provider",
+            "label",
+            "person_urn",
+            "org_urn",
+            "url",
+            "target_url",
+            "webhook_url",
+            "outbound_url",
+            "channel",
+            "channels",
+            "handle",
+            "name",
+            "auth_mode",
+            "token_type",
+        }
+    )
+
+    def _invalidate_sensitive_secrets_cache(self) -> None:
+        with self._lock:
+            self._vault_secrets_cache = None
+            self._sensitive_secrets_cache = None
+
     def collect_all_vault_secret_values(self) -> list[str]:
         """Collect all decrypted non-empty Vault secret strings for trace/log scrubbing."""
-        values: list[str] = []
-        for meta in self.list_vault_secrets():
-            dec = self.get_vault_secret_decrypted(meta["slug"])
-            if not dec:
-                continue
-            for val in (dec.get("secrets") or {}).values():
-                s = str(val).strip()
-                if len(s) >= 4:
-                    values.append(s)
-        return values
+        with self._lock:
+            if self._vault_secrets_cache is not None:
+                return list(self._vault_secrets_cache)
+            values: list[str] = []
+            for meta in self.list_vault_secrets():
+                dec = self.get_vault_secret_decrypted(meta["slug"])
+                if not dec:
+                    continue
+                for key, val in (dec.get("secrets") or {}).items():
+                    if str(key or "").strip().lower() in self._NON_SECRET_VAULT_KEYS:
+                        continue
+                    s = str(val).strip()
+                    if len(s) >= 4:
+                        values.append(s)
+            deduped = tuple(dict.fromkeys(values))
+            self._vault_secrets_cache = deduped
+            return list(deduped)
+
+    def collect_all_sensitive_secrets(self) -> list[str]:
+        """Collect all decrypted Vault, LLM provider, and integration secret strings (cached)."""
+        with self._lock:
+            if self._sensitive_secrets_cache is not None:
+                return list(self._sensitive_secrets_cache)
+            values: list[str] = list(self.collect_all_vault_secret_values())
+            for mdl in self.list_model_provider_credentials():
+                api_key = str(mdl.get("api_key") or "").strip()
+                if len(api_key) >= 6:
+                    values.append(api_key)
+            rows = self._conn.execute(
+                "SELECT encrypted_secrets FROM oauth_accounts"
+            ).fetchall()
+            for row in rows:
+                blob = row["encrypted_secrets"]
+                if not blob:
+                    continue
+                try:
+                    sec_map = self._vault.decrypt_json(blob)
+                except Exception:
+                    continue
+                if not isinstance(sec_map, dict):
+                    continue
+                for key, val in sec_map.items():
+                    if str(key or "").strip().lower() in self._NON_SECRET_OAUTH_KEYS:
+                        continue
+                    if isinstance(val, str):
+                        s = val.strip()
+                        if len(s) >= 6:
+                            values.append(s)
+            deduped = tuple(sorted(set(values), key=len, reverse=True))
+            self._sensitive_secrets_cache = deduped
+            return list(deduped)
 
     def document_exists(self, collection: str, external_key: str) -> bool:
         """Return True if a document with external_key already exists in collection."""
@@ -5015,6 +8204,9 @@ class ArgoRepository:
                     (new_id,),
                 ).fetchone()
             self._conn.commit()
+            if clean_coll == "vault_secrets":
+                self._vault_secrets_cache = None
+                self._sensitive_secrets_cache = None
 
         return {
             "id": row["id"],
@@ -5085,18 +8277,24 @@ class ArgoRepository:
                 (clean_coll, doc_id),
             )
             self._conn.commit()
+            if clean_coll == "vault_secrets":
+                self._vault_secrets_cache = None
+                self._sensitive_secrets_cache = None
 
     def delete_collection(self, collection: str) -> int:
-        """Delete all documents in a collection and return deleted count."""
+        """Delete all documents in a collection, remove analytics Parquet files, and return deleted count."""
         clean_coll = collection_slug(collection)
-        with self._lock:
+        with self._tx():
             cursor = self._conn.execute(
                 "DELETE FROM collection_documents WHERE collection = ?",
                 (clean_coll,),
             )
             self._conn.execute("DELETE FROM collections WHERE slug = ?", (clean_coll,))
-            self._conn.commit()
-            return int(cursor.rowcount or 0)
+            deleted_count = int(cursor.rowcount or 0)
+        analytics_target = (self._analytics_root / clean_coll).resolve()
+        if analytics_target != self._analytics_root and analytics_target.is_relative_to(self._analytics_root):
+            shutil.rmtree(analytics_target, ignore_errors=True)
+        return deleted_count
 
     # ------------------------------------------------------------------
     # Workspace Summary & Desktops View
@@ -5131,20 +8329,82 @@ class ArgoRepository:
                     stopped.append(bot["slug"])
         return stopped
 
-    def workspace_counts(self) -> dict[str, int]:
+    def list_sandboxes(self) -> list[dict[str, Any]]:
+        """Return isolated per-bot lightweight headless sandbox records."""
+        sandboxes: list[dict[str, Any]] = []
+        for bot in self.list_bots():
+            if bot["runtime"] == "sandbox":
+                sandboxes.append(
+                    {
+                        "bot_slug": bot["slug"],
+                        "bot_name": bot["name"],
+                        "role": bot["role"],
+                        "container_name": f"argo-sandbox-{bot['slug']}",
+                        "sandbox_state": bot.get("sandbox_state", "hibernated"),
+                        "ram_mb": bot.get("ram_mb", 0),
+                        "ram_limit_mb": bot.get("ram_limit_mb", 512),
+                    }
+                )
+        return sandboxes
+
+    def set_sandbox_state(self, slug: str, state: str, *, ram_mb: int = 0) -> dict[str, Any]:
+        """Persist sandbox running/hibernated state for a sandbox-runtime bot."""
+        return self.update_bot(slug, {"sandbox_state": state, "ram_mb": ram_mb})
+
+    def stop_running_sandboxes(self) -> list[str]:
+        """Mark all active script sandboxes as hibernated while preserving /workspace volumes."""
+        stopped: list[str] = []
+        with self._lock:
+            for bot in self.list_bots():
+                if bot["runtime"] == "sandbox" and bot.get("sandbox_state") == "running":
+                    self.set_sandbox_state(bot["slug"], "hibernated", ram_mb=0)
+                    stopped.append(bot["slug"])
+        return stopped
+
+    def workspace_counts(
+        self,
+        *,
+        allowed_bot_slugs: set[str] | None = None,
+        allowed_page_slugs: set[str] | None = None,
+        allowed_integration_slugs: set[str] | None = None,
+        manageable_bot_slugs: set[str] | None = None,
+    ) -> dict[str, int]:
         """Compute live sidebar badge and footer summary counts."""
         bots = self.list_bots()
+        if allowed_bot_slugs is not None:
+            bots = [b for b in bots if b["slug"] in allowed_bot_slugs]
         desktops = [b for b in bots if b["runtime"] == "desktop"]
         desktops_running = sum(1 for b in desktops if b["desktop_state"] == "running")
+        sandboxes = [b for b in bots if b["runtime"] == "sandbox"]
+        sandboxes_running = sum(1 for b in sandboxes if b.get("sandbox_state") == "running")
 
         with self._lock:
-            pending_approvals = self._conn.execute(
-                "SELECT COUNT(*) FROM approvals_outbox WHERE status = 'pending'"
-            ).fetchone()[0]
-            pages_count = self._conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-            integrations_count = self._conn.execute(
-                "SELECT COUNT(*) FROM oauth_accounts"
-            ).fetchone()[0]
+            if manageable_bot_slugs is not None:
+                if not manageable_bot_slugs:
+                    pending_approvals = 0
+                else:
+                    ph = ",".join("?" for _ in manageable_bot_slugs)
+                    pending_approvals = self._conn.execute(
+                        f"SELECT COUNT(*) FROM approvals_outbox WHERE status = 'pending' AND bot_slug IN ({ph})",
+                        tuple(sorted(manageable_bot_slugs)),
+                    ).fetchone()[0]
+            else:
+                pending_approvals = self._conn.execute(
+                    "SELECT COUNT(*) FROM approvals_outbox WHERE status = 'pending'"
+                ).fetchone()[0]
+
+            if allowed_page_slugs is not None:
+                pages_count = len(allowed_page_slugs)
+            else:
+                pages_count = self._conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+
+            if allowed_integration_slugs is not None:
+                integrations_count = len(allowed_integration_slugs)
+            else:
+                integrations_count = self._conn.execute(
+                    "SELECT COUNT(*) FROM oauth_accounts"
+                ).fetchone()[0]
+
             models_count = self._conn.execute("SELECT COUNT(*) FROM model_providers").fetchone()[0]
 
         return {
@@ -5155,6 +8415,8 @@ class ArgoRepository:
             "models": int(models_count),
             "desktops_running": desktops_running,
             "desktops_total": len(desktops),
+            "sandboxes_running": sandboxes_running,
+            "sandboxes_total": len(sandboxes),
         }
 
     def build_platform_status_snapshot(
@@ -5177,6 +8439,7 @@ class ArgoRepository:
                     "enabled": bot["enabled"],
                     "runtime": bot["runtime"],
                     "desktop_state": bot["desktop_state"],
+                    "sandbox_state": bot.get("sandbox_state", "none"),
                     "outbound_rbac": bot["outbound_rbac"],
                     "daily_cap": bot["daily_cap"],
                     "model": bot["model"],
@@ -5261,13 +8524,27 @@ class ArgoRepository:
         desktop_states: dict[str, dict[str, Any]] | None = None,
         active_runs: dict[str, dict[str, Any]] | None = None,
         user_email: str | None = None,
+        allowed_bot_slugs: set[str] | None = None,
+        allowed_room_slugs: set[str] | None = None,
+        allowed_page_slugs: set[str] | None = None,
+        allowed_integration_slugs: set[str] | None = None,
+        manageable_bot_slugs: set[str] | None = None,
     ) -> dict[str, Any]:
         """Return lightweight secret-free live status for bots, rooms, unread cursors & approvals."""
         bots = self.list_bots()
+        if allowed_bot_slugs is not None:
+            bots = [b for b in bots if b["slug"] in allowed_bot_slugs]
         bot_name_by_slug = {b["slug"]: b["name"] for b in bots}
         rooms = self.list_rooms()
+        if allowed_room_slugs is not None:
+            rooms = [r for r in rooms if r["slug"] in allowed_room_slugs]
         pending = self.list_approvals(tab="pending")
-        recent_runs = self.list_bot_runs(limit=80)
+        if manageable_bot_slugs is not None:
+            pending = [p for p in pending if p.get("bot_slug") in manageable_bot_slugs]
+        recent_runs = self.list_bot_runs(
+            allowed_bot_slugs=allowed_bot_slugs,
+            limit=80,
+        )
         recent_events = self.list_events(limit=60)
         cursors = self._list_read_cursors_for_user(user_email)
         desktop_map = desktop_states or {}
@@ -5428,10 +8705,14 @@ class ArgoRepository:
                     "pinned": bool(bot.get("pinned", False)),
                     "section": bot.get("section", ""),
                     "goal_metric": bot.get("goal_metric", ""),
+                    "owner_email": bot.get("owner_email", ""),
+                    "visibility": bot.get("visibility", "shared"),
+                    "allowed_groups": list(bot.get("allowed_groups") or []),
                     "role": bot["role"],
                     "enabled": bot["enabled"],
                     "runtime": bot["runtime"],
                     "desktop_state": bot["desktop_state"],
+                    "sandbox_state": bot.get("sandbox_state", "none"),
                     "state": state,
                     "active_step": str(active_run.get("step") or "") if active_run else "",
                     "pending_approvals_count": p_count,
@@ -5456,12 +8737,22 @@ class ArgoRepository:
             preview = ""
             if rmsg and rmsg.get("text"):
                 prefix = f"{rmsg['sender_name']}: " if rmsg.get("sender") == "bot" else "You: "
-                preview = f"{prefix}{str(rmsg['text']).strip().splitlines()[0]}"[:120]
+                raw_lines = [ln.strip() for ln in str(rmsg["text"]).splitlines() if ln.strip()]
+                first_line = raw_lines[0] if raw_lines else str(rmsg["text"]).strip()
+                cleaned_line = re.sub(r"^#{1,6}\s+", "", first_line)
+                cleaned_line = re.sub(r"^(?:[-*•]+|\d+[.)])\s+", "", cleaned_line)
+                cleaned_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned_line)
+                cleaned_line = re.sub(r"[*_`~]+", "", cleaned_line)
+                cleaned_line = re.sub(r"\s+", " ", cleaned_line).strip()
+                preview = f"{prefix}{cleaned_line}"[:120]
             room_stations.append(
                 {
                     "slug": rslug,
                     "title": room["title"],
                     "member_bot_slugs": room["member_bot_slugs"],
+                    "owner_email": room.get("owner_email", ""),
+                    "visibility": room.get("visibility", "shared"),
+                    "allowed_groups": list(room.get("allowed_groups") or []),
                     "last_sender_name": rmsg.get("sender_name") if rmsg else None,
                     "last_message_preview": preview,
                     "last_activity_at": rmsg["created_at"] if rmsg else room["updated_at"],
@@ -5471,7 +8762,537 @@ class ArgoRepository:
 
         return {
             "generated_at": utc_now(),
-            "counts": self.workspace_counts(),
+            "counts": self.workspace_counts(
+                allowed_bot_slugs=allowed_bot_slugs,
+                allowed_page_slugs=allowed_page_slugs,
+                allowed_integration_slugs=allowed_integration_slugs,
+                manageable_bot_slugs=manageable_bot_slugs,
+            ),
             "bots": stations,
             "rooms": room_stations,
         }
+
+    # ------------------------------------------------------------------
+    # Users, Team Groups, Auth Sessions & Google Login OAuth States
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_auth_methods(raw: Any, *, default: list[str] | None = None) -> list[str]:
+        valid = {"password", "google"}
+        if raw is None:
+            return list(default or ["password"])
+        cleaned: list[str] = []
+        for item in raw:
+            val = str(item or "").strip().lower()
+            if val in valid and val not in cleaned:
+                cleaned.append(val)
+        return cleaned
+
+    @staticmethod
+    def _sanitize_user(
+        doc: dict[str, Any],
+        *,
+        groups_by_email: dict[str, list[dict[str, str]]] | None = None,
+    ) -> dict[str, Any]:
+        email = normalize_email(doc.get("email"))
+        raw_role = str(doc.get("role") or "member").strip().lower()
+        role = raw_role if raw_role in {"admin", "member"} else "member"
+        groups = list((groups_by_email or {}).get(email, []))
+        return {
+            "email": email,
+            "display_name": str(doc.get("display_name") or ""),
+            "role": role,
+            "active": bool(doc.get("active", True)),
+            "auth_methods": [
+                m
+                for m in (doc.get("auth_methods") or [])
+                if str(m).strip().lower() in {"password", "google"}
+            ],
+            "has_password": bool(doc.get("password_hash")),
+            "must_change_password": bool(doc.get("must_change_password", False)),
+            "max_active_desktops": doc.get("max_active_desktops"),
+            "max_active_sandboxes": doc.get("max_active_sandboxes"),
+            "token_version": int(doc.get("token_version") or 1),
+            "groups": groups,
+            "last_login_at": doc.get("last_login_at"),
+            "created_by": str(doc.get("created_by") or ""),
+            "created_at": doc.get("created_at") or "",
+            "updated_at": doc.get("updated_at") or "",
+        }
+
+    def list_team_groups(self) -> list[dict[str, Any]]:
+        """List all workspace Team Groups sorted by name."""
+        rows = self.search_documents("argo_team_groups", limit=500)
+        groups: list[dict[str, Any]] = []
+        for item in rows:
+            doc = item.get("doc") or {}
+            slug = slugify(str(doc.get("slug") or item.get("external_key") or ""))
+            if not slug:
+                continue
+            members = sorted(
+                {
+                    normalize_email(str(m))
+                    for m in (doc.get("member_emails") or [])
+                    if normalize_email(str(m))
+                }
+            )
+            groups.append(
+                {
+                    "id": item["id"],
+                    "slug": slug,
+                    "name": str(doc.get("name") or slug),
+                    "description": str(doc.get("description") or ""),
+                    "member_emails": members,
+                    "created_by": str(doc.get("created_by") or ""),
+                    "created_at": item["created_at"],
+                    "updated_at": item["updated_at"],
+                }
+            )
+        groups.sort(key=lambda g: (g["name"].lower(), g["slug"]))
+        return groups
+
+    def get_team_group(self, slug: str) -> dict[str, Any] | None:
+        """Fetch a single Team Group by slug, or None."""
+        clean_slug = slugify(slug)
+        if not clean_slug:
+            return None
+        for grp in self.list_team_groups():
+            if grp["slug"] == clean_slug:
+                return grp
+        return None
+
+    def upsert_team_group(
+        self,
+        *,
+        name: str,
+        slug: str | None = None,
+        description: str | None = None,
+        member_emails: list[str] | None = None,
+        created_by: str = "",
+    ) -> dict[str, Any]:
+        """Create or update a workspace Team Group."""
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Team Group name is required.")
+        clean_slug = slugify(slug or clean_name)
+        existing = self.get_team_group(clean_slug)
+        resolved_desc = (
+            description.strip()
+            if description is not None
+            else (existing["description"] if existing else "")
+        )
+        if member_emails is not None:
+            resolved_members = sorted(
+                {
+                    normalize_email(str(m))
+                    for m in member_emails
+                    if normalize_email(str(m))
+                }
+            )
+        elif existing is not None:
+            resolved_members = list(existing["member_emails"])
+        else:
+            resolved_members = []
+        doc = {
+            "slug": clean_slug,
+            "name": clean_name,
+            "description": resolved_desc,
+            "member_emails": resolved_members,
+            "created_by": (
+                existing["created_by"]
+                if existing and existing.get("created_by")
+                else normalize_email(created_by)
+            ),
+        }
+        self.upsert_document(
+            collection="argo_team_groups",
+            external_key=clean_slug,
+            search_text="",
+            doc=doc,
+            description="Internal workspace Team Groups",
+        )
+        return self.get_team_group(clean_slug)  # type: ignore[return-value]
+
+    def set_user_groups(self, email: str, group_slugs: list[str]) -> list[str]:
+        """Set exact Team Group memberships for a user email."""
+        clean_email = normalize_email(email)
+        if not clean_email:
+            return []
+        desired = set(normalize_group_slugs(group_slugs))
+        known = self.list_team_groups()
+        known_slugs = {g["slug"] for g in known}
+        unknown = sorted(desired - known_slugs)
+        if unknown:
+            raise ValueError(f"Unknown Team Group(s): {', '.join(unknown)}.")
+        for grp in known:
+            members = set(grp["member_emails"])
+            should_be_in = grp["slug"] in desired
+            currently_in = clean_email in members
+            if should_be_in and not currently_in:
+                members.add(clean_email)
+                self.upsert_team_group(
+                    name=grp["name"],
+                    slug=grp["slug"],
+                    description=grp["description"],
+                    member_emails=sorted(members),
+                    created_by=grp.get("created_by", ""),
+                )
+            elif not should_be_in and currently_in:
+                members.discard(clean_email)
+                self.upsert_team_group(
+                    name=grp["name"],
+                    slug=grp["slug"],
+                    description=grp["description"],
+                    member_emails=sorted(members),
+                    created_by=grp.get("created_by", ""),
+                )
+        return sorted(desired)
+
+    def delete_team_group(self, slug: str) -> None:
+        """Delete a Team Group and safely remove it from all resource ACLs."""
+        clean_slug = slugify(slug)
+        saved = self.get_document_by_external_key("argo_team_groups", clean_slug)
+        if saved is None:
+            raise NotFoundError(f"Team Group '{slug}' not found.")
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM collection_documents WHERE collection = 'argo_team_groups' AND external_key = ?",
+                (clean_slug,),
+            )
+            self._conn.commit()
+
+        # Scrub deleted group slug from resources; empty 'team' becomes 'private' (fail-closed)
+        for bot in self.list_bots():
+            groups = list(bot.get("allowed_groups") or [])
+            if clean_slug in groups or (bot.get("visibility") == "team" and not groups):
+                next_groups = [g for g in groups if g != clean_slug]
+                next_vis = "private" if (bot.get("visibility") == "team" and not next_groups) else bot.get("visibility", "shared")
+                self.update_bot(bot["slug"], {"visibility": next_vis, "allowed_groups": next_groups})
+
+        for acc in self.list_integrations():
+            groups = list(acc.get("allowed_groups") or [])
+            if clean_slug in groups or (acc.get("visibility") == "team" and not groups):
+                next_groups = [g for g in groups if g != clean_slug]
+                next_vis = "private" if (acc.get("visibility") == "team" and not next_groups) else acc.get("visibility", "shared")
+                self.upsert_integration(
+                    slug=acc["slug"],
+                    provider=acc["provider"],
+                    display_name=acc["display_name"],
+                    account_identifier=acc.get("account_identifier"),
+                    scopes=list(acc.get("scopes") or []),
+                    status=str(acc.get("status") or "ok"),
+                    visibility=next_vis,
+                    allowed_groups=next_groups,
+                )
+
+        for pg in self.list_pages():
+            groups = list(pg.get("allowed_groups") or [])
+            if clean_slug in groups or (pg.get("visibility") == "team" and not groups):
+                next_groups = [g for g in groups if g != clean_slug]
+                next_vis = "private" if (pg.get("visibility") == "team" and not next_groups) else pg.get("visibility", "shared")
+                self.update_page(
+                    pg["slug"],
+                    {"visibility": next_vis, "allowed_groups": next_groups},
+                    is_admin=True,
+                )
+
+        for rm in self.list_rooms():
+            groups = list(rm.get("allowed_groups") or [])
+            if clean_slug in groups or (rm.get("visibility") == "team" and not groups):
+                next_groups = [g for g in groups if g != clean_slug]
+                next_vis = "private" if (rm.get("visibility") == "team" and not next_groups) else rm.get("visibility", "shared")
+                self.update_room(rm["slug"], {"visibility": next_vis, "allowed_groups": next_groups})
+
+        for vs in self.list_vault_secrets():
+            groups = list(vs.get("allowed_groups") or [])
+            if clean_slug in groups or (vs.get("visibility") == "team" and not groups):
+                next_groups = [g for g in groups if g != clean_slug]
+                next_vis = "private" if (vs.get("visibility") == "team" and not next_groups) else vs.get("visibility", "shared")
+                self.upsert_vault_secret(
+                    name=vs["name"],
+                    slug=vs["slug"],
+                    secret_type=vs["secret_type"],
+                    host=vs.get("host", ""),
+                    port=vs.get("port", ""),
+                    url=vs.get("url", ""),
+                    visibility=next_vis,
+                    allowed_groups=next_groups,
+                )
+
+    def _groups_by_email_map(self) -> dict[str, list[dict[str, str]]]:
+        mapping: dict[str, list[dict[str, str]]] = {}
+        for grp in self.list_team_groups():
+            entry = {"slug": grp["slug"], "name": grp["name"]}
+            for member in grp["member_emails"]:
+                mapping.setdefault(member, []).append(entry)
+        return mapping
+
+    def get_user(self, email: str, *, include_secret: bool = False) -> dict[str, Any] | None:
+        """Fetch an invited/bootstrap user account by email."""
+        clean_email = normalize_email(email)
+        if not clean_email:
+            return None
+        saved = self.get_document_by_external_key("argo_users", clean_email)
+        if saved is None:
+            return None
+        doc = dict(saved.get("doc") or {})
+        doc.setdefault("email", clean_email)
+        doc.setdefault("created_at", saved.get("created_at"))
+        doc.setdefault("updated_at", saved.get("updated_at"))
+        groups_map = self._groups_by_email_map()
+        sanitized = self._sanitize_user(doc, groups_by_email=groups_map)
+        if include_secret:
+            sanitized["password_hash"] = str(doc.get("password_hash") or "")
+        return sanitized
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """List all invited and bootstrap users sorted by email."""
+        rows = self.search_documents("argo_users", limit=500)
+        groups_map = self._groups_by_email_map()
+        users: list[dict[str, Any]] = []
+        for item in rows:
+            doc = dict(item.get("doc") or {})
+            doc.setdefault("email", item.get("external_key"))
+            doc.setdefault("created_at", item.get("created_at"))
+            doc.setdefault("updated_at", item.get("updated_at"))
+            sanitized = self._sanitize_user(doc, groups_by_email=groups_map)
+            if sanitized["email"]:
+                users.append(sanitized)
+        users.sort(key=lambda u: u["email"])
+        return users
+
+    def upsert_user(
+        self,
+        *,
+        email: str,
+        display_name: str | None = None,
+        role: str | None = None,
+        active: bool | None = None,
+        auth_methods: list[str] | None = None,
+        password_hash: Any = _UNSET,
+        must_change_password: bool | None = None,
+        max_active_desktops: Any = _UNSET,
+        max_active_sandboxes: Any = _UNSET,
+        created_by: str | None = None,
+        touch_login: bool = False,
+        bump_token_version: bool = False,
+    ) -> dict[str, Any]:
+        """Create or update an internal workspace user account."""
+        clean_email = normalize_email(email)
+        if not clean_email or "@" not in clean_email:
+            raise ValueError("Valid user email is required.")
+        saved = self.get_document_by_external_key("argo_users", clean_email)
+        existing = dict(saved.get("doc") or {}) if saved else {}
+
+        next_name = (
+            display_name.strip()
+            if display_name is not None
+            else str(existing.get("display_name") or "")
+        )
+        raw_role = str(role if role is not None else (existing.get("role") or "member")).strip().lower()
+        next_role = raw_role if raw_role in {"admin", "member"} else "member"
+        next_active = bool(active if active is not None else existing.get("active", True))
+        next_methods = (
+            self._normalize_auth_methods(auth_methods)
+            if auth_methods is not None
+            else self._normalize_auth_methods(existing.get("auth_methods"), default=["password"])
+        )
+        if password_hash is _UNSET or password_hash is None:
+            next_pw_hash = str(existing.get("password_hash") or "")
+        else:
+            next_pw_hash = str(password_hash)
+
+        next_must_change = (
+            bool(must_change_password)
+            if must_change_password is not None
+            else bool(existing.get("must_change_password", False))
+        )
+        if max_active_desktops is _UNSET:
+            next_desk = existing.get("max_active_desktops")
+        elif max_active_desktops is None:
+            next_desk = None
+        else:
+            next_desk = max(0, int(max_active_desktops))
+
+        if max_active_sandboxes is _UNSET:
+            next_sb = existing.get("max_active_sandboxes")
+        elif max_active_sandboxes is None:
+            next_sb = None
+        else:
+            next_sb = max(0, int(max_active_sandboxes))
+
+        next_token_ver = int(existing.get("token_version") or 1) + (1 if bump_token_version else 0)
+        next_login_at = utc_now() if touch_login else existing.get("last_login_at")
+        resolved_creator = (
+            str(existing.get("created_by") or "")
+            or normalize_email(created_by)
+        )
+
+        doc = {
+            "email": clean_email,
+            "display_name": next_name,
+            "role": next_role,
+            "active": next_active,
+            "auth_methods": next_methods,
+            "password_hash": next_pw_hash,
+            "must_change_password": next_must_change,
+            "max_active_desktops": next_desk,
+            "max_active_sandboxes": next_sb,
+            "token_version": next_token_ver,
+            "last_login_at": next_login_at,
+            "created_by": resolved_creator,
+        }
+        self.upsert_document(
+            collection="argo_users",
+            external_key=clean_email,
+            search_text="",
+            doc=doc,
+            description="Internal workspace invited users and auth credentials",
+        )
+        return self.get_user(clean_email)  # type: ignore[return-value]
+
+    def delete_user(self, email: str) -> None:
+        """Delete a user account, its sessions, and remove it from Team Groups."""
+        clean_email = normalize_email(email)
+        if not clean_email or self.get_user(clean_email) is None:
+            raise NotFoundError(f"User '{email}' not found.")
+        self.delete_user_sessions(clean_email)
+        for grp in self.list_team_groups():
+            if clean_email in grp["member_emails"]:
+                remaining = [m for m in grp["member_emails"] if m != clean_email]
+                self.upsert_team_group(
+                    name=grp["name"],
+                    slug=grp["slug"],
+                    description=grp["description"],
+                    member_emails=remaining,
+                    created_by=grp.get("created_by", ""),
+                )
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM collection_documents WHERE collection = 'argo_users' AND external_key = ?",
+                (clean_email,),
+            )
+            self._conn.commit()
+
+    def create_auth_session(
+        self,
+        *,
+        token_sha256: str,
+        email: str,
+        auth_method: str,
+        token_version: int,
+        ttl_hours: int,
+        user_agent: str = "",
+    ) -> dict[str, Any]:
+        """Persist an active authenticated session in SQLite."""
+        clean_email = normalize_email(email)
+        now = utc_now()
+        expires_at = (
+            (datetime.now(UTC) + timedelta(hours=max(1, int(ttl_hours))))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        doc = {
+            "token_sha256": token_sha256,
+            "email": clean_email,
+            "auth_method": str(auth_method or "password"),
+            "token_version": int(token_version),
+            "user_agent": str(user_agent or "")[:200],
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+        self.upsert_document(
+            collection="argo_auth_sessions",
+            external_key=token_sha256,
+            search_text="",
+            doc=doc,
+            description="Internal active cookie authentication sessions",
+        )
+        return doc
+
+    def get_auth_session(self, token_sha256: str) -> dict[str, Any] | None:
+        """Fetch an active session by SHA-256 token hash, pruning expired sessions."""
+        if not token_sha256:
+            return None
+        saved = self.get_document_by_external_key("argo_auth_sessions", token_sha256)
+        if saved is None:
+            return None
+        doc = dict(saved.get("doc") or {})
+        expires_at = str(doc.get("expires_at") or "")
+        if not expires_at or expires_at <= utc_now():
+            self.delete_auth_session(token_sha256)
+            return None
+        return doc
+
+    def delete_auth_session(self, token_sha256: str) -> None:
+        """Revoke a single authentication session."""
+        if not token_sha256:
+            return
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM collection_documents WHERE collection = 'argo_auth_sessions' AND external_key = ?",
+                (token_sha256,),
+            )
+            self._conn.commit()
+
+    def delete_user_sessions(self, email: str) -> int:
+        """Revoke all active authentication sessions belonging to an email."""
+        clean_email = normalize_email(email)
+        if not clean_email:
+            return 0
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM collection_documents
+                WHERE collection = 'argo_auth_sessions'
+                  AND lower(json_extract(doc_json, '$.email')) = ?
+                """,
+                (clean_email,),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def store_auth_oauth_state(self, state_hash: str, doc: dict[str, Any]) -> None:
+        """Store short-lived PKCE + nonce verification state for native Google Sign-In."""
+        self.upsert_document(
+            collection="argo_auth_oauth_states",
+            external_key=state_hash,
+            search_text="",
+            doc=doc,
+            description="Ephemeral OAuth login states for native Google Sign-In",
+        )
+
+    def consume_auth_oauth_state(self, state_hash: str) -> dict[str, Any] | None:
+        """Consume and return a Google Sign-In OAuth state entry once, rejecting expired entries."""
+        if not state_hash:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT doc_json
+                FROM collection_documents
+                WHERE collection = 'argo_auth_oauth_states' AND external_key = ?
+                """,
+                (state_hash,),
+            ).fetchone()
+            if row is not None:
+                self._conn.execute(
+                    """
+                    DELETE FROM collection_documents
+                    WHERE collection = 'argo_auth_oauth_states' AND external_key = ?
+                    """,
+                    (state_hash,),
+                )
+                self._conn.commit()
+        if row is None:
+            return None
+        try:
+            doc = json.loads(row["doc_json"])
+        except Exception:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        expires_at = str(doc.get("expires_at") or "")
+        if not expires_at or expires_at <= utc_now():
+            return None
+        return doc

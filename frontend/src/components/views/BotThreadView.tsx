@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent,
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
@@ -22,18 +23,24 @@ import {
   CornerUpLeft,
   Download,
   FileText,
+  FileUp,
+  Image as ImageIcon,
   ListChecks,
   Loader2,
   Monitor,
   MoreHorizontal,
   Paperclip,
+  Pencil,
   Plus,
+  ShieldCheck,
   SmilePlus,
   Sparkles,
   Square,
+  Terminal,
   X,
 } from "lucide-react";
-import { api, MAX_WORKSPACE_FILE_BYTES } from "../../api";
+import { api, maxWorkspaceFileBytesForName } from "../../api";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import type {
   ActiveThreadStream,
   ApprovalItem,
@@ -47,10 +54,12 @@ import type {
   LiveTurnChip,
   MessageQuote,
   ModelProvider,
+  OperatorQuestion,
   PageRecord,
   PendingRoomHandoff,
   RoomMessage,
   RoomRecord,
+  RunCheckpoint,
   SkillRecord,
   VaultSecretRecord,
   WorkspaceFileAttachment,
@@ -58,10 +67,14 @@ import type {
 } from "../../types";
 import {
   computeWordDiff,
+  extractApprovalHost,
+  extractSuggestedTrustPrefixes,
   formatBotSystemText,
   formatFriendlyTime,
+  formatShellCommandForDisplay,
   friendlyActionStepLabel,
   friendlyAutonomyLabel,
+  partitionSSHApprovalBatches,
 } from "../../utils/format";
 import { BotAvatar } from "../BotAvatar";
 import {
@@ -118,6 +131,7 @@ interface BotThreadViewProps {
       approved_handoff_bot_slug?: string;
     },
   ) => Promise<void>;
+  onEditLastMessage?: (messageId: string, newText: string) => Promise<void>;
   onCancelRun?: (runId: string) => Promise<void>;
   onUploadFile?: (file: File) => Promise<WorkspaceFileRecord>;
   onExecutePlan?: (plan: DelegationPlan) => Promise<void>;
@@ -136,11 +150,17 @@ interface BotThreadViewProps {
       routines?: Array<Record<string, unknown>>;
     },
   ) => Promise<void> | void;
-  onApproveItem?: (id: string) => Promise<void>;
+  onApproveItem?: (id: string, opts?: { trust_command?: boolean }) => Promise<void>;
+  onBatchResolveApprovals?: (
+    ids: string[],
+    action: "approve" | "reject",
+    opts?: { trust_command?: boolean },
+  ) => Promise<void>;
   onRejectItem?: (id: string) => Promise<void>;
   onEditApprovalItem?: (item: ApprovalItem) => void;
   onOpenPage?: (pageSlug: string, sideBySide?: boolean) => void;
   onOpenSelkies?: (bot: BotRecord) => void;
+  onOpenTerminal?: (botSlug: string, sessionId?: string | null) => void;
   onSaveSkill?: (payload: {
     name: string;
     description?: string;
@@ -152,6 +172,8 @@ interface BotThreadViewProps {
   loadingMessages?: boolean;
   loadingOlderMessages?: boolean;
   onLoadOlderMessages?: () => Promise<void> | void;
+  prefillDraft?: { id: number; text: string } | null;
+  onConsumePrefillDraft?: () => void;
   compact?: boolean;
   placeholder?: string;
 }
@@ -180,7 +202,9 @@ interface NormalizedThreadMessage {
     applied_changes?: Record<string, unknown>;
     habit_proposal?: HabitProposal;
     delegation_plan?: DelegationPlan;
+    operator_question?: OperatorQuestion;
     pending_room_handoff?: PendingRoomHandoff;
+    run_checkpoint?: RunCheckpoint;
     attachments?: WorkspaceFileAttachment[];
     reply_to?: MessageQuote;
     reactions?: Record<string, string[]>;
@@ -212,7 +236,9 @@ function botHasTool(bot: BotRecord, toolName: string): boolean {
   );
 }
 
-function getRoleType(bot: BotRecord): "supervisor" | "desktop" | "email" | "web" | "writer" | "general" {
+function getRoleType(
+  bot: BotRecord,
+): "supervisor" | "sandbox" | "desktop" | "email" | "web" | "writer" | "general" {
   const combined = `${bot.name} ${bot.role} ${bot.role_prompt}`.toLowerCase();
   if (
     botHasTool(bot, "platform_status") ||
@@ -223,6 +249,9 @@ function getRoleType(bot: BotRecord): "supervisor" | "desktop" | "email" | "web"
   }
   if (bot.runtime === "desktop") {
     return "desktop";
+  }
+  if (bot.runtime === "sandbox") {
+    return "sandbox";
   }
   if (
     botHasTool(bot, "gmail_search") ||
@@ -267,6 +296,28 @@ function getStarterPrompts(bot: BotRecord): Array<{ title: string; prompt: strin
       {
         title: "Propose a new specialist bot",
         prompt: "Based on my current bots, propose a helpful new specialist bot to fill any gap.",
+      },
+    ];
+  }
+  if (roleType === "sandbox") {
+    return [
+      {
+        title: "Write & run a Python script",
+        prompt:
+          "Write a Python script to /workspace/check_versions.py that fetches JSON API metadata and prints a clean summary.",
+      },
+      {
+        title: "Inspect /workspace scripts",
+        prompt: "List files in /workspace and inspect any saved scripts and recent outputs.",
+      },
+      {
+        title: "Check HTTPS endpoint via curl",
+        prompt:
+          "Use curl or Python in your Script Sandbox to inspect response status, headers, and release info from a public API endpoint.",
+      },
+      {
+        title: "Create a live status Page",
+        prompt: "Collect CLI script findings and publish an interactive Page summarizing the results.",
       },
     ];
   }
@@ -391,6 +442,7 @@ export function BotThreadView({
   onClearContextCorrelation,
   onSendMessage,
   onSendRoomMessage,
+  onEditLastMessage,
   onCancelRun,
   onUploadFile,
   onExecutePlan,
@@ -398,16 +450,20 @@ export function BotThreadView({
   onOpenNewBot,
   onUpdateBot,
   onApproveItem,
+  onBatchResolveApprovals,
   onRejectItem,
   onEditApprovalItem,
   onOpenPage,
   onOpenSelkies,
+  onOpenTerminal,
   onSaveSkill,
   hasMoreMessages = false,
   totalMessagesCount = 0,
   loadingMessages = false,
   loadingOlderMessages = false,
   onLoadOlderMessages,
+  prefillDraft = null,
+  onConsumePrefillDraft,
   compact = false,
   placeholder,
 }: BotThreadViewProps) {
@@ -418,8 +474,10 @@ export function BotThreadView({
     replyTo?: MessageQuote | null;
     attachments?: WorkspaceFileRecord[];
   } | null>(null);
+  const isMobile = useIsMobile();
   const [elapsedSec, setElapsedSec] = useState(0);
   const [mentionOpen, setMentionOpen] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionSelectedIndex, setMentionSelectedIndex] = useState(0);
   const [expandedSteps, setExpandedSteps] = useState<Record<string, boolean>>({});
@@ -442,9 +500,43 @@ export function BotThreadView({
   >({});
   const [activatedHabits, setActivatedHabits] = useState<Record<string, boolean>>({});
   const [savingHabitId, setSavingHabitId] = useState<string | null>(null);
+  const [answeredQuestions, setAnsweredQuestions] = useState<Record<string, string>>({});
+  const [busyApprovalId, setBusyApprovalId] = useState<string | null>(null);
+  const [busyBatchMsgId, setBusyBatchMsgId] = useState<string | null>(null);
+  const [expandedBatchKeys, setExpandedBatchKeys] = useState<Record<string, boolean>>({});
+  const [copiedApprovalKey, setCopiedApprovalKey] = useState<string | null>(null);
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState("");
+  const [submittingEdit, setSubmittingEdit] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  function compactStepUrl(rawUrl: string): string {
+    const clean = rawUrl.trim();
+    if (!clean) return "";
+    try {
+      const u = new URL(clean);
+      const host = u.hostname.replace(/^www\./, "");
+      const path = u.pathname.replace(/\/+$/, "");
+      const joined = path ? `${host}${path}` : host;
+      return joined.length <= 44 ? joined : `${joined.slice(0, 41)}...`;
+    } catch {
+      return clean.length <= 44 ? clean : `${clean.slice(0, 41)}...`;
+    }
+  }
+
+  function copyApprovalCommand(copyKey: string, commandText: string) {
+    if (!commandText) return;
+    void navigator.clipboard?.writeText(commandText);
+    setCopiedApprovalKey(copyKey);
+    window.setTimeout(() => {
+      setCopiedApprovalKey((prev) => (prev === copyKey ? null : prev));
+    }, 1600);
+  }
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const docFileInputRef = useRef<HTMLInputElement | null>(null);
+  const photoFileInputRef = useRef<HTMLInputElement | null>(null);
   const composerBackdropRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -496,6 +588,30 @@ export function BotThreadView({
       }));
   }, [room, roomMessages, bot, messages]);
 
+  const { claimedApprovalIds, latestFallbackMsgIdByCorr } = useMemo(() => {
+    const claimed = new Set<string>();
+    const latestByCorr = new Map<string, string>();
+    for (const m of visibleMessages) {
+      if (m.sender === "user") continue;
+      const mActions = m.metadata?.actions ?? [];
+      let hasExplicitApproval = false;
+      for (const a of mActions) {
+        const aid = String(
+          a.approval_id ?? (a.approval as { id?: string } | undefined)?.id ?? "",
+        ).trim();
+        if (aid) {
+          claimed.add(aid);
+          hasExplicitApproval = true;
+        }
+      }
+      const corr = m.metadata?.correlation_id;
+      if (!hasExplicitApproval && corr) {
+        latestByCorr.set(corr, m.id);
+      }
+    }
+    return { claimedApprovalIds: claimed, latestFallbackMsgIdByCorr: latestByCorr };
+  }, [visibleMessages]);
+
   const showLiveStream = Boolean(
     activeStream &&
       !visibleMessages.some(
@@ -507,14 +623,119 @@ export function BotThreadView({
   const isWorking = sending || Boolean(activeRun) || showLiveStream;
   const [cancellingRunId, setCancellingRunId] = useState<string | null>(null);
 
+  const lastUserMessageId = useMemo(() => {
+    for (let i = visibleMessages.length - 1; i >= 0; i -= 1) {
+      if (visibleMessages[i].sender === "user") {
+        return visibleMessages[i].id;
+      }
+    }
+    return null;
+  }, [visibleMessages]);
+
+  async function handleSubmitEditLastMessage(messageId: string) {
+    if (!onEditLastMessage || submittingEdit) return;
+    const trimmed = editingText.trim();
+    if (!trimmed) {
+      setEditError("Message cannot be empty.");
+      return;
+    }
+    setSubmittingEdit(true);
+    setEditError(null);
+    try {
+      await onEditLastMessage(messageId, trimmed);
+      setEditingMsgId(null);
+      setEditingText("");
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to re-submit edited message.");
+    } finally {
+      setSubmittingEdit(false);
+    }
+  }
+
   useEffect(() => {
     setReplyTo(null);
     setDraftAttachments([]);
     setFileError(null);
     setMentionOpen(false);
+    setAttachMenuOpen(false);
     setReactMenuMsgId(null);
     setMoreMenuMsgId(null);
+    setEditingMsgId(null);
+    setEditingText("");
+    setSubmittingEdit(false);
+    setEditError(null);
   }, [threadKey]);
+
+  useEffect(() => {
+    if (!mentionOpen && !attachMenuOpen && !reactMenuMsgId && !moreMenuMsgId) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (reactMenuMsgId && !target?.closest('[data-argo-popover="react"]')) {
+        setReactMenuMsgId(null);
+      }
+      if (moreMenuMsgId && !target?.closest('[data-argo-popover="more"]')) {
+        setMoreMenuMsgId(null);
+      }
+      if (mentionOpen && !target?.closest('[data-argo-popover="mention"]')) {
+        setMentionOpen(false);
+      }
+      if (attachMenuOpen && !target?.closest('[data-argo-popover="attach"]')) {
+        setAttachMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMentionOpen(false);
+        setAttachMenuOpen(false);
+        setReactMenuMsgId(null);
+        setMoreMenuMsgId(null);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [mentionOpen, attachMenuOpen, reactMenuMsgId, moreMenuMsgId]);
+
+  useEffect(() => {
+    if (!prefillDraft) return;
+    setText(prefillDraft.text);
+    onConsumePrefillDraft?.();
+    window.requestAnimationFrame(() => {
+      const area = textareaRef.current;
+      if (!area) return;
+      area.focus();
+      const len = prefillDraft.text.length;
+      area.setSelectionRange(len, len);
+    });
+  }, [prefillDraft, onConsumePrefillDraft]);
+
+  useLayoutEffect(() => {
+    const area = textareaRef.current;
+    if (!area) return;
+    const MAX_COMPOSER_HEIGHT = 200;
+    const syncHeight = () => {
+      area.style.height = "auto";
+      const nextHeight = Math.min(area.scrollHeight, MAX_COMPOSER_HEIGHT);
+      area.style.height = `${nextHeight}px`;
+      area.style.overflowY = area.scrollHeight > MAX_COMPOSER_HEIGHT ? "auto" : "hidden";
+      if (composerBackdropRef.current) {
+        composerBackdropRef.current.style.transform = `translateY(-${area.scrollTop}px)`;
+      }
+    };
+    syncHeight();
+    if (typeof ResizeObserver === "undefined") return;
+    let lastWidth = area.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (area.clientWidth === lastWidth) return;
+      lastWidth = area.clientWidth;
+      syncHeight();
+    });
+    ro.observe(area);
+    return () => ro.disconnect();
+  }, [text, threadKey]);
 
   useEffect(() => {
     if (!isWorking) {
@@ -784,8 +1005,10 @@ export function BotThreadView({
     setUploadingFile(true);
     try {
       for (const file of list) {
-        if (file.size > MAX_WORKSPACE_FILE_BYTES) {
-          setFileError(`"${file.name}" exceeds the 10 MB per-file upload limit.`);
+        const limitBytes = maxWorkspaceFileBytesForName(file.name, file.type);
+        if (file.size > limitBytes) {
+          const limitMb = Math.round(limitBytes / (1024 * 1024));
+          setFileError(`"${file.name}" exceeds the ${limitMb} MB per-file upload limit.`);
           continue;
         }
         const uploaded = onUploadFile
@@ -800,6 +1023,52 @@ export function BotThreadView({
     } finally {
       setUploadingFile(false);
     }
+  }
+
+  function handleComposerPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const dt = e.clipboardData;
+    if (!dt) return;
+    const rawFiles: File[] = [];
+    if (dt.items && dt.items.length > 0) {
+      for (const item of Array.from(dt.items)) {
+        if (item.kind === "file") {
+          const f = item.getAsFile();
+          if (f) rawFiles.push(f);
+        }
+      }
+    } else if (dt.files && dt.files.length > 0) {
+      rawFiles.push(...Array.from(dt.files));
+    }
+    if (rawFiles.length === 0) return;
+
+    const plainText = dt.getData("text/plain");
+    if (!plainText) {
+      e.preventDefault();
+    }
+
+    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const normalizedFiles = rawFiles.map((file, idx) => {
+      const hasCustomName = Boolean(file.name && file.name !== "image.png" && file.name !== "blob");
+      if (hasCustomName) return file;
+      const mime = (file.type || "image/png").toLowerCase();
+      const ext =
+        mime.includes("jpeg") || mime.includes("jpg")
+          ? "jpg"
+          : mime.includes("webp")
+            ? "webp"
+            : mime.includes("gif")
+              ? "gif"
+              : mime.includes("pdf")
+                ? "pdf"
+                : "png";
+      const suffix = rawFiles.length > 1 ? `-${idx + 1}` : "";
+      return new File([file], `pasted-${stamp}${suffix}.${ext}`, {
+        type: file.type || "image/png",
+        lastModified: Date.now(),
+      });
+    });
+
+    void handleFileSelection(normalizedFiles);
   }
 
   function handleDropFile(e: DragEvent<HTMLDivElement>) {
@@ -1123,7 +1392,7 @@ export function BotThreadView({
                   </button>
                 </div>
               )}
-              {visibleMessages.map((msg) => {
+              {visibleMessages.map((msg, msgIdx) => {
                 const actions = msg.metadata?.actions ?? [];
                 const msgApprovalIds = new Set(
                   actions
@@ -1133,10 +1402,15 @@ export function BotThreadView({
                     .filter(Boolean),
                 );
                 const msgCorr = msg.metadata?.correlation_id;
-                const linkedApprovals = approvals.filter(
-                  (apr) =>
-                    msgApprovalIds.has(apr.id) || (Boolean(msgCorr) && apr.correlation_id === msgCorr),
-                );
+                const linkedApprovals = approvals.filter((apr) => {
+                  if (msgApprovalIds.size > 0) {
+                    return msgApprovalIds.has(apr.id);
+                  }
+                  if (!msgCorr || apr.correlation_id !== msgCorr) return false;
+                  if (apr.status !== "pending") return false;
+                  if (claimedApprovalIds.has(apr.id)) return false;
+                  return latestFallbackMsgIdByCorr.get(msgCorr) === msg.id;
+                });
                 const linkedPagesMap = new Map<string, string>();
                 for (const a of actions) {
                   if (
@@ -1231,13 +1505,70 @@ export function BotThreadView({
                               </button>
                             </div>
                           )}
-                          {msg.text && (
-                            <HighlightedMessageText
-                              text={msg.text}
-                              catalog={mentionCatalog}
-                              inverted
-                              onMentionClick={handleMentionClick}
-                            />
+                          {editingMsgId === msg.id ? (
+                            <div className="space-y-2 min-w-[240px]">
+                              <textarea
+                                rows={3}
+                                autoFocus
+                                value={editingText}
+                                disabled={submittingEdit}
+                                onChange={(e) => setEditingText(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Escape") {
+                                    e.preventDefault();
+                                    setEditingMsgId(null);
+                                    setEditingText("");
+                                    setEditError(null);
+                                  } else if (e.key === "Enter" && !e.shiftKey) {
+                                    e.preventDefault();
+                                    void handleSubmitEditLastMessage(msg.id);
+                                  }
+                                }}
+                                className="w-full rounded-xl border border-[#35547a] bg-[#16273f] px-3 py-2 text-[13px] text-white placeholder-[#94a3b8] focus:outline-none focus:border-white"
+                              />
+                              {editError && (
+                                <div className="rounded-lg border border-rose-300 bg-rose-900 px-2.5 py-1 text-[11px] text-white">
+                                  {editError}
+                                </div>
+                              )}
+                              <div className="flex items-center justify-between gap-2 flex-wrap">
+                                <span className="text-[10px] text-[#cbd5e1]">
+                                  Replaces reply below with a new answer
+                                </span>
+                                <div className="flex items-center gap-1.5 ml-auto">
+                                  <button
+                                    type="button"
+                                    disabled={submittingEdit}
+                                    onClick={() => {
+                                      setEditingMsgId(null);
+                                      setEditingText("");
+                                      setEditError(null);
+                                    }}
+                                    className="px-2.5 py-1 rounded-lg border border-[#35547a] bg-[#1d3554] text-[11px] text-[#dbeafe] hover:bg-[#244166] disabled:opacity-50 cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={submittingEdit || !editingText.trim()}
+                                    onClick={() => void handleSubmitEditLastMessage(msg.id)}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white text-slate-900 hover:bg-slate-100 text-[11px] font-semibold disabled:opacity-50 cursor-pointer"
+                                  >
+                                    {submittingEdit && <Loader2 className="w-3 h-3 animate-spin" />}
+                                    <span>{submittingEdit ? "Sending..." : "Save & Resend"}</span>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            msg.text && (
+                              <HighlightedMessageText
+                                text={msg.text}
+                                catalog={mentionCatalog}
+                                inverted
+                                onMentionClick={handleMentionClick}
+                              />
+                            )
                           )}
                           {msgAttachments.length > 0 && (
                             <div className="flex flex-wrap gap-1.5 pt-1">
@@ -1288,22 +1619,42 @@ export function BotThreadView({
                           })()}
                           <div className="mt-1 text-[10px] text-[#cbd5e1] flex items-center justify-between gap-2">
                             <span>{formatFriendlyTime(msg.createdAt)}</span>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setReplyTo({
-                                  id: msg.id,
-                                  sender: "user",
-                                  sender_slug: "user",
-                                  sender_name: "You",
-                                  excerpt: msg.text.slice(0, 140),
-                                })
-                              }
-                              className="opacity-0 group-hover:opacity-100 inline-flex items-center gap-0.5 text-[#dbeafe] hover:underline cursor-pointer"
-                            >
-                              <CornerUpLeft className="w-2.5 h-2.5" />
-                              Reply
-                            </button>
+                            <div className="flex items-center gap-2.5">
+                              {editingMsgId !== msg.id &&
+                                msg.id === lastUserMessageId &&
+                                onEditLastMessage &&
+                                !isWorking &&
+                                queuedCount === 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingMsgId(msg.id);
+                                      setEditingText(msg.text);
+                                      setEditError(null);
+                                    }}
+                                    className="opacity-85 md:opacity-0 md:group-hover:opacity-100 inline-flex items-center gap-0.5 text-[#dbeafe] hover:underline cursor-pointer"
+                                  >
+                                    <Pencil className="w-2.5 h-2.5" />
+                                    Edit
+                                  </button>
+                                )}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setReplyTo({
+                                    id: msg.id,
+                                    sender: "user",
+                                    sender_slug: "user",
+                                    sender_name: "You",
+                                    excerpt: msg.text.slice(0, 140),
+                                  })
+                                }
+                                className="opacity-85 md:opacity-0 md:group-hover:opacity-100 inline-flex items-center gap-0.5 text-[#dbeafe] hover:underline cursor-pointer"
+                              >
+                                <CornerUpLeft className="w-2.5 h-2.5" />
+                                Reply
+                              </button>
+                            </div>
                           </div>
                         </div>
                         {reactionEntries.length > 0 && (
@@ -1344,6 +1695,12 @@ export function BotThreadView({
                   ? Object.entries(appliedChanges).filter(([, v]) => v !== null && v !== undefined && v !== "")
                   : [];
                 const delegationPlan = msg.metadata?.delegation_plan;
+                const operatorQuestion = msg.metadata?.operator_question;
+                const answeredChoiceLabel = answeredQuestions[msg.id] ?? null;
+                const hasLaterUserReply =
+                  Boolean(operatorQuestion) &&
+                  visibleMessages.slice(msgIdx + 1).some((m) => m.sender === "user");
+                const questionResolved = Boolean(answeredChoiceLabel) || hasLaterUserReply;
                 const habitProposal = msg.metadata?.habit_proposal;
                 const pendingHandoff = msg.metadata?.pending_room_handoff;
                 const footerVisible =
@@ -1458,16 +1815,79 @@ export function BotThreadView({
                       )}
 
                       {stepsOpen && actions.length > 0 && (
-                        <div className="rounded-xl border border-slate-200 bg-white p-2.5 space-y-1 text-[11px] max-w-lg">
+                        <div className="rounded-xl border border-slate-200 bg-white p-2.5 space-y-1.5 text-[11px] max-w-lg">
                           {actions.map((act, idx) => {
-                            const friendly = friendlyActionStepLabel(
-                              String(act.type ?? "action"),
-                              String(act.status ?? act.outcome ?? "ok"),
-                            );
+                            const actType = String(act.type ?? "action");
+                            const actStatus = String(act.status ?? act.outcome ?? "ok");
+                            const friendly = friendlyActionStepLabel(actType, actStatus);
+                            const hostLabel =
+                              typeof act.host === "string" && act.host.trim() ? act.host.trim() : null;
+                            const urlLabel =
+                              typeof act.url === "string" && act.url.trim() ? act.url.trim() : null;
+                            const handleLabel =
+                              typeof act.channel_handle === "string" && act.channel_handle.trim()
+                                ? `@${act.channel_handle.trim().replace(/^@/, "")}`
+                                : null;
+                            const fileLabel =
+                              typeof act.filename === "string" && act.filename.trim()
+                                ? act.filename.trim()
+                                : null;
+                            const colLabel =
+                              !fileLabel && !urlLabel && typeof act.collection === "string" && act.collection.trim()
+                                ? act.collection.trim()
+                                : null;
+                            const targetSuffix = hostLabel
+                              ? hostLabel
+                              : urlLabel
+                                ? compactStepUrl(urlLabel)
+                                : handleLabel ?? fileLabel ?? colLabel ?? null;
+                            const detailText =
+                              typeof act.detail === "string" && act.detail.trim() ? act.detail.trim() : null;
+                            const sessionId =
+                              typeof act.session_id === "string" && act.session_id.trim()
+                                ? act.session_id.trim()
+                                : null;
+                            const isErrorStep =
+                              actStatus !== "ok" &&
+                              actStatus !== "completed" &&
+                              actStatus !== "queued_approval";
                             return (
-                              <div key={idx} className="flex items-center justify-between gap-2">
-                                <span className="font-medium text-slate-800">{friendly.label}</span>
-                                <span className="text-slate-500">{friendly.outcome}</span>
+                              <div key={idx} className="space-y-0.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span
+                                    title={urlLabel || undefined}
+                                    className="font-medium text-slate-800 truncate"
+                                  >
+                                    {friendly.label}
+                                    {targetSuffix ? ` · ${targetSuffix}` : ""}
+                                  </span>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    {sessionId && onOpenTerminal && (
+                                      <button
+                                        type="button"
+                                        onClick={() => onOpenTerminal(msg.senderSlug, sessionId)}
+                                        className="inline-flex items-center gap-1 text-sky-700 hover:underline font-medium cursor-pointer"
+                                      >
+                                        <Terminal className="w-3 h-3" />
+                                        <span>View Terminal</span>
+                                      </button>
+                                    )}
+                                    <span
+                                      className={
+                                        isErrorStep
+                                          ? "text-rose-700 font-medium"
+                                          : "text-slate-500"
+                                      }
+                                    >
+                                      {friendly.outcome}
+                                    </span>
+                                  </div>
+                                </div>
+                                {detailText && isErrorStep && (
+                                  <div className="text-[10.5px] text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-2 py-1 break-words">
+                                    {detailText}
+                                  </div>
+                                )}
                               </div>
                             );
                           })}
@@ -1618,6 +2038,96 @@ export function BotThreadView({
                               </button>
                             </div>
                           )}
+                        </div>
+                      )}
+
+                      {operatorQuestion && (
+                        <div className="rounded-2xl border border-slate-200 bg-white p-3.5 space-y-2.5 max-w-xl shadow-xs">
+                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900">
+                              <ListChecks className="w-3.5 h-3.5 text-amber-600" />
+                              <span>Decision Required</span>
+                            </span>
+                            {questionResolved ? (
+                              <span className="px-2 py-0.5 rounded-full border border-emerald-200 bg-emerald-50 text-[10px] font-medium text-emerald-700">
+                                {answeredChoiceLabel ? `Selected: ${answeredChoiceLabel}` : "Answered"}
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-full border border-amber-200 bg-amber-50 text-[10px] font-medium text-amber-800">
+                                Waiting for your choice
+                              </span>
+                            )}
+                          </div>
+                          {operatorQuestion.question.trim() !== msg.text.trim() && (
+                            <p className="text-xs font-medium text-slate-900">
+                              {operatorQuestion.question}
+                            </p>
+                          )}
+                          {operatorQuestion.context &&
+                            !msg.text.includes(operatorQuestion.context) && (
+                              <p className="text-[11px] text-slate-600 leading-relaxed">
+                                {operatorQuestion.context}
+                              </p>
+                            )}
+                          {!questionResolved && operatorQuestion.options.length > 0 && (
+                            <div className="flex items-center gap-2 flex-wrap pt-0.5">
+                              {operatorQuestion.options.map((opt) => {
+                                const btnToneClass =
+                                  opt.tone === "primary"
+                                    ? "bg-slate-900 text-white hover:bg-slate-800"
+                                    : opt.tone === "danger"
+                                      ? "border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100"
+                                      : "border border-slate-200 bg-slate-50 text-slate-800 hover:bg-slate-100";
+                                return (
+                                  <button
+                                    key={opt.id}
+                                    type="button"
+                                    disabled={isWorking}
+                                    onClick={() => {
+                                      setAnsweredQuestions((prev) => ({
+                                        ...prev,
+                                        [msg.id]: opt.label,
+                                      }));
+                                      void submitText(opt.reply);
+                                    }}
+                                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium disabled:opacity-50 cursor-pointer transition-colors ${btnToneClass}`}
+                                  >
+                                    <span>{opt.label}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {!questionResolved && operatorQuestion.allow_custom_reply !== false && (
+                            <p className="text-[11px] text-slate-500">
+                              Or reply below with custom instructions.
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {msg.metadata?.run_checkpoint && (
+                        <div className="rounded-xl border border-sky-200 bg-sky-50 px-3.5 py-2.5 flex items-center justify-between gap-3 flex-wrap max-w-xl">
+                          <span className="text-xs text-slate-800">
+                            Paused after <strong>{msg.metadata.run_checkpoint.steps_completed}</strong>{" "}
+                            step{msg.metadata.run_checkpoint.steps_completed === 1 ? "" : "s"} so you can review progress.
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isWorking}
+                            onClick={() =>
+                              void submitText(
+                                msg.metadata?.run_checkpoint?.continue_prompt ||
+                                  "Continue from where you left off and complete the remaining steps.",
+                              )
+                            }
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-[11px] font-medium hover:bg-slate-800 disabled:opacity-50 cursor-pointer shrink-0"
+                          >
+                            <ArrowRight className="w-3 h-3" />
+                            <span>
+                              Continue (+{msg.metadata.run_checkpoint.next_batch_steps} steps)
+                            </span>
+                          </button>
                         </div>
                       )}
 
@@ -1776,98 +2286,640 @@ export function BotThreadView({
                         </div>
                       )}
 
-                      {/* Inline Approval Cards */}
-                      {linkedApprovals.map((item) => {
-                        const isWorkspaceAction = item.target_account_slug === "argo_workspace";
-                        const origText = String(item.payload.text ?? "");
-                        const editedText = item.edited_payload?.text
-                          ? String(item.edited_payload.text)
-                          : null;
-                        const hasDiff = Boolean(editedText && origText && editedText !== origText);
+                      {/* Inline Approval Cards (Unified SSH Batch Cards + Individual Cards) */}
+                      {(() => {
+                        const { batches, singles } = partitionSSHApprovalBatches(linkedApprovals, {
+                          scopeByBot: false,
+                        });
+                        const remainingPending = singles.filter((a) => a.status === "pending");
+                        const pendingBatchCount = batches.filter((b) =>
+                          b.items.some((a) => a.status === "pending"),
+                        ).length;
+                        const allPendingApprovals = linkedApprovals.filter(
+                          (a) => a.status === "pending",
+                        );
+                        const allTrustableApprovals = allPendingApprovals.filter(
+                          (a) =>
+                            a.action_type === "ssh_exec" &&
+                            extractSuggestedTrustPrefixes(a).length > 0,
+                        );
+                        const showMessageBatchBar =
+                          Boolean(onBatchResolveApprovals) &&
+                          allPendingApprovals.length >= 2 &&
+                          (pendingBatchCount > 1 ||
+                            (pendingBatchCount === 1 && remainingPending.length > 0) ||
+                            (pendingBatchCount === 0 && remainingPending.length >= 2));
+                        const batchBusy = busyBatchMsgId === msg.id;
+
                         return (
-                          <div
-                            key={item.id}
-                            className="rounded-2xl border border-amber-200 bg-amber-50 p-3.5 space-y-2.5"
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-xs font-semibold text-slate-900">
-                                {item.payload.title ??
-                                  (isWorkspaceAction
-                                    ? "Configuration update awaiting approval"
-                                    : "Draft ready for review")}
-                              </span>
-                              <span
-                                className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${
-                                  item.status === "pending"
-                                    ? "bg-amber-100 border-amber-300 text-amber-900"
-                                    : "bg-emerald-50 border-emerald-200 text-emerald-700"
-                                }`}
-                              >
-                                {item.status === "pending" ? "Waiting for review" : item.status}
-                              </span>
-                            </div>
-                            <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-800">
-                              {hasDiff && editedText ? (
-                                <div className="whitespace-pre-wrap">
-                                  {computeWordDiff(origText, editedText).map((tok, i) =>
-                                    tok.type === "same" ? (
-                                      <span key={i}>{tok.text}</span>
-                                    ) : tok.type === "add" ? (
-                                      <span key={i} className="bg-emerald-100 text-emerald-900 px-0.5 rounded">
-                                        {tok.text}
-                                      </span>
-                                    ) : (
-                                      <span
-                                        key={i}
-                                        className="bg-rose-100 text-rose-800 line-through px-0.5 rounded"
-                                      >
-                                        {tok.text}
-                                      </span>
-                                    ),
-                                  )}
-                                </div>
-                              ) : (
-                                <RichMarkdown
-                                  text={origText || JSON.stringify(item.payload)}
-                                  catalog={mentionCatalog}
-                                />
-                              )}
-                            </div>
-                            {item.status === "pending" && (onApproveItem || onRejectItem) && (
-                              <div className="flex items-center gap-2 flex-wrap">
-                                {onApproveItem && (
+                          <>
+                            {showMessageBatchBar && onBatchResolveApprovals && (
+                              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 flex items-center justify-between gap-2 flex-wrap">
+                                <span className="text-[11px] font-medium text-amber-900">
+                                  {allPendingApprovals.length} actions awaiting approval together
+                                </span>
+                                <div className="flex items-center gap-1.5 flex-wrap">
                                   <button
                                     type="button"
-                                    onClick={() => void onApproveItem(item.id)}
-                                    className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer"
+                                    disabled={batchBusy || busyApprovalId !== null}
+                                    onClick={async () => {
+                                      setBusyBatchMsgId(msg.id);
+                                      try {
+                                        await onBatchResolveApprovals(
+                                          allPendingApprovals.map((a) => a.id),
+                                          "approve",
+                                        );
+                                      } finally {
+                                        setBusyBatchMsgId(null);
+                                      }
+                                    }}
+                                    className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-2.5 py-1 rounded-lg text-[11px] font-medium cursor-pointer"
                                   >
                                     <Check className="w-3 h-3" />
-                                    {isWorkspaceAction ? "Approve & Apply" : "Approve & Send"}
+                                    <span>
+                                      {batchBusy
+                                        ? "Running..."
+                                        : `Approve All (${allPendingApprovals.length})`}
+                                    </span>
                                   </button>
-                                )}
-                                {onEditApprovalItem && !isWorkspaceAction && (
+                                  {allTrustableApprovals.length > 0 && (
+                                    <button
+                                      type="button"
+                                      disabled={batchBusy || busyApprovalId !== null}
+                                      onClick={async () => {
+                                        setBusyBatchMsgId(msg.id);
+                                        try {
+                                          await onBatchResolveApprovals(
+                                            allPendingApprovals.map((a) => a.id),
+                                            "approve",
+                                            { trust_command: true },
+                                          );
+                                        } finally {
+                                          setBusyBatchMsgId(null);
+                                        }
+                                      }}
+                                      className="inline-flex items-center gap-1 border border-slate-300 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-900 px-2.5 py-1 rounded-lg text-[11px] font-medium cursor-pointer"
+                                    >
+                                      <ShieldCheck className="w-3 h-3" />
+                                      <span>Approve All &amp; Always Allow</span>
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
-                                    onClick={() => onEditApprovalItem(item)}
-                                    className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-[11px] font-medium text-slate-800 hover:bg-slate-50 cursor-pointer"
+                                    disabled={batchBusy || busyApprovalId !== null}
+                                    onClick={async () => {
+                                      setBusyBatchMsgId(msg.id);
+                                      try {
+                                        await onBatchResolveApprovals(
+                                          allPendingApprovals.map((a) => a.id),
+                                          "reject",
+                                        );
+                                      } finally {
+                                        setBusyBatchMsgId(null);
+                                      }
+                                    }}
+                                    className="px-2.5 py-1 rounded-lg border border-rose-200 text-rose-700 bg-white text-[11px] font-medium hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
                                   >
-                                    Edit
+                                    Reject All
                                   </button>
-                                )}
-                                {onRejectItem && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void onRejectItem(item.id)}
-                                    className="px-3 py-1.5 rounded-lg border border-rose-200 text-rose-700 bg-white text-[11px] font-medium hover:bg-rose-50 cursor-pointer"
-                                  >
-                                    Reject
-                                  </button>
-                                )}
+                                </div>
                               </div>
                             )}
-                          </div>
+
+                            {batches.map((batch) => {
+                              const batchKey = `${msg.id}:${batch.key}`;
+                              const batchIds = batch.items.map((a) => a.id);
+                              const isExpanded = Boolean(expandedBatchKeys[batchKey]);
+                              const formattedCmd = formatShellCommandForDisplay(batch.command);
+                              const copyKey = `batch-${batchKey}`;
+                              const isCopied = copiedApprovalKey === copyKey;
+                              const visiblePrefixes = batch.trustPrefixes.slice(0, 6);
+                              const extraPrefixCount = Math.max(
+                                0,
+                                batch.trustPrefixes.length - visiblePrefixes.length,
+                              );
+
+                              return (
+                                <div
+                                  key={batchKey}
+                                  className="rounded-2xl border border-amber-200 bg-amber-50 p-3.5 space-y-3"
+                                >
+                                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                                    <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                      <Terminal className="w-3.5 h-3.5 text-slate-700 shrink-0" />
+                                      <span className="text-xs font-semibold text-slate-900">
+                                        Run SSH command across {batch.items.length} hosts
+                                      </span>
+                                      <span className="px-2 py-0.5 rounded-md border border-slate-200 bg-white text-[10.5px] font-mono text-slate-700">
+                                        @{batch.vaultSlug}
+                                      </span>
+                                    </div>
+                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-medium border bg-amber-100 border-amber-300 text-amber-900 shrink-0">
+                                      Waiting for review
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    {batch.items.map((it) => {
+                                      const hostLabel = extractApprovalHost(it) || "target host";
+                                      return (
+                                        <span
+                                          key={it.id}
+                                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-slate-200 bg-white text-[11px] font-mono text-slate-800"
+                                        >
+                                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                          <span>{hostLabel}</span>
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+
+                                  <div className="argo-code-block rounded-xl border overflow-hidden">
+                                    <div className="argo-code-block-bar px-3 py-1.5 border-b flex items-center justify-between gap-2 text-[10.5px]">
+                                      <span className="font-medium">Shell command</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => copyApprovalCommand(copyKey, batch.command)}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-slate-700 transition-colors cursor-pointer"
+                                      >
+                                        {isCopied ? (
+                                          <>
+                                            <Check className="w-3 h-3" />
+                                            <span>Copied</span>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Copy className="w-3 h-3" />
+                                            <span>Copy</span>
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
+                                    <pre className="p-3 text-[11.5px] leading-relaxed font-mono whitespace-pre-wrap break-words max-h-56 overflow-y-auto custom-scroll m-0">
+                                      {formattedCmd}
+                                    </pre>
+                                  </div>
+
+                                  {batch.trustPrefixes.length > 0 && (
+                                    <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-600">
+                                      <span className="font-medium text-slate-700">
+                                        Always Allow will trust on @{batch.vaultSlug}:
+                                      </span>
+                                      {visiblePrefixes.map((pref) => (
+                                        <code
+                                          key={pref}
+                                          className="px-1.5 py-0.5 rounded border border-slate-300 bg-slate-100 text-[10.5px] font-mono text-slate-800"
+                                        >
+                                          {pref}
+                                        </code>
+                                      ))}
+                                      {extraPrefixCount > 0 && (
+                                        <span className="text-[10.5px] text-slate-500">
+                                          +{extraPrefixCount} more
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {(onApproveItem || onBatchResolveApprovals || onRejectItem) && (
+                                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        {onBatchResolveApprovals && (
+                                          <>
+                                            <button
+                                              type="button"
+                                              disabled={batchBusy || busyApprovalId !== null}
+                                              onClick={async () => {
+                                                setBusyBatchMsgId(msg.id);
+                                                try {
+                                                  await onBatchResolveApprovals(batchIds, "approve");
+                                                } finally {
+                                                  setBusyBatchMsgId(null);
+                                                }
+                                              }}
+                                              className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer"
+                                            >
+                                              <Check className="w-3 h-3" />
+                                              <span>
+                                                {batchBusy
+                                                  ? "Running..."
+                                                  : `Approve All (${batch.items.length})`}
+                                              </span>
+                                            </button>
+                                            {batch.trustPrefixes.length > 0 && (
+                                              <button
+                                                type="button"
+                                                disabled={batchBusy || busyApprovalId !== null}
+                                                title={`Approve, run now, and always allow on @${batch.vaultSlug}: ${batch.trustPrefixes.join(", ")}`}
+                                                onClick={async () => {
+                                                  setBusyBatchMsgId(msg.id);
+                                                  try {
+                                                    await onBatchResolveApprovals(
+                                                      batchIds,
+                                                      "approve",
+                                                      { trust_command: true },
+                                                    );
+                                                  } finally {
+                                                    setBusyBatchMsgId(null);
+                                                  }
+                                                }}
+                                                className="inline-flex items-center gap-1 border border-slate-300 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-900 px-3 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer"
+                                              >
+                                                <ShieldCheck className="w-3 h-3" />
+                                                <span>Approve All &amp; Always Allow</span>
+                                              </button>
+                                            )}
+                                            <button
+                                              type="button"
+                                              disabled={batchBusy || busyApprovalId !== null}
+                                              onClick={async () => {
+                                                setBusyBatchMsgId(msg.id);
+                                                try {
+                                                  await onBatchResolveApprovals(batchIds, "reject");
+                                                } finally {
+                                                  setBusyBatchMsgId(null);
+                                                }
+                                              }}
+                                              className="px-3 py-1.5 rounded-lg border border-rose-200 text-rose-700 bg-white text-[11px] font-medium hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
+                                            >
+                                              Reject All
+                                            </button>
+                                          </>
+                                        )}
+                                      </div>
+
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setExpandedBatchKeys((prev) => ({
+                                            ...prev,
+                                            [batchKey]: !prev[batchKey],
+                                          }))
+                                        }
+                                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
+                                      >
+                                        {isExpanded ? (
+                                          <ChevronDown className="w-3.5 h-3.5" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                        )}
+                                        <span>Per-host controls ({batch.items.length})</span>
+                                      </button>
+                                    </div>
+                                  )}
+
+                                  {isExpanded && (
+                                    <div className="rounded-xl border border-slate-200 bg-white divide-y divide-slate-100">
+                                      {batch.items.map((it) => {
+                                        const hostLabel = extractApprovalHost(it) || "target host";
+                                        const rowBusy =
+                                          busyApprovalId === it.id || busyBatchMsgId === msg.id;
+                                        const itTrust = extractSuggestedTrustPrefixes(it);
+                                        return (
+                                          <div
+                                            key={it.id}
+                                            className="px-3 py-2 flex items-center justify-between gap-2 flex-wrap"
+                                          >
+                                            <span className="inline-flex items-center gap-1.5 text-[11px] font-mono font-semibold text-slate-800">
+                                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                              <span>{hostLabel}</span>
+                                            </span>
+                                            <div className="flex items-center gap-1.5 flex-wrap">
+                                              {onApproveItem && (
+                                                <button
+                                                  type="button"
+                                                  disabled={rowBusy}
+                                                  onClick={async () => {
+                                                    setBusyApprovalId(it.id);
+                                                    try {
+                                                      await onApproveItem(it.id);
+                                                    } finally {
+                                                      setBusyApprovalId(null);
+                                                    }
+                                                  }}
+                                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[10.5px] font-medium cursor-pointer"
+                                                >
+                                                  <Check className="w-3 h-3" />
+                                                  <span>Approve</span>
+                                                </button>
+                                              )}
+                                              {onApproveItem && itTrust.length > 0 && (
+                                                <button
+                                                  type="button"
+                                                  disabled={rowBusy}
+                                                  onClick={async () => {
+                                                    setBusyApprovalId(it.id);
+                                                    try {
+                                                      await onApproveItem(it.id, {
+                                                        trust_command: true,
+                                                      });
+                                                    } finally {
+                                                      setBusyApprovalId(null);
+                                                    }
+                                                  }}
+                                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-300 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-900 text-[10.5px] font-medium cursor-pointer"
+                                                >
+                                                  <ShieldCheck className="w-3 h-3" />
+                                                  <span>Always Allow</span>
+                                                </button>
+                                              )}
+                                              {onEditApprovalItem && (
+                                                <button
+                                                  type="button"
+                                                  disabled={rowBusy}
+                                                  onClick={() => onEditApprovalItem(it)}
+                                                  className="px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-[10.5px] font-medium disabled:opacity-50 cursor-pointer"
+                                                >
+                                                  Edit
+                                                </button>
+                                              )}
+                                              {onRejectItem && (
+                                                <button
+                                                  type="button"
+                                                  disabled={rowBusy}
+                                                  onClick={async () => {
+                                                    setBusyApprovalId(it.id);
+                                                    try {
+                                                      await onRejectItem(it.id);
+                                                    } finally {
+                                                      setBusyApprovalId(null);
+                                                    }
+                                                  }}
+                                                  className="px-2.5 py-1 rounded-md border border-rose-200 text-rose-700 bg-white hover:bg-rose-50 text-[10.5px] font-medium disabled:opacity-50 cursor-pointer"
+                                                >
+                                                  Reject
+                                                </button>
+                                              )}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+
+                            {singles.map((item) => {
+                              const isWorkspaceAction = item.target_account_slug === "argo_workspace";
+                              const isSshAction =
+                                item.action_type === "ssh_exec" || item.action_type === "ssh_input";
+                              const origText = String(item.payload.text ?? "");
+                              const editedText = item.edited_payload?.text
+                                ? String(item.edited_payload.text)
+                                : null;
+                              const hasDiff = Boolean(
+                                editedText && origText && editedText !== origText,
+                              );
+                              const suggestedTrust = extractSuggestedTrustPrefixes(item);
+                              const visiblePrefixes = suggestedTrust.slice(0, 6);
+                              const extraPrefixCount = Math.max(
+                                0,
+                                suggestedTrust.length - visiblePrefixes.length,
+                              );
+                              const cardBusy =
+                                busyApprovalId === item.id || busyBatchMsgId === msg.id;
+                              const copyKey = `single-${item.id}`;
+                              const isCopied = copiedApprovalKey === copyKey;
+
+                              return (
+                                <div
+                                  key={item.id}
+                                  className="rounded-2xl border border-amber-200 bg-amber-50 p-3.5 space-y-2.5"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      {isSshAction && (
+                                        <Terminal className="w-3.5 h-3.5 text-slate-700 shrink-0" />
+                                      )}
+                                      <span className="text-xs font-semibold text-slate-900 truncate">
+                                        {item.payload.title ??
+                                          (isWorkspaceAction
+                                            ? "Configuration update awaiting approval"
+                                            : "Draft ready for review")}
+                                      </span>
+                                    </div>
+                                    <span
+                                      className={`px-2 py-0.5 rounded-full text-[10px] font-medium border shrink-0 ${
+                                        item.status === "pending"
+                                          ? "bg-amber-100 border-amber-300 text-amber-900"
+                                          : "bg-emerald-50 border-emerald-200 text-emerald-700"
+                                      }`}
+                                    >
+                                      {item.status === "pending" ? "Waiting for review" : item.status}
+                                    </span>
+                                  </div>
+
+                                  {hasDiff && editedText ? (
+                                    <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-800 whitespace-pre-wrap">
+                                      {computeWordDiff(origText, editedText).map((tok, i) =>
+                                        tok.type === "same" ? (
+                                          <span key={i}>{tok.text}</span>
+                                        ) : tok.type === "add" ? (
+                                          <span
+                                            key={i}
+                                            className="bg-emerald-100 text-emerald-900 px-0.5 rounded"
+                                          >
+                                            {tok.text}
+                                          </span>
+                                        ) : (
+                                          <span
+                                            key={i}
+                                            className="bg-rose-100 text-rose-800 line-through px-0.5 rounded"
+                                          >
+                                            {tok.text}
+                                          </span>
+                                        ),
+                                      )}
+                                    </div>
+                                  ) : isSshAction ? (
+                                    (() => {
+                                      const sshCmdText =
+                                        origText ||
+                                        (item.action_type === "ssh_exec" &&
+                                        typeof item.payload.command === "string"
+                                          ? item.payload.command.trim()
+                                          : "");
+                                      const sshPromptLine =
+                                        typeof item.payload.prompt_line === "string"
+                                          ? item.payload.prompt_line.trim()
+                                          : "";
+                                      const sshExcerpt =
+                                        typeof item.payload.screen_excerpt === "string"
+                                          ? item.payload.screen_excerpt.trim()
+                                          : "";
+                                      return (
+                                        <div className="space-y-2">
+                                          {sshExcerpt && (
+                                            <pre className="argo-ssh-terminal rounded-lg border border-slate-800 bg-slate-900 text-slate-100 p-2.5 text-[11px] font-mono overflow-x-auto whitespace-pre-wrap max-h-44 overflow-y-auto custom-scroll m-0">
+                                              {sshExcerpt}
+                                            </pre>
+                                          )}
+                                          {sshPromptLine && item.action_type === "ssh_input" && (
+                                            <div className="rounded-lg border border-amber-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800 break-words">
+                                              Prompt: {sshPromptLine}
+                                            </div>
+                                          )}
+                                          <div className="argo-code-block rounded-xl border overflow-hidden">
+                                            <div className="argo-code-block-bar px-3 py-1.5 border-b flex items-center justify-between gap-2 text-[10.5px]">
+                                              <span className="font-medium">
+                                                {item.action_type === "ssh_input"
+                                                  ? "Terminal input"
+                                                  : "Shell command"}
+                                              </span>
+                                              {sshCmdText && (
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    copyApprovalCommand(copyKey, sshCmdText)
+                                                  }
+                                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-slate-700 transition-colors cursor-pointer"
+                                                >
+                                                  {isCopied ? (
+                                                    <>
+                                                      <Check className="w-3 h-3" />
+                                                      <span>Copied</span>
+                                                    </>
+                                                  ) : (
+                                                    <>
+                                                      <Copy className="w-3 h-3" />
+                                                      <span>Copy</span>
+                                                    </>
+                                                  )}
+                                                </button>
+                                              )}
+                                            </div>
+                                            <pre className="p-3 text-[11.5px] leading-relaxed font-mono whitespace-pre-wrap break-words max-h-56 overflow-y-auto custom-scroll m-0">
+                                              {sshCmdText
+                                                ? formatShellCommandForDisplay(sshCmdText)
+                                                : "(Empty input / Enter)"}
+                                            </pre>
+                                          </div>
+                                        </div>
+                                      );
+                                    })()
+                                  ) : (
+                                    <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-800 space-y-2">
+                                      <RichMarkdown
+                                        text={origText || JSON.stringify(item.payload)}
+                                        catalog={mentionCatalog}
+                                      />
+                                    </div>
+                                  )}
+
+                                  {item.payload.execution_result?.screen_text && (
+                                    <pre className="argo-ssh-terminal rounded-lg border border-slate-800 bg-slate-900 text-slate-100 p-2.5 text-[11px] font-mono overflow-x-auto whitespace-pre-wrap max-h-52 overflow-y-auto custom-scroll">
+                                      {item.payload.execution_result.screen_text}
+                                    </pre>
+                                  )}
+
+                                  {item.status === "pending" &&
+                                    item.action_type === "ssh_exec" &&
+                                    suggestedTrust.length > 0 && (
+                                      <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-600">
+                                        <span className="font-medium text-slate-700">
+                                          Always Allow will trust on @{item.target_account_slug}:
+                                        </span>
+                                        {visiblePrefixes.map((pref) => (
+                                          <code
+                                            key={pref}
+                                            className="px-1.5 py-0.5 rounded border border-slate-300 bg-slate-100 text-[10.5px] font-mono text-slate-800"
+                                          >
+                                            {pref}
+                                          </code>
+                                        ))}
+                                        {extraPrefixCount > 0 && (
+                                          <span className="text-[10.5px] text-slate-500">
+                                            +{extraPrefixCount} more
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+
+                                  {item.status === "pending" && (onApproveItem || onRejectItem) && (
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      {onApproveItem && (
+                                        <button
+                                          type="button"
+                                          disabled={cardBusy}
+                                          onClick={async () => {
+                                            setBusyApprovalId(item.id);
+                                            try {
+                                              await onApproveItem(item.id);
+                                            } finally {
+                                              setBusyApprovalId(null);
+                                            }
+                                          }}
+                                          className="inline-flex items-center justify-center gap-1.5 flex-1 md:flex-none min-h-[42px] md:min-h-0 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-3.5 md:px-3 py-2 md:py-1.5 rounded-xl md:rounded-lg text-xs md:text-[11px] font-medium cursor-pointer"
+                                        >
+                                          <Check className="w-3.5 h-3.5 md:w-3 md:h-3" />
+                                          {isWorkspaceAction
+                                            ? "Approve & Apply"
+                                            : isSshAction
+                                              ? "Approve & Run"
+                                              : "Approve & Send"}
+                                        </button>
+                                      )}
+                                      {onApproveItem &&
+                                        item.action_type === "ssh_exec" &&
+                                        suggestedTrust.length > 0 && (
+                                          <button
+                                            type="button"
+                                            disabled={cardBusy}
+                                            title={`Approve, run now, and always allow on @${item.target_account_slug}: ${suggestedTrust.join(", ")}`}
+                                            onClick={async () => {
+                                              setBusyApprovalId(item.id);
+                                              try {
+                                                await onApproveItem(item.id, {
+                                                  trust_command: true,
+                                                });
+                                              } finally {
+                                                setBusyApprovalId(null);
+                                              }
+                                            }}
+                                            className="inline-flex items-center justify-center gap-1.5 min-h-[42px] md:min-h-0 border border-slate-300 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-900 px-3.5 md:px-3 py-2 md:py-1.5 rounded-xl md:rounded-lg text-xs md:text-[11px] font-medium cursor-pointer"
+                                          >
+                                            <ShieldCheck className="w-3.5 h-3.5 md:w-3 md:h-3" />
+                                            <span>
+                                              Always Allow on @{item.target_account_slug}
+                                            </span>
+                                          </button>
+                                        )}
+                                      {onEditApprovalItem && !isWorkspaceAction && (
+                                        <button
+                                          type="button"
+                                          disabled={cardBusy}
+                                          onClick={() => onEditApprovalItem(item)}
+                                          className="min-h-[42px] md:min-h-0 px-3.5 md:px-3 py-2 md:py-1.5 rounded-xl md:rounded-lg border border-slate-200 bg-white text-xs md:text-[11px] font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                                        >
+                                          Edit
+                                        </button>
+                                      )}
+                                      {onRejectItem && (
+                                        <button
+                                          type="button"
+                                          disabled={cardBusy}
+                                          onClick={async () => {
+                                            setBusyApprovalId(item.id);
+                                            try {
+                                              await onRejectItem(item.id);
+                                            } finally {
+                                              setBusyApprovalId(null);
+                                            }
+                                          }}
+                                          className="flex-1 md:flex-none min-h-[42px] md:min-h-0 px-3.5 md:px-3 py-2 md:py-1.5 rounded-xl md:rounded-lg border border-rose-200 text-rose-700 bg-white text-xs md:text-[11px] font-medium hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
+                                        >
+                                          Reject
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </>
                         );
-                      })}
+                      })()}
 
                       {/* Inline Page Pills -> Dock beside chat */}
                       {linkedPages.length > 0 && (
@@ -1995,14 +3047,14 @@ export function BotThreadView({
                       )}
 
                       <div
-                        className={`relative flex items-center gap-0.5 text-slate-400 transition-opacity ${
+                        className={`relative flex items-center gap-1 md:gap-0.5 text-slate-400 transition-opacity ${
                           footerVisible
                             ? "opacity-100"
-                            : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                            : "opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100"
                         }`}
                       >
                         {onToggleReaction && (
-                          <div className="relative">
+                          <div className="relative" data-argo-popover="react">
                             <button
                               type="button"
                               title="Add reaction"
@@ -2064,7 +3116,7 @@ export function BotThreadView({
                           )}
                         </button>
                         {(onSaveSkill || onUpdateBot) && (
-                          <div className="relative">
+                          <div className="relative" data-argo-popover="more">
                             <button
                               type="button"
                               title="More actions"
@@ -2359,10 +3411,13 @@ export function BotThreadView({
       </div>
 
       {/* Clean Single-Row Grok-Style Composer Bar */}
-      <footer className={`shrink-0 ${compact ? "p-3" : "px-5 pb-5 pt-2"} bg-slate-50`}>
+      <footer className={`shrink-0 ${compact ? "p-3" : "px-3 pb-3 pt-2 md:px-5 md:pb-5 md:pt-2"} bg-slate-50 argo-safe-bottom`}>
         <form onSubmit={handleSubmit} className={compact ? "relative" : "max-w-3xl mx-auto relative"}>
           {mentionOpen && (
-            <div className="absolute bottom-full left-0 mb-2 w-72 max-w-[calc(100vw-2rem)] max-h-72 overflow-y-auto custom-scroll rounded-xl border border-slate-200 bg-white shadow-lg p-1.5 space-y-0.5 z-30 text-xs">
+            <div
+              data-argo-popover="mention"
+              className="absolute bottom-full left-0 mb-2 w-72 max-w-[calc(100vw-2rem)] max-h-72 overflow-y-auto custom-scroll rounded-xl border border-slate-200 bg-white shadow-lg p-1.5 space-y-0.5 z-30 text-xs"
+            >
               {mentionCandidates.length === 0 ? (
                 <div className="px-2.5 py-2 text-[11px] text-slate-400">No matches found.</div>
               ) : (
@@ -2512,23 +3567,85 @@ export function BotThreadView({
                   }
                 }}
               />
-              <button
-                type="button"
-                disabled={uploadingFile}
-                title="Attach workspace file (max 10 MB)"
-                aria-label="Attach workspace file"
-                onClick={() => fileInputRef.current?.click()}
-                className="w-8 h-8 rounded-full border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-600 flex items-center justify-center disabled:opacity-50 cursor-pointer shrink-0"
-              >
-                {uploadingFile ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Plus className="w-3.5 h-3.5" />
+              <input
+                ref={docFileInputRef}
+                type="file"
+                multiple
+                accept="application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.oasis.opendocument.spreadsheet,text/csv,text/tab-separated-values,text/plain,text/markdown,application/json,application/x-ndjson,application/octet-stream,.pdf,.docx,.xlsx,.xlsm,.xlsb,.xls,.ods,.csv,.tsv,.parquet,.json,.ndjson,.jsonl,.txt,.md,.log,.sh,.yaml,.yml,.zip"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files?.length) {
+                    void handleFileSelection(e.target.files);
+                    e.target.value = "";
+                  }
+                }}
+              />
+              <input
+                ref={photoFileInputRef}
+                type="file"
+                multiple
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files?.length) {
+                    void handleFileSelection(e.target.files);
+                    e.target.value = "";
+                  }
+                }}
+              />
+              <div className="relative shrink-0" data-argo-popover="attach">
+                {attachMenuOpen && (
+                  <div className="absolute bottom-full left-0 mb-2 w-52 rounded-xl border border-slate-200 bg-white shadow-lg p-1.5 space-y-0.5 z-30 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        docFileInputRef.current?.click();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-left font-medium text-slate-800 hover:bg-slate-100 cursor-pointer"
+                    >
+                      <FileUp className="w-4 h-4 text-slate-500 shrink-0" />
+                      <span>Document or File</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        photoFileInputRef.current?.click();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-left font-medium text-slate-800 hover:bg-slate-100 cursor-pointer"
+                    >
+                      <ImageIcon className="w-4 h-4 text-slate-500 shrink-0" />
+                      <span>Photo or Camera</span>
+                    </button>
+                  </div>
                 )}
-              </button>
+                <button
+                  type="button"
+                  disabled={uploadingFile}
+                  title="Attach workspace file (max 100 MB docs/data, 10 MB misc)"
+                  aria-label="Attach workspace file"
+                  onClick={() => {
+                    if (isMobile) {
+                      setMentionOpen(false);
+                      setAttachMenuOpen((v) => !v);
+                    } else {
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  className="w-9 h-9 md:w-8 md:h-8 rounded-full border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-600 flex items-center justify-center disabled:opacity-50 cursor-pointer shrink-0"
+                >
+                  {uploadingFile ? (
+                    <Loader2 className="w-4 h-4 md:w-3.5 md:h-3.5 animate-spin" />
+                  ) : (
+                    <Plus className="w-4 h-4 md:w-3.5 md:h-3.5" />
+                  )}
+                </button>
+              </div>
 
               <button
                 type="button"
+                data-argo-popover="mention"
                 title="Mention"
                 aria-label="Mention"
                 onClick={() => {
@@ -2537,26 +3654,26 @@ export function BotThreadView({
                   setMentionQuery("");
                   setMentionSelectedIndex(0);
                 }}
-                className="w-8 h-8 rounded-full hover:bg-slate-100 text-slate-500 flex items-center justify-center cursor-pointer shrink-0"
+                className="w-9 h-9 md:w-8 md:h-8 rounded-full hover:bg-slate-100 text-slate-500 flex items-center justify-center cursor-pointer shrink-0"
               >
-                <AtSign className="w-3.5 h-3.5" />
+                <AtSign className="w-4 h-4 md:w-3.5 md:h-3.5" />
               </button>
 
-              <div className="relative flex-1 min-w-0 my-1">
+              <div className="relative flex-1 min-w-0 my-1" data-argo-popover="mention">
                 <div
                   aria-hidden="true"
                   className="argo-composer-backdrop pointer-events-none absolute inset-0 overflow-hidden"
                 >
                   <div
                     ref={composerBackdropRef}
-                    className="whitespace-pre-wrap break-words text-[13px] leading-relaxed select-none m-0 p-0 border-0 will-change-transform"
+                    className="whitespace-pre-wrap break-words text-[16px] md:text-[13px] leading-relaxed select-none m-0 p-0 border-0 will-change-transform"
                   >
                     {renderComposerBackdropNodes(text, mentionCatalog)}
                   </div>
                 </div>
                 <textarea
                   ref={textareaRef}
-                  rows={Math.min(5, Math.max(1, text.split("\n").length))}
+                  rows={1}
                   value={text}
                   onChange={(e) => handleTextChange(e.target.value, e.target.selectionStart)}
                   onScroll={(e) => {
@@ -2565,13 +3682,14 @@ export function BotThreadView({
                     }
                   }}
                   onKeyDown={handleKeyDown}
+                  onPaste={handleComposerPaste}
                   placeholder={
                     placeholder ??
                     (isRoomMode && room
                       ? `Message ${room.title}...`
                       : `Message ${subjectBot?.name ?? "Bot"}...`)
                   }
-                  className="argo-composer-input relative z-10 w-full resize-none border-0 bg-transparent text-[13px] leading-relaxed focus:outline-none m-0 p-0 block max-h-36"
+                  className="argo-composer-input relative z-10 w-full resize-none border-0 bg-transparent text-[16px] md:text-[13px] leading-relaxed focus:outline-none m-0 p-0 block max-h-[200px] overflow-y-hidden custom-scroll"
                 />
               </div>
 
@@ -2585,9 +3703,9 @@ export function BotThreadView({
                   }}
                   title="Stop current reply"
                   aria-label="Stop current reply"
-                  className="w-8 h-8 rounded-full border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-800 flex items-center justify-center cursor-pointer disabled:opacity-50 shrink-0"
+                  className="w-9 h-9 md:w-8 md:h-8 rounded-full border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-800 flex items-center justify-center cursor-pointer disabled:opacity-50 shrink-0"
                 >
-                  <Square className="w-3 h-3 fill-current" />
+                  <Square className="w-3.5 h-3.5 md:w-3 md:h-3 fill-current" />
                 </button>
               )}
 
@@ -2596,7 +3714,7 @@ export function BotThreadView({
                 disabled={sending || (!text.trim() && draftAttachments.length === 0)}
                 title={showLiveStream ? "Queue follow-up message" : "Send message"}
                 aria-label="Send message"
-                className="w-8 h-8 rounded-full bg-slate-900 text-white flex items-center justify-center cursor-pointer hover:bg-slate-800 disabled:opacity-35 shrink-0"
+                className="w-9 h-9 md:w-8 md:h-8 rounded-full bg-slate-900 text-white flex items-center justify-center cursor-pointer hover:bg-slate-800 disabled:opacity-35 shrink-0"
               >
                 <ArrowUp className="w-4 h-4" />
               </button>

@@ -2,24 +2,103 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html as html_lib
+import inspect
+import json
 import re
+import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
+from lxml import html as lxml_html
+
+from argo_core.analytics.engine import (
+    _deduplicate_headers,
+    _json_safe,
+    _normalize_cell_value,
+    extract_document_summary_from_bytes,
+    ingest_file_to_analytics,
+    is_analytics_or_document_file,
+    profile_datasets,
+    read_dataset_rows,
+    write_rows_to_parquet,
+)
 from argo_core.bus.valkey_bus import EventBus
-from argo_core.db.repositories import ArgoRepository, make_id, utc_now
+from argo_core.db.repositories import ArgoRepository, collection_slug, make_id, slugify, utc_now
 from argo_core.security.ssrf import (
     AntiBotHaltError,
+    PublicFetchError,
     PublicHttpFetcher,
+    PublicHttpResponse,
     SafePublicHttpFetcher,
 )
+from argo_core.security.vault import redact_secrets
 
 HTTP_FEED_CACHE_COLLECTION = "http_feed_cache"
+_PLAIN_TEXT_CONTENT_TYPES = frozenset(
+    {
+        "text/plain",
+        "text/markdown",
+        "text/x-markdown",
+        "text/x-shellscript",
+        "application/x-sh",
+        "application/x-shellscript",
+        "text/x-python",
+        "text/x-script.python",
+        "text/yaml",
+        "application/x-yaml",
+        "application/toml",
+        "text/x-ini",
+        "text/x-diff",
+    }
+)
+_PLAIN_TEXT_EXTS = frozenset(
+    {
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".py",
+        ".rb",
+        ".pl",
+        ".js",
+        ".ts",
+        ".jsx",
+        ".tsx",
+        ".go",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".java",
+        ".sql",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".service",
+        ".rules",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".txt",
+        ".log",
+        ".patch",
+        ".diff",
+    }
+)
 _TAG_RE = re.compile(r"<[^>]+>")
+_JSON_LD_RE = re.compile(
+    r"<script\b[^>]*type\s*=\s*['\"]application/ld\+json['\"][^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRICE_RE = re.compile(r"(?:[$€£¥]\s*\d[\d,]*(?:\.\d{1,2})?|\b\d[\d,]*(?:\.\d{1,2})?\s*(?:USD|EUR|GBP)\b)")
 
 
 def _strip_html(raw: str) -> str:
@@ -175,6 +254,10 @@ class _MarkdownHTMLParser(HTMLParser):
         self._in_title = False
         self._in_link_href: str | None = None
         self._link_parts: list[str] = []
+        self._in_table_row = False
+        self._in_table_cell = False
+        self._row_cells: list[str] = []
+        self._cell_parts: list[str] = []
         self.title_parts: list[str] = []
         self.chunks: list[str] = []
 
@@ -188,7 +271,15 @@ class _MarkdownHTMLParser(HTMLParser):
             return
         if self._skip_depth > 0:
             return
-        if lowered in self._HEADING_TAGS:
+        if lowered == "table":
+            self.chunks.append("\n\n")
+        elif lowered == "tr":
+            self._in_table_row = True
+            self._row_cells = []
+        elif lowered in {"th", "td"}:
+            self._in_table_cell = True
+            self._cell_parts = []
+        elif lowered in self._HEADING_TAGS:
             self.chunks.append(f"\n\n{self._HEADING_TAGS[lowered]}")
         elif lowered == "li":
             self.chunks.append("\n- ")
@@ -215,9 +306,25 @@ class _MarkdownHTMLParser(HTMLParser):
         if lowered == "a" and self._in_link_href is not None:
             label = re.sub(r"\s+", " ", "".join(self._link_parts)).strip()
             if label:
-                self.chunks.append(f"[{label}]({self._in_link_href})")
+                rendered = f"[{label}]({self._in_link_href})"
+                if self._in_table_cell:
+                    self._cell_parts.append(label)
+                else:
+                    self.chunks.append(rendered)
             self._in_link_href = None
             self._link_parts = []
+        elif lowered in {"th", "td"} and self._in_table_cell:
+            cell_text = re.sub(r"\s+", " ", "".join(self._cell_parts)).strip().replace("|", "\\|")
+            self._row_cells.append(cell_text)
+            self._in_table_cell = False
+            self._cell_parts = []
+        elif lowered == "tr" and self._in_table_row:
+            if any(c for c in self._row_cells):
+                self.chunks.append("\n| " + " | ".join(self._row_cells) + " |")
+            self._in_table_row = False
+            self._row_cells = []
+        elif lowered == "table":
+            self.chunks.append("\n\n")
         elif lowered in self._HEADING_TAGS or lowered in {"p", "li"}:
             self.chunks.append("\n")
 
@@ -229,6 +336,8 @@ class _MarkdownHTMLParser(HTMLParser):
             return
         if self._in_link_href is not None:
             self._link_parts.append(data)
+        elif self._in_table_cell:
+            self._cell_parts.append(data)
         else:
             self.chunks.append(data)
 
@@ -412,6 +521,65 @@ async def fetch_rss_feed(
     }
 
 
+def _extract_json_ld(raw_html: str) -> list[Any]:
+    """Extract parsed <script type="application/ld+json"> payloads before HTML stripping."""
+    if not raw_html or "ld+json" not in raw_html.lower():
+        return []
+    found: list[Any] = []
+    for raw_block in _JSON_LD_RE.findall(raw_html):
+        cleaned = raw_block.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"^\s*<!--|-->\s*$", "", cleaned).strip()
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            found.extend(parsed)
+        else:
+            found.append(parsed)
+    return found
+
+
+async def _fetch_public_http(
+    http_fetcher: PublicHttpFetcher,
+    url: str,
+    *,
+    headers: dict[str, str],
+    max_bytes: int = 10_485_760,
+) -> PublicHttpResponse:
+    kwargs: dict[str, Any] = {"headers": headers}
+    try:
+        sig = inspect.signature(http_fetcher.fetch)
+        accepts_var = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if accepts_var or "max_bytes" in sig.parameters:
+            kwargs["max_bytes"] = max_bytes
+    except (TypeError, ValueError):
+        pass
+    return await http_fetcher.fetch(url, **kwargs)
+
+
+def _guess_filename_from_url_and_mime(url: str, mime_type: str) -> str:
+    path_name = Path(urllib.parse.urlsplit(url).path).name
+    if path_name and "." in path_name:
+        return path_name
+    ext_map = {
+        "application/pdf": "document.pdf",
+        "text/csv": "data.csv",
+        "application/csv": "data.csv",
+        "text/tab-separated-values": "data.tsv",
+        "application/json": "data.json",
+        "application/x-ndjson": "data.ndjson",
+        "application/ndjson": "data.ndjson",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "workbook.xlsx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document.docx",
+        "application/parquet": "data.parquet",
+        "application/vnd.apache.parquet": "data.parquet",
+    }
+    return ext_map.get(mime_type, "webpage.html")
+
+
 async def fetch_public_webpage(
     url: str,
     *,
@@ -419,15 +587,16 @@ async def fetch_public_webpage(
     bus: EventBus | None = None,
     fetcher: PublicHttpFetcher | None = None,
     max_chars: int = 12000,
+    offset: int = 0,
     correlation_id: str | None = None,
     source_slug: str = "builtin:web",
 ) -> dict[str, Any]:
-    """Fetch a public HTML page safely (SSRF-guarded), extract Markdown, and track ETag/content hash."""
+    """Fetch a public webpage/document safely (SSRF-guarded), extract Markdown + JSON-LD, and paginate up to 48k chars."""
     cleaned_url = url.strip()
     cache_key = f"web:{cleaned_url}"
     cached_doc: dict[str, Any] = {}
     req_headers: dict[str, str] = {
-        "Accept": "text/html, application/xhtml+xml;q=0.9, */*;q=0.5"
+        "Accept": "text/html, application/xhtml+xml;q=0.9, application/pdf, text/csv, application/json, */*;q=0.5"
     }
 
     if repo is not None:
@@ -441,9 +610,11 @@ async def fetch_public_webpage(
 
     http_fetcher = fetcher or SafePublicHttpFetcher()
     try:
-        resp = await http_fetcher.fetch(
+        resp = await _fetch_public_http(
+            http_fetcher,
             cleaned_url,
             headers=req_headers,
+            max_bytes=10_485_760,
         )
     except AntiBotHaltError as exc:
         await _publish_antibot_halt(
@@ -464,42 +635,126 @@ async def fetch_public_webpage(
             "title": str(cached_doc.get("title") or ""),
             "markdown": "",
             "char_count": 0,
+            "offset": max(0, int(offset)),
+            "total_chars": 0,
+            "has_more": False,
+            "next_offset": None,
+            "structured_json_ld": [],
             "discovered_feeds": list(cached_doc.get("discovered_feeds") or []),
         }
 
-    title = _extract_title_fast(resp.body)
-    markdown = ""
-    try:
-        import trafilatura  # type: ignore[import-not-found]
-
-        extracted = trafilatura.extract(
-            resp.body,
-            url=resp.url,
-            output_format="markdown",
-            include_links=True,
+    lower_headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+    ctype = lower_headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    fname = _guess_filename_from_url_and_mime(resp.url, ctype)
+    url_path = urllib.parse.urlparse(resp.url).path
+    url_suffix = Path(url_path).suffix.lower()
+    is_json_text = (
+        ctype
+        in {
+            "application/json",
+            "text/json",
+            "application/x-ndjson",
+            "application/ndjson",
+            "application/jsonl",
+        }
+        or ctype.endswith("+json")
+        or (
+            ctype not in {"text/html", "application/xhtml+xml"}
+            and not ctype.endswith("+xml")
+            and url_suffix in {".json", ".ndjson", ".jsonl"}
         )
-        if isinstance(extracted, str) and extracted.strip():
-            markdown = extracted.strip()
-    except ImportError:
-        pass
-    except Exception:
-        markdown = ""
+    )
+    is_direct_doc = (
+        (not is_json_text)
+        and ctype != "text/html"
+        and ctype != "application/xhtml+xml"
+        and is_analytics_or_document_file(fname, ctype)
+    )
+    is_plain_text = (not is_direct_doc) and (
+        is_json_text
+        or ctype in _PLAIN_TEXT_CONTENT_TYPES
+        or (
+            ctype not in {"text/html", "application/xhtml+xml"}
+            and not ctype.endswith("+xml")
+            and url_suffix in _PLAIN_TEXT_EXTS
+        )
+    )
 
-    if not markdown:
-        parser = _MarkdownHTMLParser(resp.url)
-        parser.feed(resp.body)
-        parser.close()
-        parsed_title, parsed_md = parser.result()
-        title = parsed_title or title
-        markdown = parsed_md
+    structured_json_ld: list[Any] = []
+    discovered_feeds: list[str] = []
+    title = ""
+    full_markdown = ""
+    secret_vals = repo.collect_all_vault_secret_values() if repo is not None else []
 
-    discovered_feeds = discover_feed_urls(resp.body, resp.url)
-    clipped = markdown[: max(200, max_chars)]
-    content_hash = hashlib.sha256(clipped.encode("utf-8")).hexdigest()[:24]
+    if is_direct_doc:
+        raw_bytes = getattr(resp, "raw_bytes", b"") or resp.body.encode("utf-8", errors="replace")
+        try:
+            parsed_doc = extract_document_summary_from_bytes(
+                raw_bytes,
+                filename=fname,
+                mime_type=ctype,
+                vault_secrets=secret_vals,
+                max_chars=120_000,
+            )
+            title = fname
+            full_markdown = str(parsed_doc.get("excerpt") or "")
+        except Exception as exc:
+            if (
+                ctype in {"text/csv", "text/tab-separated-values", "application/csv"}
+                or Path(fname).suffix.lower() in {".csv", ".tsv"}
+            ):
+                title = Path(url_path).name or fname or resp.url
+                full_markdown = redact_secrets(resp.body, secret_vals) if secret_vals else resp.body
+            else:
+                raise PublicFetchError(
+                    url=resp.url,
+                    status_code=resp.status_code,
+                    message=f"Unable to parse document '{fname}' ({ctype or 'unknown'}): {exc}",
+                ) from exc
+    elif is_plain_text:
+        title = Path(url_path).name or fname or resp.url
+        full_markdown = redact_secrets(resp.body, secret_vals) if secret_vals else resp.body
+    else:
+        structured_json_ld = _extract_json_ld(resp.body)
+        title = _extract_title_fast(resp.body)
+        try:
+            import trafilatura  # type: ignore[import-not-found]
+
+            extracted = trafilatura.extract(
+                resp.body,
+                url=resp.url,
+                output_format="markdown",
+                include_links=True,
+                include_tables=True,
+            )
+            if isinstance(extracted, str) and extracted.strip():
+                full_markdown = extracted.strip()
+        except ImportError:
+            pass
+        except Exception:
+            full_markdown = ""
+
+        if not full_markdown:
+            parser = _MarkdownHTMLParser(resp.url)
+            parser.feed(resp.body)
+            parser.close()
+            parsed_title, parsed_md = parser.result()
+            title = parsed_title or title
+            full_markdown = parsed_md
+
+        discovered_feeds = discover_feed_urls(resp.body, resp.url)
+
+    capped_chars = max(200, min(int(max_chars), 48_000))
+    clean_offset = max(0, int(offset))
+    total_chars = len(full_markdown)
+    clipped = full_markdown[clean_offset : clean_offset + capped_chars]
+    has_more = (clean_offset + len(clipped)) < total_chars
+    next_offset = (clean_offset + len(clipped)) if has_more else None
+
+    content_hash = hashlib.sha256(full_markdown[:48_000].encode("utf-8")).hexdigest()[:24]
     unchanged = bool(
         cached_doc.get("content_hash") and cached_doc.get("content_hash") == content_hash
     )
-    lower_headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
     if repo is not None:
         repo.upsert_document(
             collection=HTTP_FEED_CACHE_COLLECTION,
@@ -526,5 +781,394 @@ async def fetch_public_webpage(
         "title": title,
         "markdown": clipped,
         "char_count": len(clipped),
+        "offset": clean_offset,
+        "total_chars": total_chars,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "structured_json_ld": structured_json_ld,
         "discovered_feeds": discovered_feeds,
     }
+
+
+def _css_part_to_xpath(part: str) -> str:
+    """Convert a simple CSS selector segment (tag#id.cls1.cls2[attr=val]) to XPath."""
+    rem = part.strip()
+    tag = "*"
+    tag_m = re.match(r"^([a-zA-Z][a-zA-Z0-9_-]*)", rem)
+    if tag_m:
+        tag = tag_m.group(1).lower()
+        rem = rem[tag_m.end() :]
+    predicates: list[str] = []
+    for id_m in re.finditer(r"#([A-Za-z0-9_-]+)", rem):
+        predicates.append(f"@id={repr(id_m.group(1))}")
+    for cls_m in re.finditer(r"\.([A-Za-z0-9_-]+)", rem):
+        cls = cls_m.group(1)
+        predicates.append(f"contains(concat(' ', normalize-space(@class), ' '), {repr(' ' + cls + ' ')})")
+    for attr_m in re.finditer(r"\[([A-Za-z0-9_:-]+)(?:=['\"]?([^'\"\]]+)['\"]?)?\]", rem):
+        attr_name = attr_m.group(1)
+        attr_val = attr_m.group(2)
+        if attr_val is not None:
+            predicates.append(f"@{attr_name}={repr(attr_val)}")
+        else:
+            predicates.append(f"@{attr_name}")
+    if predicates:
+        return f"{tag}[{' and '.join(predicates)}]"
+    return tag
+
+
+def _css_or_xpath_query(doc: Any, selector: str) -> list[Any]:
+    sel = selector.strip()
+    if not sel:
+        return []
+    if sel.startswith(("/", "(")):
+        return list(doc.xpath(sel))
+    results: list[Any] = []
+    for branch in sel.split(","):
+        branch_clean = branch.strip()
+        if not branch_clean:
+            continue
+        parts = [p for p in re.split(r"\s+", branch_clean) if p]
+        xpath_expr = "//" + "//".join(_css_part_to_xpath(p) for p in parts)
+        try:
+            for el in doc.xpath(xpath_expr):
+                if el not in results:
+                    results.append(el)
+        except Exception:
+            continue
+    return results
+
+
+def _extract_html_tables(doc: Any) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    for tbl in doc.xpath("//table"):
+        if tbl.xpath(".//table"):
+            # Skip outer layout wrapper tables containing nested data tables
+            continue
+        tr_nodes = tbl.xpath(".//tr")
+        if len(tr_nodes) < 2:
+            continue
+        header_cells: list[str] = []
+        data_matrix: list[list[str]] = []
+        thead_rows = tbl.xpath("./thead/tr")
+        if thead_rows:
+            header_cells = [
+                re.sub(r"\s+", " ", "".join(cell.itertext())).strip()
+                for cell in thead_rows[0].xpath("./th|./td")
+            ]
+        for tr in tr_nodes:
+            if thead_rows and tr is thead_rows[0]:
+                continue
+            cells = [
+                re.sub(r"\s+", " ", "".join(cell.itertext())).strip()
+                for cell in tr.xpath("./th|./td")
+            ]
+            if not any(cells):
+                continue
+            if not header_cells:
+                header_cells = cells
+            else:
+                data_matrix.append(cells)
+        if len(data_matrix) < 2 or not header_cells:
+            continue
+        col_count = max(len(header_cells), max(len(r) for r in data_matrix))
+        if col_count < 1:
+            continue
+        cols = _deduplicate_headers(header_cells, col_count)
+        rows = [
+            {cols[idx]: (row[idx] if idx < len(row) else "") for idx in range(col_count)}
+            for row in data_matrix
+        ]
+        tables.append({"columns": cols, "rows": rows})
+    return tables
+
+
+def _flatten_json_ld_items(items: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def _visit(node: Any) -> None:
+        if isinstance(node, list):
+            for el in node:
+                _visit(el)
+            return
+        if not isinstance(node, dict):
+            return
+        if "@graph" in node and isinstance(node["@graph"], list):
+            for el in node["@graph"]:
+                _visit(el)
+            return
+        if "itemListElement" in node and isinstance(node["itemListElement"], list):
+            for el in node["itemListElement"]:
+                if isinstance(el, dict) and isinstance(el.get("item"), dict):
+                    _visit(el["item"])
+                else:
+                    _visit(el)
+            return
+        row: dict[str, Any] = {}
+        for k, v in node.items():
+            clean_k = str(k).lstrip("@")
+            if k == "@context":
+                continue
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    if not isinstance(sub_v, (dict, list)):
+                        row[f"{clean_k}_{str(sub_k).lstrip('@')}"] = _normalize_cell_value(sub_v)
+            elif isinstance(v, list):
+                if v and all(not isinstance(x, (dict, list)) for x in v):
+                    row[clean_k] = ", ".join(str(x) for x in v)
+                elif v and isinstance(v[0], dict):
+                    for sub_k, sub_v in v[0].items():
+                        if not isinstance(sub_v, (dict, list)):
+                            row[f"{clean_k}_{str(sub_k).lstrip('@')}"] = _normalize_cell_value(sub_v)
+            else:
+                row[clean_k] = _normalize_cell_value(v)
+        if row:
+            rows.append(row)
+
+    for item in items:
+        _visit(item)
+    return rows
+
+
+async def extract_web_data(
+    url: str,
+    *,
+    selector: str | None = None,
+    target_collection: str | None = None,
+    save_as_file: bool = False,
+    repo: ArgoRepository | None = None,
+    bus: EventBus | None = None,
+    fetcher: PublicHttpFetcher | None = None,
+    bot_slug: str | None = None,
+    owner_email: str | None = None,
+    correlation_id: str | None = None,
+    source_slug: str = "builtin:web_extract",
+) -> dict[str, Any]:
+    """Deterministically extract structured tables, JSON-LD, files, or CSS selectors to 0o444 Parquet at 0 LLM tokens."""
+    cleaned_url = url.strip()
+    http_fetcher = fetcher or SafePublicHttpFetcher()
+    try:
+        resp = await _fetch_public_http(
+            http_fetcher,
+            cleaned_url,
+            headers={
+                "Accept": "text/html, application/xhtml+xml, text/csv, application/json, application/pdf, */*;q=0.8"
+            },
+            max_bytes=10_485_760,
+        )
+    except AntiBotHaltError as exc:
+        await _publish_antibot_halt(
+            bus,
+            correlation_id=correlation_id,
+            source_slug=source_slug,
+            exc=exc,
+        )
+        raise
+
+    lower_headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+    ctype = lower_headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    fname = _guess_filename_from_url_and_mime(resp.url, ctype)
+    is_direct_doc = (
+        ctype != "text/html"
+        and ctype != "application/xhtml+xml"
+        and is_analytics_or_document_file(fname, ctype)
+    )
+    secret_vals = repo.collect_all_vault_secret_values() if repo is not None else []
+
+    def _process_extracted_sync() -> dict[str, Any]:
+        extracted_rows: list[dict[str, Any]] = []
+        extracted_cols: list[str] = []
+        tables_found = 0
+        extraction_kind = "none"
+
+        if is_direct_doc:
+            raw_bytes = getattr(resp, "raw_bytes", b"") or resp.body.encode("utf-8", errors="replace")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_p = Path(tmpdir)
+                src_f = tmp_p / fname
+                src_f.write_bytes(raw_bytes)
+                der_dir = tmp_p / "derived"
+                ingested = ingest_file_to_analytics(
+                    src_f,
+                    der_dir,
+                    file_id="file_web",
+                    filename=fname,
+                    mime_type=ctype,
+                    vault_secrets=secret_vals,
+                )
+                def_name = ingested.get("default_parquet_name")
+                if def_name and (der_dir / def_name).is_file():
+                    extracted_cols, extracted_rows, _ = read_dataset_rows(
+                        der_dir / def_name,
+                        limit=100_000,
+                        secret_values=secret_vals,
+                    )
+            tables_found = max(1, len(ingested.get("derived_datasets") or [])) if extracted_rows else 0
+            extraction_kind = "direct_file"
+        else:
+            html_body = resp.body or ""
+            try:
+                doc = lxml_html.fromstring(html_body)
+                if resp.url.startswith(("http://", "https://")):
+                    try:
+                        doc.make_links_absolute(resp.url)
+                    except Exception:
+                        pass
+            except Exception:
+                doc = None
+
+            if selector and selector.strip() and doc is not None:
+                matched_nodes = _css_or_xpath_query(doc, selector.strip())
+                for node in matched_nodes[:5000]:
+                    text_val = re.sub(r"\s+", " ", "".join(node.itertext())).strip()
+                    if not text_val:
+                        continue
+                    href = node.attrib.get("href") or ""
+                    if not href:
+                        a_nodes = node.xpath(".//a[@href]")
+                        if a_nodes:
+                            href = str(a_nodes[0].attrib.get("href") or "")
+                    title_nodes = node.xpath(".//h1|.//h2|.//h3|.//h4|.//a[1]")
+                    title_val = (
+                        re.sub(r"\s+", " ", "".join(title_nodes[0].itertext())).strip()
+                        if title_nodes
+                        else text_val[:120]
+                    )
+                    price_m = _PRICE_RE.search(text_val)
+                    extracted_rows.append(
+                        {
+                            "title": title_val[:240],
+                            "text": text_val[:1000],
+                            "href": href,
+                            "price": price_m.group(0) if price_m else "",
+                        }
+                    )
+                if extracted_rows:
+                    extracted_cols = ["title", "text", "href", "price"]
+                    tables_found = 1
+                    extraction_kind = "selector"
+
+            if not extracted_rows and doc is not None:
+                html_tables = _extract_html_tables(doc)
+                if html_tables:
+                    tables_found = len(html_tables)
+                    best = max(html_tables, key=lambda t: len(t["rows"]))
+                    extracted_cols = best["columns"]
+                    extracted_rows = best["rows"]
+                    extraction_kind = "html_table"
+
+            if not extracted_rows:
+                json_ld_items = _extract_json_ld(html_body)
+                ld_rows = _flatten_json_ld_items(json_ld_items)
+                if ld_rows:
+                    extracted_rows = ld_rows
+                    tables_found = 1
+                    extraction_kind = "json_ld"
+
+        if not extracted_rows:
+            return {
+                "status": "empty",
+                "url": resp.url,
+                "dataset_id": None,
+                "row_count": 0,
+                "tables_found": 0,
+                "columns": [],
+                "profile": None,
+                "sample_rows": [],
+                "detail": "No structured HTML tables, JSON-LD items, or matching selector data found.",
+            }
+
+        # Scrub secrets across all extracted cells before materializing Parquet
+        scrubbed_rows = [
+            {str(k): _json_safe(v, secret_vals) for k, v in row.items()}
+            for row in extracted_rows
+        ]
+
+        parsed_url = urllib.parse.urlsplit(resp.url)
+        url_slug = slugify(f"{parsed_url.netloc}_{parsed_url.path}".strip("_"))[:36] or "web"
+
+        if repo is None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_parquet = Path(tmpdir) / "main.parquet"
+                row_count, cols = write_rows_to_parquet(
+                    scrubbed_rows, tmp_parquet, columns=extracted_cols or None
+                )
+                prof = profile_datasets(
+                    [{"id": f"web_{url_slug}", "parquet_path": str(tmp_parquet)}],
+                    secret_values=secret_vals,
+                )[0]
+            return {
+                "status": "ok",
+                "url": resp.url,
+                "extraction_kind": extraction_kind,
+                "dataset_id": f"web_{url_slug}",
+                "row_count": row_count,
+                "tables_found": tables_found,
+                "columns": cols,
+                "profile": prof,
+                "sample_rows": prof.get("sample_rows") or [],
+            }
+
+        if save_as_file and owner_email:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_parquet = Path(tmpdir) / f"{url_slug}.parquet"
+                row_count, cols = write_rows_to_parquet(
+                    scrubbed_rows, tmp_parquet, columns=extracted_cols or None
+                )
+                saved_file = repo.save_workspace_file(
+                    owner_email=owner_email,
+                    filename=f"{url_slug}.parquet",
+                    mime_type="application/parquet",
+                    content_bytes=tmp_parquet.read_bytes(),
+                    uploaded_by=bot_slug or "bot",
+                )
+            dataset_id = f"file:{saved_file['id']}"
+            specs = repo.resolve_authorized_datasets([dataset_id], owner_email=owner_email)
+            prof = profile_datasets(specs, secret_values=secret_vals)[0]
+            return {
+                "status": "ok",
+                "url": resp.url,
+                "extraction_kind": extraction_kind,
+                "dataset_id": dataset_id,
+                "file_id": saved_file["id"],
+                "row_count": row_count,
+                "tables_found": tables_found,
+                "columns": cols,
+                "profile": prof,
+                "sample_rows": prof.get("sample_rows") or [],
+            }
+
+        default_col = (
+            target_collection
+            or (f"bot_{slugify(bot_slug)}_web_{url_slug}" if bot_slug else f"web_{url_slug}")
+        )
+        clean_col = collection_slug(default_col)
+        analytics_dir = repo.analytics_dir_for_collection(clean_col)
+        parquet_path = analytics_dir / "main.parquet"
+        row_count, cols = write_rows_to_parquet(
+            scrubbed_rows, parquet_path, columns=extracted_cols or None
+        )
+        repo.register_analytics_collection(
+            clean_col,
+            parquet_path=parquet_path,
+            row_count=row_count,
+            columns=cols,
+            source_url=resp.url,
+            description=f"Web extracted dataset from {resp.url}",
+        )
+        prof = profile_datasets(
+            [{"id": clean_col, "parquet_path": str(parquet_path)}],
+            secret_values=secret_vals,
+        )[0]
+        return {
+            "status": "ok",
+            "url": resp.url,
+            "extraction_kind": extraction_kind,
+            "dataset_id": clean_col,
+            "row_count": row_count,
+            "tables_found": tables_found,
+            "columns": cols,
+            "profile": prof,
+            "sample_rows": prof.get("sample_rows") or [],
+        }
+
+    return await asyncio.to_thread(_process_extracted_sync)

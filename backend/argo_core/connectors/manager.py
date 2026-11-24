@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from argo_core.bus.valkey_bus import EventBus
+from argo_core.connectors.gateway import ConnectorGateway, build_default_connector_gateway
 from argo_core.connectors.google_oauth import GoogleOAuthService
 from argo_core.connectors.linkedin import LinkedInService
 from argo_core.connectors.telegram_bot import TelegramBotService
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectorManager:
-    """Routes per-connector health checks across Google, Telegram, LinkedIn, Webhooks, and MCP."""
+    """Routes per-connector health checks across registered ConnectorGateway adapters."""
 
     def __init__(
         self,
@@ -28,6 +29,7 @@ class ConnectorManager:
         telegram_service: TelegramBotService,
         linkedin_service: LinkedInService,
         webhook_service: WebhookService,
+        gateway: ConnectorGateway | None = None,
     ) -> None:
         self._repo = repo
         self._bus = bus
@@ -35,6 +37,12 @@ class ConnectorManager:
         self.telegram = telegram_service
         self.linkedin = linkedin_service
         self.webhook = webhook_service
+        self.gateway = gateway or build_default_connector_gateway(
+            google_service=google_service,
+            telegram_service=telegram_service,
+            linkedin_service=linkedin_service,
+            webhook_service=webhook_service,
+        )
 
     async def probe_integration(
         self,
@@ -44,18 +52,9 @@ class ConnectorManager:
     ) -> dict[str, Any]:
         """Probe a single integration account by slug and return its updated health record."""
         account = self._repo.get_integration_secrets(slug)
-        provider = account["provider"]
-        if provider == "google":
-            return await self.google.probe_account(account["slug"])
-        if provider == "telegram":
-            return await self.telegram.probe_account(
-                account["slug"],
-                send_test_message=send_test_message,
-            )
-        if provider == "linkedin":
-            return await self.linkedin.probe_account(account["slug"])
-        if provider == "webhook":
-            return await self.webhook.probe_account(account["slug"])
+        probed = await self.gateway.probe(account, send_test_message=send_test_message)
+        if probed is not None:
+            return probed
 
         if account["has_secrets"] or account.get("account_identifier"):
             return self._repo.update_integration_health(

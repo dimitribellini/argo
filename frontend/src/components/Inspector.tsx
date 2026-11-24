@@ -16,12 +16,13 @@ import {
   Play,
   Plus,
   Sparkles,
+  Terminal,
   Trash2,
   Upload,
   Users,
   X,
 } from "lucide-react";
-import { api, MAX_WORKSPACE_FILE_BYTES } from "../api";
+import { api, maxWorkspaceFileBytesForName } from "../api";
 import { integrationIconComponent, vaultSecretIconComponent } from "./MentionText";
 import type {
   BotRecord,
@@ -31,15 +32,20 @@ import type {
   IntegrationAccount,
   ModelProvider,
   PageRecord,
+  ResourceVisibility,
   RoomRecord,
   SkillRecord,
+  SsoPrincipal,
   StyleRule,
+  TeamGroupRecord,
   VaultSecretRecord,
   WorkspaceFileRecord,
 } from "../types";
 import { friendlyModelName } from "../utils/format";
 import { BOT_ICON_OPTIONS, BotAvatar } from "./BotAvatar";
 import { DesktopScreenPreview } from "./DesktopScreenPreview";
+import { SSHTerminalPanel } from "./SSHTerminalPanel";
+import { VisibilityPicker, formatVisibilityLabel, visibilityBadgeClasses } from "./VisibilityPicker";
 
 export type InspectorTab = "details" | "library" | "computer";
 
@@ -53,6 +59,7 @@ interface InspectorProps {
   workspaceFiles?: WorkspaceFileRecord[];
   activePageSlug?: string | null;
   initialTab?: InspectorTab;
+  theme?: "light" | "dark";
   models: ModelProvider[];
   integrations: IntegrationAccount[];
   vaultSecrets?: VaultSecretRecord[];
@@ -64,13 +71,15 @@ interface InspectorProps {
     updates: {
       name?: string;
       enabled?: boolean;
-      runtime?: "api" | "desktop";
+      runtime?: "api" | "sandbox" | "desktop";
       role_prompt?: string;
       model?: string;
       outbound_rbac?: "internal" | "draft" | "execute";
       daily_cap?: number;
+      max_steps_per_run?: number;
       toggle_routine_id?: string;
       routines?: Array<Record<string, unknown>>;
+      collections?: { read: string[]; write: string[] };
       linked_accounts?: string[];
       avatar_color?: string;
       avatar_icon?: string;
@@ -80,8 +89,11 @@ interface InspectorProps {
       boundaries?: string[];
       goal_metric?: string;
       handoff_bot_slug?: string;
+      visibility?: ResourceVisibility;
+      allowed_groups?: string[];
     },
   ) => Promise<void> | void;
+  teams?: TeamGroupRecord[];
   onUpdateRoom?: (slug: string, updates: Partial<RoomRecord>) => Promise<void>;
   onDeleteRoom?: (slug: string) => Promise<void>;
   onUploadFile?: (file: File) => Promise<WorkspaceFileRecord>;
@@ -98,12 +110,21 @@ interface InspectorProps {
   onDeleteStyleRule: (ruleId: string) => Promise<void>;
   onTriggerBot: (slug: string, routineId?: string) => Promise<void>;
   togglingDesktop?: boolean;
+  togglingSandbox?: boolean;
   desktopInfo?: DesktopInfo | null;
   desktopBootProgress?: DesktopBootProgress | null;
+  sshRefreshTick?: number;
+  onExpandTerminal?: (botSlug: string) => void;
   onToggleDesktop: (slug: string) => void;
+  onToggleSandbox?: (slug: string) => void;
   onOpenSelkies: (bot: BotRecord) => void;
   onExportBlueprint?: (slug: string) => Promise<void>;
   onDeleteBot?: (slug: string) => Promise<void>;
+  messageCount?: number;
+  onClearBotMessages?: (slug: string, opts?: { keep_last?: number }) => Promise<void>;
+  onExportBotMessages?: (slug: string) => Promise<void>;
+  onClearRoomMessages?: (slug: string, opts?: { keep_last?: number }) => Promise<void>;
+  onExportRoomMessages?: (slug: string) => Promise<void>;
   onOpenIntegrations?: () => void;
   onOpenVault?: () => void;
   onToggleVaultSecret?: (secret: VaultSecretRecord, botSlug: string) => Promise<void> | void;
@@ -111,6 +132,7 @@ interface InspectorProps {
   onOpenPage?: (pageSlug: string) => void;
   onOpenNewPage?: () => void;
   onTogglePagePin?: (pageSlug: string, nextPinned: boolean) => void;
+  principal?: SsoPrincipal | null;
 }
 
 const RBAC_MODES: Array<{
@@ -137,6 +159,20 @@ const RBAC_MODES: Array<{
 
 const SCHEDULE_OPTIONS = ["Every 15m", "Every 1h", "Every 24h", "Manual"];
 
+function isOneShotRoutineSchedule(
+  schedule: string | undefined,
+  type?: string,
+  oneShotFlag?: boolean,
+): boolean {
+  if (oneShotFlag || String(type || "").toLowerCase() === "once") {
+    return true;
+  }
+  const s = String(schedule || "").trim();
+  return /^(?:once\b|one[\s-]*shot\b|one[\s-]*time\b|\d{4}-\d{2}-\d{2}|at\s+\d{4}-\d{2}-\d{2}|in\s+\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours))/i.test(
+    s,
+  );
+}
+
 const AVATAR_COLORS = [
   { key: "slate", bg: "bg-slate-700" },
   { key: "blue", bg: "bg-[#2b5278]" },
@@ -155,6 +191,13 @@ const HIDDEN_INTERNAL_COLLECTIONS = new Set([
   "bot_skills",
   "ingestion_seen_keys",
   "vault_secrets",
+  "bot_rooms",
+  "room_threads",
+  "workspace_files",
+  "thread_read_cursors",
+  "delegation_plans",
+  "ssh_settings",
+  "chat_settings",
 ]);
 
 const BOUNDARY_PREFIX_RE = /^(?:never|do\s+not|don't|skip|discard|ignore)\b/i;
@@ -203,6 +246,7 @@ export function Inspector({
   workspaceFiles = [],
   activePageSlug = null,
   initialTab = "details",
+  theme = "light",
   models,
   integrations,
   vaultSecrets = [],
@@ -221,12 +265,21 @@ export function Inspector({
   onDeleteStyleRule,
   onTriggerBot,
   togglingDesktop = false,
+  togglingSandbox = false,
   desktopInfo = null,
   desktopBootProgress = null,
+  sshRefreshTick = 0,
+  onExpandTerminal,
   onToggleDesktop,
+  onToggleSandbox,
   onOpenSelkies,
   onExportBlueprint,
   onDeleteBot,
+  messageCount,
+  onClearBotMessages,
+  onExportBotMessages,
+  onClearRoomMessages,
+  onExportRoomMessages,
   onOpenIntegrations,
   onOpenVault,
   onToggleVaultSecret,
@@ -234,7 +287,30 @@ export function Inspector({
   onOpenPage,
   onOpenNewPage,
   onTogglePagePin,
+  teams = [],
+  principal = null,
 }: InspectorProps) {
+  const isMultiUser = Boolean(principal?.multi_user);
+  const isAdmin = Boolean(principal?.is_admin);
+  const callerEmail = (principal?.email || "").toLowerCase();
+  const canManageResource = (owner?: string) =>
+    !isMultiUser || isAdmin || !owner || owner.toLowerCase() === callerEmail;
+  const canManageRoom = canManageResource(room?.owner_email);
+  const canManageBot = canManageResource(bot?.owner_email);
+  const [roomVisDraft, setRoomVisDraft] = useState<{
+    visibility: ResourceVisibility;
+    allowed_groups: string[];
+  } | null>(null);
+  const [botVisDraft, setBotVisDraft] = useState<{
+    visibility: ResourceVisibility;
+    allowed_groups: string[];
+  } | null>(null);
+  useEffect(() => {
+    setRoomVisDraft(null);
+  }, [room?.slug]);
+  useEffect(() => {
+    setBotVisDraft(null);
+  }, [bot?.slug]);
   const browserTz = (() => {
     try {
       return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -260,17 +336,23 @@ export function Inspector({
   const [editingRoutineId, setEditingRoutineId] = useState<string | null>(null);
   const [editRoutineDraft, setEditRoutineDraft] = useState<{
     label: string;
+    schedule: string;
     timezone: string;
     prompt: string;
     stale_data_policy: "skip_quietly" | "notify_missing" | "always_run";
   } | null>(null);
   const [addingApp, setAddingApp] = useState(false);
   const [addingSecret, setAddingSecret] = useState(false);
+  const [addingSourceBot, setAddingSourceBot] = useState(false);
   const [expandedSkillId, setExpandedSkillId] = useState<string | null>(null);
   const [fileUploadError, setFileUploadError] = useState<string | null>(null);
   const [uploadingFile, setUploadingFile] = useState(false);
   const [confirmDeleteBot, setConfirmDeleteBot] = useState(false);
   const [deletingBot, setDeletingBot] = useState(false);
+  const [confirmClearChat, setConfirmClearChat] = useState(false);
+  const [clearingChat, setClearingChat] = useState(false);
+  const [exportingChat, setExportingChat] = useState(false);
+  const [clearChatError, setClearChatError] = useState<string | null>(null);
   const [roomTitleInput, setRoomTitleInput] = useState(room?.title ?? "");
 
   useEffect(() => {
@@ -287,13 +369,118 @@ export function Inspector({
     setEditRoutineDraft(null);
     setAddingApp(false);
     setAddingSecret(false);
+    setAddingSourceBot(false);
     setConfirmDeleteBot(false);
     setDeletingBot(false);
+    setConfirmClearChat(false);
+    setClearingChat(false);
+    setExportingChat(false);
+    setClearChatError(null);
   }, [bot?.slug, bot?.name, bot?.role_prompt, bot?.role, bot?.section]);
 
   useEffect(() => {
     setRoomTitleInput(room?.title ?? "");
+    setConfirmClearChat(false);
+    setClearingChat(false);
+    setExportingChat(false);
+    setClearChatError(null);
   }, [room?.slug, room?.title]);
+
+  function renderClearChatConfirmation(opts: {
+    slug: string;
+    onClear?: (slug: string, clearOpts?: { keep_last?: number }) => Promise<void>;
+    onExport?: (slug: string) => Promise<void>;
+  }) {
+    const canKeepLast10 = typeof messageCount !== "number" || messageCount > 10;
+    const isEmpty = typeof messageCount === "number" && messageCount === 0;
+    const runClear = async (clearOpts?: { keep_last?: number }) => {
+      if (!opts.onClear) return;
+      setClearingChat(true);
+      setClearChatError(null);
+      try {
+        await opts.onClear(opts.slug, clearOpts);
+        setConfirmClearChat(false);
+      } catch (err) {
+        setClearChatError(err instanceof Error ? err.message : "Failed to clear chat history.");
+      } finally {
+        setClearingChat(false);
+      }
+    };
+    const runExport = async () => {
+      if (!opts.onExport) return;
+      setExportingChat(true);
+      setClearChatError(null);
+      try {
+        await opts.onExport(opts.slug);
+      } catch (err) {
+        setClearChatError(err instanceof Error ? err.message : "Failed to export transcript.");
+      } finally {
+        setExportingChat(false);
+      }
+    };
+
+    return (
+      <div className="w-full rounded-xl border border-slate-200 bg-white p-3 space-y-2.5">
+        <div className="space-y-1">
+          <div className="text-xs font-semibold text-slate-900">Clear chat history?</div>
+          <p className="text-[11px] leading-relaxed text-slate-500">
+            Removes messages from this thread only. Keeps Skills, Rules, Routines, Data Lists, Pages, Files, Approvals &amp; SSH recordings.
+          </p>
+        </div>
+        {clearChatError && (
+          <div className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-700">
+            {clearChatError}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {opts.onExport && (
+            <button
+              type="button"
+              disabled={clearingChat || exportingChat || isEmpty}
+              onClick={() => void runExport()}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-medium text-slate-700 disabled:opacity-50 cursor-pointer"
+            >
+              {exportingChat ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Download className="w-3 h-3" />
+              )}
+              <span>Export .md</span>
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={clearingChat || exportingChat || !canKeepLast10}
+            onClick={() => void runClear({ keep_last: 10 })}
+            title={canKeepLast10 ? "Delete older messages and keep the newest 10" : "10 or fewer messages in thread"}
+            className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-800 disabled:opacity-50 cursor-pointer"
+          >
+            Keep Last 10
+          </button>
+          <button
+            type="button"
+            disabled={clearingChat || exportingChat || isEmpty}
+            onClick={() => void runClear()}
+            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-medium disabled:opacity-50 cursor-pointer"
+          >
+            {clearingChat && <Loader2 className="w-3 h-3 animate-spin" />}
+            <span>{clearingChat ? "Clearing..." : "Clear All"}</span>
+          </button>
+          <button
+            type="button"
+            disabled={clearingChat || exportingChat}
+            onClick={() => {
+              setConfirmClearChat(false);
+              setClearChatError(null);
+            }}
+            className="px-2 py-1 rounded-lg text-[11px] text-slate-500 hover:text-slate-900 disabled:opacity-50 cursor-pointer ml-auto"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   function renderWorkspaceFilesSection() {
     return (
@@ -304,7 +491,7 @@ export function Inspector({
           </span>
           <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer">
             <Upload className="w-2.5 h-2.5" />
-            <span>{uploadingFile ? "Uploading..." : "Upload (<=10 MB)"}</span>
+            <span>{uploadingFile ? "Uploading..." : "Upload (<=100 MB docs)"}</span>
             <input
               type="file"
               className="hidden"
@@ -314,8 +501,10 @@ export function Inspector({
                 e.target.value = "";
                 if (!file) return;
                 setFileUploadError(null);
-                if (file.size > MAX_WORKSPACE_FILE_BYTES) {
-                  setFileUploadError("File exceeds the 10 MB per-file upload limit.");
+                const limitBytes = maxWorkspaceFileBytesForName(file.name, file.type);
+                if (file.size > limitBytes) {
+                  const limitMb = Math.round(limitBytes / (1024 * 1024));
+                  setFileUploadError(`File exceeds the ${limitMb} MB per-file upload limit.`);
                   return;
                 }
                 setUploadingFile(true);
@@ -390,7 +579,7 @@ export function Inspector({
 
   if (room) {
     return (
-      <aside className="w-[332px] shrink-0 h-full border-l border-slate-200 bg-white flex flex-col">
+      <aside className="w-full md:w-[332px] shrink-0 h-full md:border-l border-slate-200 bg-white flex flex-col">
         <div className="h-14 shrink-0 px-4 border-b border-slate-200 flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
             <Users className="w-4 h-4 text-slate-600" />
@@ -553,29 +742,91 @@ export function Inspector({
 
           {renderWorkspaceFilesSection()}
 
-          <div className="pt-2 border-t border-slate-200 flex flex-wrap gap-2">
-            {onExportTeamPack && (
-              <button
-                type="button"
-                onClick={() =>
-                  void onExportTeamPack({ room_slug: room.slug, title: room.title })
-                }
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-800 cursor-pointer"
-              >
-                <Package className="w-3.5 h-3.5" />
-                <span>Export Team Pack</span>
-              </button>
-            )}
-            {onDeleteRoom && (
-              <button
-                type="button"
-                onClick={() => void onDeleteRoom(room.slug)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-medium cursor-pointer ml-auto"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Delete Room</span>
-              </button>
-            )}
+          {isMultiUser && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <span className="font-semibold uppercase tracking-wider text-slate-500">
+                  Access &amp; Owner
+                </span>
+                <span className="text-slate-600 truncate">
+                  {room.owner_email || "workspace"}
+                </span>
+              </div>
+              {canManageRoom ? (
+                <VisibilityPicker
+                  value={roomVisDraft?.visibility ?? room.visibility ?? "shared"}
+                  allowedGroups={roomVisDraft?.allowed_groups ?? room.allowed_groups ?? []}
+                  teams={teams}
+                  label=""
+                  compact
+                  onChange={(vis, groups) => {
+                    if (vis === "team" && groups.length === 0) {
+                      setRoomVisDraft({ visibility: vis, allowed_groups: groups });
+                      return;
+                    }
+                    setRoomVisDraft(null);
+                    void onUpdateRoom?.(room.slug, {
+                      visibility: vis,
+                      allowed_groups: vis === "team" ? groups : [],
+                    });
+                  }}
+                />
+              ) : (
+                <span
+                  className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-medium ${visibilityBadgeClasses(
+                    room.visibility,
+                  )}`}
+                >
+                  {formatVisibilityLabel(room.visibility, room.allowed_groups)}
+                </span>
+              )}
+            </div>
+          )}
+
+          <div className="pt-2 border-t border-slate-200 space-y-2">
+            {confirmClearChat && canManageRoom && onClearRoomMessages && renderClearChatConfirmation({
+              slug: room.slug,
+              onClear: onClearRoomMessages,
+              onExport: onExportRoomMessages,
+            })}
+            <div className="flex flex-wrap gap-2">
+              {onExportTeamPack && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void onExportTeamPack({ room_slug: room.slug, title: room.title })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-800 cursor-pointer"
+                >
+                  <Package className="w-3.5 h-3.5" />
+                  <span>Export Team Pack</span>
+                </button>
+              )}
+              {onClearRoomMessages && canManageRoom && !confirmClearChat && (
+                <button
+                  type="button"
+                  disabled={typeof messageCount === "number" && messageCount === 0}
+                  onClick={() => {
+                    setClearChatError(null);
+                    setConfirmClearChat(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 disabled:opacity-50 cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Clear Chat</span>
+                </button>
+              )}
+              {onDeleteRoom && canManageRoom && (
+                <button
+                  type="button"
+                  onClick={() => void onDeleteRoom(room.slug)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-medium cursor-pointer ml-auto"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Delete Room</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </aside>
@@ -584,7 +835,7 @@ export function Inspector({
 
   if (!bot) {
     return (
-      <aside className="w-[332px] shrink-0 h-full border-l border-slate-200 bg-white flex flex-col">
+      <aside className="w-full md:w-[332px] shrink-0 h-full md:border-l border-slate-200 bg-white flex flex-col">
         <div className="h-14 shrink-0 px-4 border-b border-slate-200 flex items-center justify-between">
           <div className="text-xs font-semibold text-slate-900">Workspace Inspector</div>
           <button
@@ -654,16 +905,27 @@ export function Inspector({
 
   async function updateRoutineSchedule(routineId: string, schedule: string) {
     if (!bot) return;
-    const updated: Array<Record<string, unknown>> = bot.routines.map((r) =>
-      r.id === routineId
-        ? {
-            ...(r as unknown as Record<string, unknown>),
-            schedule,
-            type: schedule.toLowerCase() === "manual" ? "manual_trigger" : "cron",
-            enabled: true,
-          }
-        : (r as unknown as Record<string, unknown>),
-    );
+    const updated: Array<Record<string, unknown>> = bot.routines.map((r) => {
+      if (r.id !== routineId) {
+        return r as unknown as Record<string, unknown>;
+      }
+      const trimmed = schedule.trim();
+      const oneShot = isOneShotRoutineSchedule(trimmed);
+      const next: Record<string, unknown> = {
+        ...(r as unknown as Record<string, unknown>),
+        schedule: trimmed || "Manual",
+        type:
+          trimmed.toLowerCase() === "manual"
+            ? "manual_trigger"
+            : oneShot
+              ? "once"
+              : "cron",
+        one_shot: oneShot,
+        enabled: true,
+      };
+      delete next.completed_at;
+      return next;
+    });
     await onUpdateBot(bot.slug, { routines: updated });
   }
 
@@ -701,18 +963,34 @@ export function Inspector({
   const botSkills = skills.filter((s) => s.scope_slug === bot.slug || s.scope_slug === "*");
 
   return (
-    <aside className="w-[332px] shrink-0 h-full border-l border-slate-200 bg-white flex flex-col">
+    <aside className="w-full md:w-[332px] shrink-0 h-full md:border-l border-slate-200 bg-white flex flex-col">
       {/* Top Status & Close Strip */}
       <div className="shrink-0 px-4 pt-3 pb-2 flex items-center justify-between gap-2">
         <button
           type="button"
+          role="switch"
+          aria-checked={bot.enabled}
+          aria-label={bot.enabled ? "Pause bot" : "Activate bot"}
+          title={
+            bot.enabled
+              ? "Bot is Active — click to pause (paused bots are skipped in Rooms and schedules)"
+              : "Bot is Paused — click to activate"
+          }
           onClick={() => void onUpdateBot(bot.slug, { enabled: !bot.enabled })}
-          className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-[11px] font-medium text-slate-700 hover:bg-slate-100 cursor-pointer"
+          className={`inline-flex items-center gap-2 pl-2.5 pr-1.5 py-1 rounded-full border text-[11px] font-medium transition-colors cursor-pointer ${
+            bot.enabled
+              ? "border-emerald-200 bg-emerald-50/70 text-emerald-800 hover:bg-emerald-100/80"
+              : "border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200/80"
+          }`}
         >
-          <span
-            className={`w-1.5 h-1.5 rounded-full ${bot.enabled ? "bg-[#3b8c62]" : "bg-slate-400"}`}
-          />
           <span>{bot.enabled ? "Active" : "Paused"}</span>
+          <span
+            className={`w-6 h-3.5 rounded-full p-0.5 flex items-center transition-colors ${
+              bot.enabled ? "bg-[#3b8c62] justify-end" : "bg-slate-300 justify-start"
+            }`}
+          >
+            <span className="w-2.5 h-2.5 rounded-full bg-white shadow-xs" />
+          </span>
         </button>
         <button
           type="button"
@@ -736,7 +1014,8 @@ export function Inspector({
             statusDot={
               !bot.enabled
                 ? "paused"
-                : bot.runtime === "desktop" && bot.desktop_state === "running"
+                : (bot.runtime === "desktop" && bot.desktop_state === "running") ||
+                    (bot.runtime === "sandbox" && bot.sandbox_state === "running")
                   ? "desktop"
                   : "active"
             }
@@ -768,7 +1047,11 @@ export function Inspector({
             [
               { key: "details", label: "Details" },
               { key: "library", label: "Library", badge: ownedPages.length || undefined },
-              { key: "computer", label: "Computer", dot: bot.runtime === "desktop" },
+              {
+                key: "computer",
+                label: "Computer",
+                dot: bot.runtime === "desktop" || bot.runtime === "sandbox",
+              },
             ] as const
           ).map((item) => {
             const active = activeTab === item.key;
@@ -796,11 +1079,10 @@ export function Inspector({
                 {"dot" in item && item.dot && (
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      bot.desktop_state === "running"
+                      (bot.runtime === "desktop" && bot.desktop_state === "running") ||
+                      (bot.runtime === "sandbox" && bot.sandbox_state === "running")
                         ? "bg-[#3b8c62]"
-                        : active
-                          ? "bg-slate-400"
-                          : "bg-slate-400"
+                        : "bg-slate-400"
                     }`}
                   />
                 )}
@@ -814,6 +1096,47 @@ export function Inspector({
       <div className="flex-1 overflow-y-auto custom-scroll p-4 space-y-5">
         {activeTab === "details" && (
           <>
+            {isMultiUser && (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2 text-[11px]">
+                  <span className="font-semibold uppercase tracking-wider text-slate-500">
+                    Access &amp; Owner
+                  </span>
+                  <span className="text-slate-600 truncate">
+                    {bot.owner_email || "workspace"}
+                  </span>
+                </div>
+                {canManageBot ? (
+                  <VisibilityPicker
+                    value={botVisDraft?.visibility ?? bot.visibility ?? "shared"}
+                    allowedGroups={botVisDraft?.allowed_groups ?? bot.allowed_groups ?? []}
+                    teams={teams}
+                    label=""
+                    compact
+                    onChange={(vis, groups) => {
+                      if (vis === "team" && groups.length === 0) {
+                        setBotVisDraft({ visibility: vis, allowed_groups: groups });
+                        return;
+                      }
+                      setBotVisDraft(null);
+                      void onUpdateBot(bot.slug, {
+                        visibility: vis,
+                        allowed_groups: vis === "team" ? groups : [],
+                      });
+                    }}
+                  />
+                ) : (
+                  <span
+                    className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-medium ${visibilityBadgeClasses(
+                      bot.visibility,
+                    )}`}
+                  >
+                    {formatVisibilityLabel(bot.visibility, bot.allowed_groups)}
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* 1. Instructions */}
             <form onSubmit={saveIdentity} className="space-y-2">
               <div className="flex items-center justify-between">
@@ -1053,6 +1376,122 @@ export function Inspector({
               );
             })()}
 
+            {/* 2C. Source Bots (Scoped Cross-Bot Data Read Grants) */}
+            {(() => {
+              const sourceColsFor = (other: BotRecord): string[] => {
+                const writeCols = (other.collections?.write ?? []).filter(
+                  (c) => c && !HIDDEN_INTERNAL_COLLECTIONS.has(c),
+                );
+                return writeCols.length > 0 ? writeCols : [`bot_${other.slug}_items`];
+              };
+              const curRead = bot.collections?.read ?? [];
+              const curWrite = bot.collections?.write ?? [];
+              const otherBots = bots.filter((b) => b.slug !== bot.slug);
+              const linkedSourceBots = otherBots.filter((other) =>
+                sourceColsFor(other).some((col) => curRead.includes(col)),
+              );
+              const availableSourceBots = otherBots.filter(
+                (other) => !sourceColsFor(other).some((col) => curRead.includes(col)),
+              );
+              const addSourceBot = (other: BotRecord) => {
+                const nextRead = Array.from(new Set([...curRead, ...sourceColsFor(other)]));
+                void onUpdateBot(bot.slug, {
+                  collections: { read: nextRead, write: curWrite },
+                });
+                setAddingSourceBot(false);
+              };
+              const removeSourceBot = (other: BotRecord) => {
+                const removeSet = new Set(sourceColsFor(other));
+                const nextRead = curRead.filter((col) => !removeSet.has(col));
+                void onUpdateBot(bot.slug, {
+                  collections: { read: nextRead, write: curWrite },
+                });
+              };
+              return (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                      Source Bots
+                    </div>
+                    {availableSourceBots.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setAddingSourceBot((v) => !v)}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[10.5px] font-medium text-slate-700 cursor-pointer"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>{addingSourceBot ? "Done" : "Add"}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {addingSourceBot && availableSourceBots.length > 0 && (
+                    <div className="rounded-xl border border-slate-200 bg-white p-1.5 space-y-0.5">
+                      {availableSourceBots.map((other) => (
+                        <button
+                          key={other.slug}
+                          type="button"
+                          onClick={() => addSourceBot(other)}
+                          className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-slate-100 flex items-center gap-2 text-xs text-slate-800 cursor-pointer"
+                        >
+                          <BotAvatar
+                            icon={other.avatar_icon}
+                            color={other.avatar_color}
+                            initials={other.initials}
+                            size="xs"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-medium">{other.name}</div>
+                            <div className="text-[10px] text-slate-400 truncate">{other.role}</div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {linkedSourceBots.length === 0 ? (
+                    <div className="text-[11px] text-slate-400">
+                      Isolated — reads only its own data unless linked or mentioned with @Bot.
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {linkedSourceBots.map((other) => (
+                        <div
+                          key={other.slug}
+                          className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <BotAvatar
+                              icon={other.avatar_icon}
+                              color={other.avatar_color}
+                              initials={other.initials}
+                              size="xs"
+                            />
+                            <div className="min-w-0">
+                              <div className="text-xs font-medium text-slate-900 truncate">
+                                {other.name}
+                              </div>
+                              <div className="text-[10.5px] text-slate-500 truncate">
+                                {other.role}
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            title={`Revoke access to ${other.name}`}
+                            onClick={() => removeSourceBot(other)}
+                            className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer shrink-0"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* 3. When Sending */}
             <div className="space-y-2">
               <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
@@ -1098,6 +1537,44 @@ export function Inspector({
                   />
                 </div>
               )}
+
+              {/* Generic Turn Governance Step Budget */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-2.5 space-y-1.5 text-[11px]">
+                <div className="flex justify-between text-slate-700 font-medium">
+                  <span>Step Limit Before Check-In</span>
+                  <span className="font-semibold text-slate-900">
+                    {bot.max_steps_per_run ?? 10} steps
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1 p-0.5 rounded-lg border border-slate-200 bg-white">
+                  {(
+                    [
+                      [5, "Short (5)"],
+                      [10, "Standard (10)"],
+                      [25, "Extended (25)"],
+                    ] as const
+                  ).map(([val, lbl]) => {
+                    const active = (bot.max_steps_per_run ?? 10) === val;
+                    return (
+                      <button
+                        key={val}
+                        type="button"
+                        onClick={() => void onUpdateBot(bot.slug, { max_steps_per_run: val })}
+                        className={`py-1 px-1.5 rounded-md text-[10.5px] font-medium cursor-pointer transition ${
+                          active
+                            ? "bg-slate-900 text-white shadow-xs"
+                            : "text-slate-600 hover:text-slate-900"
+                        }`}
+                      >
+                        {lbl}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[10.5px] text-slate-500 leading-snug">
+                  Repeated stuck loops stop automatically. Longer workflows pause with a 1-click Continue button.
+                </p>
+              </div>
             </div>
 
             {/* 4. Routines & Schedules */}
@@ -1135,7 +1612,7 @@ export function Inspector({
                       type="text"
                       value={newRoutineSchedule}
                       onChange={(e) => setNewRoutineSchedule(e.target.value)}
-                      placeholder="Every weekday at 09:00"
+                      placeholder="Every weekday at 09:00 or Once at 2026-11-20 21:00"
                       className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px]"
                     />
                     <input
@@ -1171,16 +1648,21 @@ export function Inspector({
                       type="button"
                       disabled={!newRoutineLabel.trim()}
                       onClick={() => {
+                        const schedVal = newRoutineSchedule.trim() || "Manual";
+                        const oneShot = isOneShotRoutineSchedule(schedVal);
                         const next = [
                           ...(bot.routines ?? []).map((r) => ({ ...r })),
                           {
                             id: `rtn-${Date.now()}`,
                             type:
-                              newRoutineSchedule.trim().toLowerCase() === "manual"
+                              schedVal.toLowerCase() === "manual"
                                 ? "manual_trigger"
-                                : "cron",
+                                : oneShot
+                                  ? "once"
+                                  : "cron",
+                            one_shot: oneShot,
                             label: newRoutineLabel.trim(),
-                            schedule: newRoutineSchedule.trim() || "Manual",
+                            schedule: schedVal,
                             timezone: newRoutineTimezone.trim() || browserTz,
                             prompt: newRoutinePrompt.trim(),
                             stale_data_policy: newRoutineStale,
@@ -1201,6 +1683,14 @@ export function Inspector({
               <div className="space-y-1.5">
                 {bot.routines.map((routine) => {
                   const isEvent = routine.type === "on_event" || Boolean(routine.event);
+                  const isOneShot =
+                    !isEvent &&
+                    isOneShotRoutineSchedule(
+                      routine.schedule,
+                      routine.type,
+                      routine.one_shot,
+                    );
+                  const isCompletedOneShot = isOneShot && !routine.enabled && Boolean(routine.completed_at);
                   const scheduleChoices = SCHEDULE_OPTIONS.includes(routine.schedule)
                     ? SCHEDULE_OPTIONS
                     : [routine.schedule, ...SCHEDULE_OPTIONS];
@@ -1212,33 +1702,47 @@ export function Inspector({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <div className="min-w-0 flex-1">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (isExpanded) {
-                                setEditingRoutineId(null);
-                                setEditRoutineDraft(null);
-                              } else {
-                                setEditingRoutineId(routine.id);
-                                setEditRoutineDraft({
-                                  label: routine.label || "Routine",
-                                  timezone: routine.timezone || browserTz,
-                                  prompt: routine.prompt || "",
-                                  stale_data_policy:
-                                    (routine.stale_data_policy as
-                                      | "skip_quietly"
-                                      | "notify_missing"
-                                      | "always_run") || "skip_quietly",
-                                });
-                              }
-                            }}
-                            className="text-left w-full text-[11.5px] font-semibold text-slate-900 truncate hover:underline cursor-pointer"
-                          >
-                            {routine.label || "Routine"}
-                            {routine.timezone && routine.timezone !== "UTC"
-                              ? ` (${routine.timezone})`
-                              : ""}
-                          </button>
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (isExpanded) {
+                                  setEditingRoutineId(null);
+                                  setEditRoutineDraft(null);
+                                } else {
+                                  setEditingRoutineId(routine.id);
+                                  setEditRoutineDraft({
+                                    label: routine.label || "Routine",
+                                    schedule: routine.schedule || "Manual",
+                                    timezone: routine.timezone || browserTz,
+                                    prompt: routine.prompt || "",
+                                    stale_data_policy:
+                                      (routine.stale_data_policy as
+                                        | "skip_quietly"
+                                        | "notify_missing"
+                                        | "always_run") || "skip_quietly",
+                                  });
+                                }
+                              }}
+                              className="text-left text-[11.5px] font-semibold text-slate-900 truncate hover:underline cursor-pointer"
+                            >
+                              {routine.label || "Routine"}
+                              {routine.timezone && routine.timezone !== "UTC"
+                                ? ` (${routine.timezone})`
+                                : ""}
+                            </button>
+                            {isOneShot && (
+                              <span
+                                className={`px-1.5 py-0.5 rounded-full text-[9.5px] font-medium shrink-0 border ${
+                                  isCompletedOneShot
+                                    ? "bg-slate-100 border-slate-200 text-slate-600"
+                                    : "bg-indigo-50 border-indigo-200 text-indigo-700"
+                                }`}
+                              >
+                                {isCompletedOneShot ? "Ran once" : "One-time"}
+                              </span>
+                            )}
+                          </div>
                           {isEvent ? (
                             <div className="text-[10.5px] text-slate-600 truncate">
                               On event: {routine.event || routine.schedule}
@@ -1325,6 +1829,17 @@ export function Inspector({
                               className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px]"
                             />
                           </div>
+                          <input
+                            type="text"
+                            value={editRoutineDraft.schedule}
+                            onChange={(e) =>
+                              setEditRoutineDraft((prev) =>
+                                prev ? { ...prev, schedule: e.target.value } : prev,
+                              )
+                            }
+                            placeholder="Every weekday at 09:00 or Once at 2026-11-20 21:00"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px]"
+                          />
                           <textarea
                             rows={2}
                             value={editRoutineDraft.prompt}
@@ -1361,17 +1876,34 @@ export function Inspector({
                             <button
                               type="button"
                               onClick={() => {
-                                const updated = bot.routines.map((r) =>
-                                  r.id === routine.id
-                                    ? {
-                                        ...(r as unknown as Record<string, unknown>),
-                                        label: editRoutineDraft.label.trim() || r.label,
-                                        timezone: editRoutineDraft.timezone.trim() || browserTz,
-                                        prompt: editRoutineDraft.prompt.trim(),
-                                        stale_data_policy: editRoutineDraft.stale_data_policy,
-                                      }
-                                    : (r as unknown as Record<string, unknown>),
-                                );
+                                const updated = bot.routines.map((r) => {
+                                  if (r.id !== routine.id) {
+                                    return r as unknown as Record<string, unknown>;
+                                  }
+                                  const nextSched =
+                                    editRoutineDraft.schedule.trim() || r.schedule || "Manual";
+                                  const nextOneShot = isOneShotRoutineSchedule(nextSched);
+                                  const nextObj: Record<string, unknown> = {
+                                    ...(r as unknown as Record<string, unknown>),
+                                    label: editRoutineDraft.label.trim() || r.label,
+                                    schedule: nextSched,
+                                    type:
+                                      nextSched.toLowerCase() === "manual"
+                                        ? "manual_trigger"
+                                        : nextOneShot
+                                          ? "once"
+                                          : "cron",
+                                    one_shot: nextOneShot,
+                                    timezone: editRoutineDraft.timezone.trim() || browserTz,
+                                    prompt: editRoutineDraft.prompt.trim(),
+                                    stale_data_policy: editRoutineDraft.stale_data_policy,
+                                  };
+                                  if (nextSched !== r.schedule) {
+                                    nextObj.enabled = true;
+                                    delete nextObj.completed_at;
+                                  }
+                                  return nextObj;
+                                });
                                 void onUpdateBot(bot.slug, { routines: updated });
                                 setEditingRoutineId(null);
                                 setEditRoutineDraft(null);
@@ -1838,6 +2370,18 @@ export function Inspector({
 
         {activeTab === "computer" && (
           <div className="space-y-4">
+            <SSHTerminalPanel
+              botSlug={bot.slug}
+              theme={theme}
+              variant="sidebar"
+              refreshTick={sshRefreshTick}
+              onExpandModal={onExpandTerminal ? () => onExpandTerminal(bot.slug) : undefined}
+              hasPermittedSSH={vaultSecrets.some(
+                (v) =>
+                  v.secret_type === "ssh" &&
+                  (v.allowed_bots.includes("*") || v.allowed_bots.includes(bot.slug)),
+              )}
+            />
             {bot.runtime === "desktop" ? (
               <>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2.5">
@@ -1901,15 +2445,98 @@ export function Inspector({
                 <div className="rounded-xl border border-slate-200 p-3 space-y-2">
                   <div className="text-xs font-medium text-slate-900">Runtime Mode</div>
                   <p className="text-[11px] text-slate-500 leading-snug">
-                    Switch to 0 MB Cloud API mode if this bot only needs native Gmail, Telegram, or RSS APIs.
+                    Switch to Script Sandbox (512 MB CLI) for bash/Python scripts, or 0 MB Cloud API for direct connectors.
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => void onUpdateBot(bot.slug, { runtime: "api" })}
-                    className="px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
-                  >
-                    Switch to Cloud API (0 MB)
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void onUpdateBot(bot.slug, { runtime: "sandbox" })}
+                      className="px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
+                    >
+                      Switch to Script Sandbox (512 MB)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onUpdateBot(bot.slug, { runtime: "api" })}
+                      className="px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
+                    >
+                      Switch to Cloud API (0 MB)
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : bot.runtime === "sandbox" ? (
+              <>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900">
+                      <Terminal className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Script Sandbox</span>
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10.5px] font-semibold ${
+                        bot.sandbox_state === "running"
+                          ? "bg-emerald-50 border border-emerald-200 text-emerald-700"
+                          : "bg-slate-200 text-slate-700"
+                      }`}
+                    >
+                      {bot.sandbox_state === "running" ? "Running" : "Sleeping"}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    Headless Fedora 45 CLI · {bot.ram_limit_mb} MB cap · Persistent /workspace
+                  </div>
+                  <div className="rounded-lg bg-white border border-slate-200 px-2.5 py-1.5 text-[11px] text-slate-600 flex justify-between gap-2">
+                    <span>
+                      Memory:{" "}
+                      {bot.sandbox_state === "running"
+                        ? `${bot.ram_mb} MB / ${bot.ram_limit_mb} MB`
+                        : "0 MB (/workspace saved)"}
+                    </span>
+                    <span className="font-mono text-[10px] text-slate-400">bash · python3</span>
+                  </div>
+                  {onToggleSandbox && (
+                    <button
+                      type="button"
+                      disabled={togglingSandbox}
+                      onClick={() => onToggleSandbox(bot.slug)}
+                      className="w-full inline-flex items-center justify-center gap-1.5 border border-slate-200 bg-white py-1.5 px-2.5 rounded-lg text-[11px] font-medium text-slate-900 cursor-pointer hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {togglingSandbox && <Loader2 className="w-3 h-3 animate-spin shrink-0" />}
+                      <span>
+                        {togglingSandbox
+                          ? bot.sandbox_state === "running"
+                            ? "Stopping..."
+                            : "Starting..."
+                          : bot.sandbox_state === "running"
+                            ? "Put to Sleep"
+                            : "Start Sandbox"}
+                      </span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-slate-200 p-3 space-y-2">
+                  <div className="text-xs font-medium text-slate-900">Runtime Mode</div>
+                  <p className="text-[11px] text-slate-500 leading-snug">
+                    Switch to 0 MB Cloud API when scripts are no longer needed, or upgrade to Virtual Desktop for GUI browser automation.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void onUpdateBot(bot.slug, { runtime: "api" })}
+                      className="px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
+                    >
+                      Switch to Cloud API (0 MB)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onUpdateBot(bot.slug, { runtime: "desktop" })}
+                      className="px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 cursor-pointer"
+                    >
+                      Upgrade to Virtual Desktop
+                    </button>
+                  </div>
                 </div>
               </>
             ) : (
@@ -1921,30 +2548,46 @@ export function Inspector({
                   <div>
                     <div className="text-xs font-semibold text-slate-900">Cloud API Mode (0 MB)</div>
                     <div className="text-[11px] text-slate-500">
-                      Fast native Gmail, Telegram, LinkedIn &amp; RSS tools
+                      Fast native Gmail, Telegram, LinkedIn, MCP &amp; RSS tools
                     </div>
                   </div>
                 </div>
                 <p className="text-[11px] text-slate-600 leading-relaxed">
-                  No Virtual Desktop container is attached, saving ~2 GB host RAM. Enable Virtual Desktop only if this bot must drive GUI apps or authenticated websites without an API.
+                  No container is attached. Attach Script Sandbox (512 MB CLI) for custom bash/Python scripts, or Virtual Desktop (2 GB) for GUI browser apps.
                 </p>
-                <button
-                  type="button"
-                  onClick={() => void onUpdateBot(bot.slug, { runtime: "desktop" })}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-900 text-white text-[11px] font-medium cursor-pointer"
-                >
-                  <Monitor className="w-3.5 h-3.5" />
-                  <span>Attach Virtual Desktop</span>
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void onUpdateBot(bot.slug, { runtime: "sandbox" })}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-200 bg-white hover:bg-slate-50 text-slate-900 text-[11px] font-medium cursor-pointer"
+                  >
+                    <Terminal className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Attach Script Sandbox</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onUpdateBot(bot.slug, { runtime: "desktop" })}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-900 text-white text-[11px] font-medium cursor-pointer"
+                  >
+                    <Monitor className="w-3.5 h-3.5" />
+                    <span>Attach Virtual Desktop</span>
+                  </button>
+                </div>
               </div>
             )}
           </div>
         )}
       </div>
 
-      {onDeleteBot && (activeTab === "details" || activeTab === "computer") && (
+      {(onDeleteBot || onClearBotMessages) && (activeTab === "details" || activeTab === "computer") && (
         <div className="shrink-0 px-4 py-2.5 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
-          {confirmDeleteBot ? (
+          {confirmClearChat && onClearBotMessages ? (
+            renderClearChatConfirmation({
+              slug: bot.slug,
+              onClear: onClearBotMessages,
+              onExport: onExportBotMessages,
+            })
+          ) : confirmDeleteBot && onDeleteBot ? (
             <div className="flex items-center justify-between gap-2 w-full">
               <span className="text-[11px] font-medium text-rose-700 truncate">
                 Delete {bot.name}?
@@ -1986,15 +2629,37 @@ export function Inspector({
               >
                 Run Logs
               </button>
-              <button
-                type="button"
-                disabled={deletingBot}
-                onClick={() => setConfirmDeleteBot(true)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-rose-200 bg-white text-[11px] font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
-              >
-                <Trash2 className="w-3 h-3" />
-                <span>Delete Bot</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                {onClearBotMessages && canManageBot && (
+                  <button
+                    type="button"
+                    disabled={deletingBot || (typeof messageCount === "number" && messageCount === 0)}
+                    onClick={() => {
+                      setConfirmDeleteBot(false);
+                      setClearChatError(null);
+                      setConfirmClearChat(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Clear Chat</span>
+                  </button>
+                )}
+                {onDeleteBot && canManageBot && (
+                  <button
+                    type="button"
+                    disabled={deletingBot}
+                    onClick={() => {
+                      setConfirmClearChat(false);
+                      setConfirmDeleteBot(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-rose-200 bg-white text-[11px] font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Delete Bot</span>
+                  </button>
+                )}
+              </div>
             </>
           )}
         </div>

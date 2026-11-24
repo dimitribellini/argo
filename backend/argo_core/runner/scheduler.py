@@ -6,10 +6,11 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from argo_core.db.repositories import ArgoRepository
+from argo_core.db.repositories import ArgoRepository, utc_now
 from argo_core.runner.bot_runner import UniversalBotRunner
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,17 @@ _CALENDAR_RE = re.compile(
     r"(?:\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?)?$",
     re.IGNORECASE,
 )
+_ONCE_RELATIVE_RE = re.compile(
+    r"^(?:once\s+)?in\s+(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)$",
+    re.IGNORECASE,
+)
+_ONCE_DATETIME_RE = re.compile(
+    r"^(?:(?:once|one[\s-]*shot|one[\s-]*time)(?:\s+(?:at|on))?|at)?\s*"
+    r"(?P<date>\d{4}-\d{2}-\d{2})"
+    r"(?:(?:\s+at|\s+|T)\s*(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))(?::(?P<second>\d{2}))?\s*(?P<ampm>am|pm)?)?"
+    r"(?:\s*(?P<tz>(?:Z|[+-]\d{2}:?\d{2})))?$",
+    re.IGNORECASE,
+)
 
 
 def validate_timezone_name(timezone_name: str | None) -> str:
@@ -90,8 +102,13 @@ def _parse_hhmm(hour_str: str | None, minute_str: str | None, ampm: str | None) 
     return (hour, minute)
 
 
-def parse_routine_schedule(schedule: str | None, timezone: str | None = None) -> dict[str, Any] | None:
-    """Parse human intervals ('Every 15m'), calendar phrases ('Every weekday at 08:30'), or 5-field cron."""
+def parse_routine_schedule(
+    schedule: str | None,
+    timezone: str | None = None,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Parse human intervals ('Every 15m'), calendar phrases ('Every weekday at 08:30'), one-shot dates ('Once at YYYY-MM-DD HH:MM', 'In 30m'), or 5-field cron."""
     if not schedule or not schedule.strip():
         return None
     cleaned = schedule.strip()
@@ -99,7 +116,8 @@ def parse_routine_schedule(schedule: str | None, timezone: str | None = None) ->
     if lowered in {"manual", "event-driven"} or lowered.startswith("on:"):
         return None
 
-    tz_extra = {"timezone": validate_timezone_name(timezone)} if (timezone is not None and str(timezone).strip()) else {}
+    tz_name = validate_timezone_name(timezone)
+    tz_extra = {"timezone": tz_name} if (timezone is not None and str(timezone).strip()) else {}
 
     if lowered == "hourly":
         return {"kind": "interval", "seconds": 3600, "raw": cleaned, **tz_extra}
@@ -112,6 +130,80 @@ def parse_routine_schedule(schedule: str | None, timezone: str | None = None) ->
             "month": "*",
             "day_of_week": "*",
             "raw": cleaned,
+            **tz_extra,
+        }
+
+    once_rel = _ONCE_RELATIVE_RE.match(cleaned)
+    if once_rel:
+        qty = max(1, int(once_rel.group(1)))
+        unit = once_rel.group(2).lower()
+        if unit.startswith("h"):
+            seconds = qty * 3600
+        elif unit.startswith("m"):
+            seconds = qty * 60
+        else:
+            seconds = qty
+        base_now = now_utc or datetime.now(UTC)
+        target_dt = (base_now + timedelta(seconds=max(5, seconds))).astimezone(ZoneInfo(tz_name))
+        fmt = "%Y-%m-%d %H:%M:%S" if unit.startswith("s") else "%Y-%m-%d %H:%M"
+        return {
+            "kind": "date",
+            "run_at": target_dt.isoformat(),
+            "raw": cleaned,
+            "normalized": f"Once at {target_dt.strftime(fmt)}",
+            **tz_extra,
+        }
+
+    once_dt = _ONCE_DATETIME_RE.match(cleaned)
+    if once_dt:
+        date_str = once_dt.group("date")
+        try:
+            parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return None
+        hhmm = _parse_hhmm(once_dt.group("hour"), once_dt.group("minute"), once_dt.group("ampm"))
+        if once_dt.group("hour") is None:
+            hhmm = (9, 0)
+        if hhmm is None:
+            return None
+        sec = int(once_dt.group("second") or 0)
+        if sec < 0 or sec > 59:
+            return None
+        tz_suffix = (once_dt.group("tz") or "").strip()
+        if tz_suffix:
+            if tz_suffix.upper() == "Z":
+                tz_obj: Any = UTC
+            else:
+                iso_tz = tz_suffix if ":" in tz_suffix else f"{tz_suffix[:3]}:{tz_suffix[3:]}"
+                try:
+                    tz_obj = datetime.fromisoformat(f"2026-01-01T00:00:00{iso_tz}").tzinfo or UTC
+                except ValueError:
+                    return None
+            target_dt = datetime(
+                parsed_date.year,
+                parsed_date.month,
+                parsed_date.day,
+                hhmm[0],
+                hhmm[1],
+                sec,
+                tzinfo=tz_obj,
+            )
+        else:
+            target_dt = datetime(
+                parsed_date.year,
+                parsed_date.month,
+                parsed_date.day,
+                hhmm[0],
+                hhmm[1],
+                sec,
+                tzinfo=ZoneInfo(tz_name),
+            )
+        fmt = "%Y-%m-%d %H:%M:%S" if target_dt.second else "%Y-%m-%d %H:%M"
+        return {
+            "kind": "date",
+            "run_at": target_dt.isoformat(),
+            "raw": cleaned,
+            "normalized": f"Once at {target_dt.strftime(fmt)}",
             **tz_extra,
         }
 
@@ -165,6 +257,19 @@ def parse_routine_schedule(schedule: str | None, timezone: str | None = None) ->
     return None
 
 
+def is_one_shot_schedule(
+    schedule: str | None,
+    timezone: str | None = None,
+    routine_type: str | None = None,
+    one_shot_flag: bool | None = None,
+) -> bool:
+    """Return True when a routine represents a one-shot run rather than a recurring schedule."""
+    if one_shot_flag or str(routine_type or "").strip().lower() == "once":
+        return True
+    parsed = parse_routine_schedule(schedule, timezone)
+    return bool(parsed and parsed.get("kind") == "date")
+
+
 class BotScheduler:
     """Reconciles enabled bot routines against APScheduler 3.11.x AsyncIOScheduler."""
 
@@ -215,6 +320,20 @@ class BotScheduler:
         self._backend = "stopped"
 
     async def _run_scheduled_routine(self, bot_slug: str, routine_id: str) -> None:
+        is_one_shot = False
+        with suppress(Exception):
+            bot_rec = self._repo.get_bot(bot_slug)
+            r_rec = next(
+                (r for r in (bot_rec.get("routines") or []) if isinstance(r, dict) and r.get("id") == routine_id),
+                None,
+            )
+            if isinstance(r_rec, dict):
+                is_one_shot = is_one_shot_schedule(
+                    r_rec.get("schedule"),
+                    r_rec.get("timezone"),
+                    r_rec.get("type"),
+                    r_rec.get("one_shot"),
+                )
         try:
             await self._runner.execute_bot(
                 bot_slug,
@@ -224,6 +343,29 @@ class BotScheduler:
             )
         except Exception as exc:
             logger.warning("Scheduled routine %s/%s failed: %s", bot_slug, routine_id, exc)
+        finally:
+            if is_one_shot:
+                with suppress(Exception):
+                    latest_bot = self._repo.get_bot(bot_slug)
+                    done_ts = utc_now()
+                    updated_routines: list[Any] = []
+                    changed = False
+                    for r in latest_bot.get("routines") or []:
+                        if isinstance(r, dict) and r.get("id") == routine_id:
+                            nr = dict(r)
+                            nr["enabled"] = False
+                            nr["one_shot"] = True
+                            nr["type"] = "once"
+                            nr["completed_at"] = done_ts
+                            updated_routines.append(nr)
+                            changed = True
+                        else:
+                            updated_routines.append(r)
+                    if changed:
+                        self._repo.update_bot(bot_slug, {"routines": updated_routines})
+                    job_id = f"{bot_slug}::{routine_id}"
+                    self._remove_job(job_id)
+                    self._jobs.pop(job_id, None)
 
     async def _fallback_interval_loop(self, bot_slug: str, routine_id: str, seconds: int) -> None:
         try:
@@ -233,9 +375,19 @@ class BotScheduler:
         except asyncio.CancelledError:
             raise
 
+    async def _fallback_once_sleep(self, bot_slug: str, routine_id: str, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            if self._started:
+                await self._run_scheduled_routine(bot_slug, routine_id)
+        except asyncio.CancelledError:
+            raise
+
     def sync_bots(self) -> list[dict[str, Any]]:
         """Reconcile active scheduled jobs with all enabled declarative bots in SQLite."""
         desired: dict[str, dict[str, Any]] = {}
+        now_utc = datetime.now(UTC)
         for bot in self._repo.list_bots():
             if not bot["enabled"]:
                 continue
@@ -247,9 +399,17 @@ class BotScheduler:
                 parsed = parse_routine_schedule(
                     routine.get("schedule"),
                     routine.get("timezone"),
+                    now_utc=now_utc,
                 )
                 if parsed is None:
                     continue
+                if parsed["kind"] == "date":
+                    try:
+                        run_dt = datetime.fromisoformat(str(parsed["run_at"])).astimezone(UTC)
+                    except ValueError:
+                        continue
+                    if run_dt <= now_utc - timedelta(seconds=60):
+                        continue
                 job_id = f"{bot['slug']}::{routine['id']}"
                 desired[job_id] = {
                     "job_id": job_id,
@@ -280,7 +440,11 @@ class BotScheduler:
                 self._scheduler.remove_job(job_id)
         task = self._fallback_tasks.pop(job_id, None)
         if task is not None:
-            task.cancel()
+            cur_task = None
+            with suppress(RuntimeError):
+                cur_task = asyncio.current_task()
+            if task is not cur_task:
+                task.cancel()
 
     def _add_job(self, job_id: str, meta: dict[str, Any]) -> None:
         spec = meta["spec"]
@@ -288,6 +452,30 @@ class BotScheduler:
         routine_id = meta["routine_id"]
 
         if self._scheduler is not None:
+            if spec["kind"] == "date":
+                try:
+                    from apscheduler.triggers.date import DateTrigger  # type: ignore[import-not-found]
+                except ImportError:
+                    run_dt = datetime.fromisoformat(str(spec["run_at"])).astimezone(UTC)
+                    delay = max(0.0, (run_dt - datetime.now(UTC)).total_seconds())
+                    self._fallback_tasks[job_id] = asyncio.create_task(
+                        self._fallback_once_sleep(bot_slug, routine_id, delay)
+                    )
+                    return
+                run_dt = datetime.fromisoformat(str(spec["run_at"]))
+                trigger = DateTrigger(run_date=run_dt)
+                self._scheduler.add_job(
+                    self._run_scheduled_routine,
+                    trigger=trigger,
+                    id=job_id,
+                    kwargs={"bot_slug": bot_slug, "routine_id": routine_id},
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=300,
+                )
+                return
+
             from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-not-found]
             from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-not-found]
 
@@ -316,6 +504,13 @@ class BotScheduler:
             return
 
         if self._started:
+            if spec["kind"] == "date":
+                run_dt = datetime.fromisoformat(str(spec["run_at"])).astimezone(UTC)
+                delay = max(0.0, (run_dt - datetime.now(UTC)).total_seconds())
+                self._fallback_tasks[job_id] = asyncio.create_task(
+                    self._fallback_once_sleep(bot_slug, routine_id, delay)
+                )
+                return
             interval_seconds = int(spec["seconds"]) if spec["kind"] == "interval" else 900
             self._fallback_tasks[job_id] = asyncio.create_task(
                 self._fallback_interval_loop(bot_slug, routine_id, interval_seconds)

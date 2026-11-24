@@ -1,3 +1,23 @@
+import type { ApprovalItem } from "../types";
+
+/**
+ * Strip Markdown heading markers, emphasis, backticks, link wrappers, and bullet prefixes
+ * so compact sidebar subtitles display clean plain text.
+ */
+export function stripMarkdownPreview(text: string): string {
+  const raw = String(text ?? "").trim();
+  if (!raw) return "";
+  return raw
+    .replace(/^([^:\n]{1,60}:\s+)#{1,6}\s+/gm, "$1")
+    .replace(/^([^:\n]{1,60}:\s+)(?:[-*•]+|\d+[.)])\s+/gm, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^\s*(?:[-*•]+|\d+[.)])\s+/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[*_`~]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function formatFriendlyTime(iso: string | null | undefined): string {
   if (!iso) return "";
   const dt = new Date(iso);
@@ -94,6 +114,9 @@ export function friendlyActionStepLabel(
     reply_email: "Email reply prepared",
     fetch_rss_feed: "Checked RSS feed",
     fetch_public_webpage: "Read webpage",
+    extract_web_data: "Extracted web data",
+    data_describe: "Inspected dataset schema",
+    data_query: "Queried dataset",
     fetch_telegram_public_channel: "Checked Telegram channel",
     upsert_document: "Saved items",
     publish_telegram: "Telegram message",
@@ -101,6 +124,7 @@ export function friendlyActionStepLabel(
     publish_linkedin: "LinkedIn post",
     linkedin_post: "LinkedIn post",
     request_human_approval: "Queued for your review",
+    ask_operator: "Asked for your decision",
     notify_approval: "Sent approval notification",
     upsert_page: "Updated Page",
     open_page: "Opened Living Board",
@@ -116,6 +140,7 @@ export function friendlyActionStepLabel(
     propose_specialist_bot: "Proposed new specialist bot",
     propose_fleet_cleanup: "Proposed bot cleanup",
     desktop_browse: "Browsed in Virtual Desktop",
+    desktop_browser_action: "Interacted with browser",
     desktop_inspect: "Inspected Virtual Desktop",
     desktop_screenshot: "Captured Virtual Desktop screenshot",
     desktop_check_app: "Checked desktop application",
@@ -126,13 +151,31 @@ export function friendlyActionStepLabel(
     desktop_key: "Sent key in Virtual Desktop",
     desktop_scroll: "Scrolled in Virtual Desktop",
     desktop_exec: "Ran command in Virtual Desktop",
+    sandbox_exec: "Ran script in Sandbox",
+    ssh_exec: "Ran SSH command",
+    ssh_input: "Replied in SSH terminal",
+    ssh_close: "Closed SSH session",
+    ssh_session_control: "Updated SSH session safety",
   };
   const statusMap: Record<string, string> = {
     ok: "Done",
+    completed: "Done",
+    awaiting_input: "Waiting for reply",
+    awaiting_decision: "Waiting for choice",
+    running_timeout: "Still running",
     queued_approval: "Waiting for review",
+    queued_ram_gate: "Paused (Host RAM >= 80%)",
     executed: "Sent",
     blocked_unlinked_account: "App not linked",
     blocked_rbac: "Blocked by permission",
+    blocked_sandbox_policy: "Requires Script Sandbox",
+    blocked_catastrophic: "Blocked for safety",
+    blocked_rogue_host: "Blocked unapproved server",
+    blocked_target: "Blocked target host",
+    blocked_vault_acl: "Credential not shared",
+    host_key_mismatch: "Server key changed",
+    operator_active: "Human in control",
+    paused: "Frozen",
     blocked_collection_acl: "Blocked by list permission",
     halted_takeover_required: "Login needed",
     halted_hop_limit: "Stopped at loop limit",
@@ -141,8 +184,16 @@ export function friendlyActionStepLabel(
     timeout: "Timed out",
   };
   const key = (actionType ?? "").trim().toLowerCase();
-  const label =
-    typeMap[key] ??
+  let label = typeMap[key];
+  if (!label && key.startsWith("mcp__")) {
+    const parts = (actionType ?? "").trim().split("__");
+    label =
+      parts.length >= 3
+        ? `MCP · ${parts[1].replaceAll("_", "-")}/${parts.slice(2).join("__")}`
+        : `MCP · ${key.slice(5)}`;
+  }
+  label =
+    label ??
     (key ? key.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase()) : "Completed step");
   const stKey = (status ?? "").trim().toLowerCase();
   const outcome = statusMap[stKey] ?? (stKey ? stKey.replaceAll("_", " ") : "Done");
@@ -151,6 +202,12 @@ export function friendlyActionStepLabel(
 
 export function friendlyApprovalChannel(actionType: string, targetSlug: string): string {
   const key = (actionType ?? "").trim().toLowerCase();
+  if (key.startsWith("mcp__")) {
+    const parts = (actionType ?? "").trim().split("__");
+    return parts.length >= 3
+      ? `MCP · ${parts[1].replaceAll("_", "-")}/${parts.slice(2).join("__")}`
+      : `MCP · ${key.slice(5)}`;
+  }
   const map: Record<string, string> = {
     publish_telegram: "Telegram Message",
     send_telegram: "Telegram Message",
@@ -163,6 +220,8 @@ export function friendlyApprovalChannel(actionType: string, targetSlug: string):
     create_specialist_bot: "New Bot Proposal",
     fleet_cleanup: "Bot Cleanup Proposal",
     update_bot_config: "Bot Configuration Proposal",
+    ssh_exec: "SSH Server Command",
+    ssh_input: "SSH Terminal Prompt",
   };
   if (map[key]) return map[key];
   if (targetSlug === "argo_workspace") return "Workspace Change";
@@ -240,4 +299,137 @@ export function computeWordDiff(beforeText: string, afterText: string): DiffToke
     j += 1;
   }
   return tokens;
+}
+
+/**
+ * Format long single-line shell scripts into readable multi-line blocks for display only.
+ * Never mutates quotes, backslash-escaped semicolons (e.g. `find ... \;`), or underlying payloads.
+ */
+export function formatShellCommandForDisplay(cmd: string): string {
+  const raw = String(cmd ?? "");
+  if (!raw || raw.includes("\n") || raw.length <= 100) {
+    return raw;
+  }
+  let out = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let justBrokeLine = false;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (justBrokeLine && (ch === " " || ch === "\t")) {
+      continue;
+    }
+    justBrokeLine = false;
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && !inSingle) {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+    if (ch === ";" && !inSingle && !inDouble) {
+      // Avoid breaking inside empty consecutive `;;` (e.g. bash `case` terminator)
+      if (raw[i + 1] === ";") {
+        out += ";;\n";
+        i += 1;
+        justBrokeLine = true;
+        continue;
+      }
+      out += ";\n";
+      justBrokeLine = true;
+      continue;
+    }
+    out += ch;
+  }
+  return out.trimEnd();
+}
+
+export function extractApprovalHost(item: ApprovalItem): string {
+  const explicit = String((item.payload as Record<string, unknown>)?.host ?? "").trim();
+  if (explicit) return explicit;
+  const title = String(item.payload?.title ?? "").trim();
+  const match = /\bon\s+([^\s]+)\s*$/i.exec(title);
+  if (match?.[1]) return match[1];
+  return "";
+}
+
+export function extractSuggestedTrustPrefixes(item: ApprovalItem): string[] {
+  const raw = item.payload?.suggested_trust_prefixes;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((p) => String(p ?? "").trim()).filter(Boolean);
+}
+
+export interface SSHApprovalBatchGroup {
+  key: string;
+  command: string;
+  botSlug: string;
+  vaultSlug: string;
+  trustPrefixes: string[];
+  items: ApprovalItem[];
+}
+
+export function partitionSSHApprovalBatches(
+  items: ApprovalItem[],
+  options?: { scopeByBot?: boolean },
+): {
+  batches: SSHApprovalBatchGroup[];
+  singles: ApprovalItem[];
+} {
+  const scopeByBot = options?.scopeByBot ?? false;
+  const buckets = new Map<string, ApprovalItem[]>();
+
+  for (const item of items) {
+    if (
+      item.status !== "pending" ||
+      item.action_type !== "ssh_exec" ||
+      Boolean(item.edited_payload?.text)
+    ) {
+      continue;
+    }
+    const cmd = String(item.payload?.text ?? "").trim();
+    if (!cmd) continue;
+    const key = `${scopeByBot ? item.bot_slug : ""}::${item.target_account_slug}::${cmd}`;
+    const arr = buckets.get(key) ?? [];
+    arr.push(item);
+    buckets.set(key, arr);
+  }
+
+  const batchedIds = new Set<string>();
+  const batches: SSHApprovalBatchGroup[] = [];
+  for (const [key, group] of buckets.entries()) {
+    if (group.length >= 2) {
+      const first = group[0];
+      const trustPrefixes = extractSuggestedTrustPrefixes(first);
+      batches.push({
+        key,
+        command: String(first.payload?.text ?? "").trim(),
+        botSlug: first.bot_slug,
+        vaultSlug: first.target_account_slug,
+        trustPrefixes,
+        items: group,
+      });
+      for (const it of group) {
+        batchedIds.add(it.id);
+      }
+    }
+  }
+
+  const singles = items.filter((it) => !batchedIds.has(it.id));
+  return { batches, singles };
 }

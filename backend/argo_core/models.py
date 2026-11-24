@@ -18,16 +18,17 @@ def _validate_supported_model(value: str) -> str:
 
 class DispatchActivityRequest(BaseModel):
     instruction: str = Field(min_length=1, max_length=4000)
-    target_slug: str = Field(default="operations-coordinator", min_length=1)
+    target_slug: str | None = Field(default=None, max_length=120)
 
 
 class CreateBotRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     role: str = Field(default="Workspace automation coworker", min_length=1, max_length=2000)
-    runtime: Literal["api", "desktop"] = "api"
+    runtime: Literal["api", "sandbox", "desktop"] = "api"
     outbound_rbac: Literal["internal", "draft", "execute"] = "draft"
     model: str = Field(default="google:gemini-3.8-flash", min_length=1)
     daily_cap: int = Field(default=10, ge=0, le=500)
+    max_steps_per_run: int = Field(default=10, ge=3, le=25)
     slug: str | None = None
     role_prompt: str | None = Field(default=None, max_length=8000)
     routines: list[dict[str, Any]] | None = None
@@ -43,6 +44,8 @@ class CreateBotRequest(BaseModel):
     goal_metric: str = ""
     handoff_bot_slug: str = ""
     onboarding_mode: Literal["configured", "interview"] = "configured"
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
     @field_validator("model")
     @classmethod
@@ -53,12 +56,13 @@ class CreateBotRequest(BaseModel):
 class UpdateBotRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     enabled: bool | None = None
-    runtime: Literal["api", "desktop"] | None = None
+    runtime: Literal["api", "sandbox", "desktop"] | None = None
     role: str | None = Field(default=None, min_length=1, max_length=2000)
     role_prompt: str | None = Field(default=None, max_length=8000)
     model: str | None = None
     outbound_rbac: Literal["internal", "draft", "execute"] | None = None
     daily_cap: int | None = Field(default=None, ge=0, le=500)
+    max_steps_per_run: int | None = Field(default=None, ge=3, le=25)
     toggle_routine_id: str | None = None
     routines: list[dict[str, Any]] | None = None
     tools: list[Any] | None = None
@@ -73,6 +77,8 @@ class UpdateBotRequest(BaseModel):
     goal_metric: str | None = None
     handoff_bot_slug: str | None = None
     onboarding_pending: bool | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
     @field_validator("model")
     @classmethod
@@ -119,6 +125,8 @@ class CreateRoomRequest(BaseModel):
     pinned_page_slug: str | None = Field(default=None, max_length=120)
     pinned: bool = False
     section: str = Field(default="", max_length=80)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class UpdateRoomRequest(BaseModel):
@@ -132,6 +140,8 @@ class UpdateRoomRequest(BaseModel):
     pinned_page_slug: str | None = None
     pinned: bool | None = None
     section: str | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class AppendRoomMessageRequest(BaseModel):
@@ -181,15 +191,18 @@ class ImportBotBlueprintRequest(BaseModel):
 class GeneratePageRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=4000)
     title: str | None = Field(default=None, max_length=120)
-    owner_bot_slug: str = "operations-coordinator"
+    owner_bot_slug: str = ""
     allowed_collections: list[str] = Field(default_factory=list)
     existing_page_slug: str | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
     template_key: Literal[
         "auto",
         "live_operations_map",
         "bot_hub_board",
         "collection_analytics",
         "interactive_playground",
+        "data_dashboard",
     ] = "auto"
 
 
@@ -209,6 +222,14 @@ class ResolveApprovalRequest(BaseModel):
     edited_text: str | None = None
     style_rule: str | None = None
     channel: Literal["web_ui", "telegram"] = "web_ui"
+    trust_command: bool = False
+    trust_prefixes: list[str] | None = None
+
+
+class BatchResolveApprovalRequest(BaseModel):
+    approval_ids: list[str] = Field(min_length=1, max_length=50)
+    action: Literal["approve", "reject"]
+    trust_command: bool = False
 
 
 class CreateStyleRuleRequest(BaseModel):
@@ -222,7 +243,9 @@ class CreatePageRequest(BaseModel):
     render_mode: Literal["declarative_json", "sandboxed_html"] = "declarative_json"
     content_payload: str | None = None
     allowed_collections: list[str] = Field(default_factory=list)
-    owner_bot_slug: str = "operations-coordinator"
+    owner_bot_slug: str = ""
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class UpsertDocumentRequest(BaseModel):
@@ -239,6 +262,8 @@ class UpsertIntegrationRequest(BaseModel):
     account_identifier: str | None = None
     scopes: list[str] = Field(default_factory=list)
     secrets: dict[str, Any] = Field(default_factory=dict)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class UpsertModelRequest(BaseModel):
@@ -250,11 +275,20 @@ class UpsertModelRequest(BaseModel):
     is_default: bool = False
     daily_token_limit: int | None = Field(default=None, ge=1)
     monthly_budget_usd: float | None = Field(default=None, ge=0.0)
+    input_price_per_million: float | None = Field(default=None, ge=0.0)
+    output_price_per_million: float | None = Field(default=None, ge=0.0)
 
     @field_validator("model_id")
     @classmethod
     def check_provider_model(cls, value: str) -> str:
         return _validate_supported_model(value)
+
+
+class DiscoverModelsRequest(BaseModel):
+    provider_type: Literal["google", "anthropic", "openai", "xai", "openrouter", "ollama"]
+    provider_slug: str | None = None
+    api_key: str | None = None
+    api_base: str | None = None
 
 
 class TestModelRequest(BaseModel):
@@ -273,6 +307,8 @@ class OnboardTelegramRequest(BaseModel):
     admin_channels: list[str] = Field(default_factory=list)
     public_channels: list[str] = Field(default_factory=list)
     register_webhook: bool = False
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class ProbeIntegrationRequest(BaseModel):
@@ -289,6 +325,8 @@ class StartGoogleOAuthRequest(BaseModel):
     login_hint: str | None = Field(default=None, max_length=200)
     scope_groups: list[str] = Field(default_factory=lambda: ["gmail_read", "calendar"])
     extra_scopes: list[str] = Field(default_factory=list)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class CompleteGoogleOAuthRequest(BaseModel):
@@ -302,6 +340,8 @@ class OnboardLinkedInRequest(BaseModel):
     linkedin_version: str = Field(default="202611", min_length=1, max_length=50)
     slug: str | None = Field(default=None, max_length=100)
     display_name: str | None = Field(default=None, max_length=150)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class PublishLinkedInPostRequest(BaseModel):
@@ -317,12 +357,16 @@ class OnboardWebhookRequest(BaseModel):
     signing_secret: str | None = Field(default=None, max_length=500)
     event_type: str = Field(default="webhook.received", min_length=3, max_length=80)
     target_collection: str | None = Field(default="webhook_events", max_length=100)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class OnboardTelegramPublicMonitorRequest(BaseModel):
     channel_handle: str = Field(min_length=2, max_length=250)
     slug: str | None = Field(default=None, max_length=100)
     display_name: str | None = Field(default=None, max_length=150)
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
     sync_immediately: bool = True
 
 
@@ -342,7 +386,7 @@ class FetchWebpageRequest(BaseModel):
 
 class DraftBotSpecRequest(BaseModel):
     prompt: str = Field(min_length=4, max_length=4000)
-    preferred_runtime: Literal["auto", "api", "desktop"] = "auto"
+    preferred_runtime: Literal["auto", "api", "sandbox", "desktop"] = "auto"
     preferred_rbac: Literal["auto", "internal", "draft", "execute"] = "auto"
     preferred_model: str | None = None
     linked_accounts: list[str] | None = None
@@ -361,12 +405,21 @@ class UpdatePageRequest(BaseModel):
     allowed_collections: list[str] | None = None
     owner_bot_slug: str | None = Field(default=None, min_length=1, max_length=120)
     pinned: bool | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class PageCollectionQueryRequest(BaseModel):
     collection: str = Field(min_length=1, max_length=100)
     query: str | None = None
     limit: int = Field(default=50, ge=1, le=200)
+
+
+class PageSqlQueryRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=8000)
+    params: list[Any] = Field(default_factory=list)
+    row_cap: int = Field(default=500, ge=1, le=500)
+    engine: Literal["auto", "duckdb", "sqlite"] = "auto"
 
 
 class DesktopBrowseRequest(BaseModel):
@@ -435,6 +488,10 @@ class VaultSecretUpsertRequest(BaseModel):
     url: str = Field(default="", max_length=2000)
     secrets: dict[str, str] = Field(default_factory=dict)
     allowed_bots: list[str] | None = None
+    trusted_command_prefixes: list[str] | None = None
+    clear_fields: list[str] | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
 
 
 class VaultSecretUpdateRequest(BaseModel):
@@ -445,3 +502,99 @@ class VaultSecretUpdateRequest(BaseModel):
     url: str | None = Field(default=None, max_length=2000)
     secrets: dict[str, str] | None = None
     allowed_bots: list[str] | None = None
+    trusted_command_prefixes: list[str] | None = None
+    clear_fields: list[str] | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
+
+
+class VaultBulkSSHRequest(BaseModel):
+    name_prefix: str = Field(min_length=1, max_length=100)
+    hosts_text: str = Field(min_length=1, max_length=10000)
+    port: str = Field(default="22", max_length=20)
+    secrets: dict[str, str] = Field(default_factory=dict)
+    allowed_bots: list[str] | None = None
+    visibility: Literal["private", "team", "shared"] | None = None
+    allowed_groups: list[str] | None = None
+
+
+class VaultResetHostKeyRequest(BaseModel):
+    host_port: str | None = Field(default=None, max_length=320)
+
+
+class SSHSessionControlRequest(BaseModel):
+    operation: Literal["pause", "resume", "terminate", "pin", "unpin"]
+    reason: str = Field(default="", max_length=500)
+
+
+class SSHAuditSettingsUpdateRequest(BaseModel):
+    retention_hours: int = Field(ge=1, le=8760)
+
+
+class ChatRetentionSettingsUpdateRequest(BaseModel):
+    retention_days: int = Field(ge=0, le=3650)
+    prune_now: bool = False
+
+
+class EditLastMessageRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20000)
+    async_mode: bool = True
+
+
+class AuthBootstrapRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    display_name: str = Field(default="", max_length=120)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AuthChangePasswordRequest(BaseModel):
+    current_password: str | None = Field(default=None, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AdminCreateUserRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    display_name: str = Field(default="", max_length=120)
+    role: Literal["admin", "member"] = "member"
+    auth_methods: list[Literal["password", "google"]] = Field(
+        default_factory=lambda: ["password", "google"]
+    )
+    password: str | None = Field(default=None, max_length=128)
+    must_change_password: bool = True
+    group_slugs: list[str] = Field(default_factory=list)
+    max_active_desktops: int | None = Field(default=None, ge=0, le=64)
+    max_active_sandboxes: int | None = Field(default=None, ge=0, le=64)
+
+
+class AdminUpdateUserRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=120)
+    role: Literal["admin", "member"] | None = None
+    active: bool | None = None
+    auth_methods: list[Literal["password", "google"]] | None = None
+    group_slugs: list[str] | None = None
+    max_active_desktops: int | None = Field(default=None, ge=0, le=64)
+    max_active_sandboxes: int | None = Field(default=None, ge=0, le=64)
+    clear_quota_overrides: bool = False
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
+    must_change_password: bool = True
+
+
+class CreateTeamGroupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    slug: str | None = Field(default=None, max_length=80)
+    description: str = Field(default="", max_length=500)
+    member_emails: list[str] = Field(default_factory=list)
+
+
+class UpdateTeamGroupRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+    member_emails: list[str] | None = None

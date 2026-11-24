@@ -453,6 +453,201 @@ class TestConversationalOnboardingAndMultiRoutine(unittest.TestCase):
                     self.assertEqual(trig_kwargs["day_of_week"], "mon-fri")
                     asyncio.run(sched.stop())
 
+    def test_oneshot_routine_autocompletes_run_routine_ssh_tools_sync_and_linked_accounts_merge(self) -> None:
+        from datetime import UTC, datetime
+
+        from argo_core.ssh.manager import is_readonly_ssh_command
+
+        # 1. Read-only modinfo vs mutating ethtool guard
+        self.assertTrue(is_readonly_ssh_command("modinfo r8152"))
+        self.assertFalse(is_readonly_ssh_command("ethtool -K eth0 tso off"))
+
+        # 2. parse_routine_schedule supports absolute and relative one-shot schedules
+        parsed_dubai = parse_routine_schedule("Once at 2026-11-20 21:00", "Asia/Dubai")
+        self.assertIsNotNone(parsed_dubai)
+        assert parsed_dubai is not None
+        self.assertEqual(parsed_dubai["kind"], "date")
+        self.assertEqual(parsed_dubai["run_at"], "2026-11-20T21:00:00+04:00")
+
+        parsed_rel = parse_routine_schedule(
+            "In 30m",
+            "UTC",
+            now_utc=datetime(2026, 11, 20, 14, 0, tzinfo=UTC),
+        )
+        self.assertIsNotNone(parsed_rel)
+        assert parsed_rel is not None
+        self.assertEqual(parsed_rel["kind"], "date")
+        self.assertEqual(parsed_rel["normalized"], "Once at 2026-11-20 14:30")
+
+        captured_sys_prompts: list[str] = []
+        captured_user_envs: list[dict[str, Any]] = []
+        scheduled_runs: list[str] = []
+
+        async def test_llm(req: LLMRequest) -> dict[str, Any]:
+            captured_sys_prompts.append(str(req.system_prompt or ""))
+            env = json.loads(req.user_prompt)
+            captured_user_envs.append(env)
+            trig = str(env.get("trigger_type") or "")
+            if trig.startswith("cron:"):
+                scheduled_runs.append(trig)
+                return {"text": json.dumps({"summary": "One-shot check executed.", "actions": []})}
+            obs = list(env.get("tool_observations") or [])
+            user_txt = str((env.get("trigger_payload") or {}).get("input_text") or "")
+            if "mode:oneshot_and_link" in user_txt and not obs:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Scheduled one-shot routine and requested @tg-ops access.",
+                            "actions": [
+                                {
+                                    "type": "configure_routine",
+                                    "operation": "upsert",
+                                    "label": "Tonight Driver Check",
+                                    "schedule": "In 30m",
+                                    "timezone": "Asia/Dubai",
+                                    "prompt": "Inspect nodes 192.168.0.69 and post summary",
+                                    "skill_slugs": ["driver-skill"],
+                                },
+                                {
+                                    "type": "update_self_config",
+                                    "linked_accounts": ["tg-ops"],
+                                },
+                            ],
+                        }
+                    )
+                }
+            if "mode:run_routine_chat" in user_txt:
+                if not obs:
+                    return {
+                        "text": json.dumps(
+                            {
+                                "summary": "",
+                                "actions": [{"type": "run_routine", "routine_id": "Tonight Driver Check"}],
+                            }
+                        )
+                    }
+                loaded = obs[-1]
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": (
+                                f"Ran `{loaded.get('label')}` with prompt `{loaded.get('prompt')}` "
+                                f"and skill `{loaded.get('skills', [{}])[0].get('instructions')}`."
+                            ),
+                            "actions": [],
+                        }
+                    )
+                }
+            return {"text": json.dumps({"summary": "Done.", "actions": []})}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(tmp, llm_transport=test_llm)
+            with TestClient(app) as client:
+                app.state.repo.upsert_integration(
+                    slug="gmail-work",
+                    provider="google",
+                    display_name="Work Gmail",
+                    account_identifier="ops@example.com",
+                    secrets={"access_token": "tok-g"},
+                )
+                app.state.repo.upsert_integration(
+                    slug="tg-ops",
+                    provider="telegram",
+                    display_name="Ops Telegram",
+                    account_identifier="@tg_ops",
+                    secrets={"bot_token": "tok-tg", "operator_chat_id": "12345"},
+                )
+                app.state.repo.upsert_skill(
+                    name="Driver Skill",
+                    skill_slug="driver-skill",
+                    description="Check r8152 driver",
+                    instructions="Always run modinfo r8152 first.",
+                    scope_slug="*",
+                )
+                created_bot = client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Ops One Shot",
+                        "slug": "ops-one-shot",
+                        "role": "Manage cluster diagnostics",
+                        "runtime": "desktop",
+                        "outbound_rbac": "draft",
+                        "linked_accounts": ["gmail-work"],
+                        "tools": [{"type": "builtin", "name": "desktop_exec"}],
+                    },
+                )
+                self.assertEqual(created_bot.status_code, 201, created_bot.text)
+                client.post(
+                    "/api/vault",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Cluster SSH",
+                        "slug": "cluster-ssh",
+                        "secret_type": "ssh",
+                        "host": "",
+                        "port": "22",
+                        "secrets": {"username": "root", "password": "OneShotPassword123!"},
+                        "allowed_bots": ["ops-one-shot"],
+                    },
+                )
+
+                # Turn 1: Virtual Desktop + SSH Vault sees ssh_exec in Permitted tools, configures In 30m one-shot & requests tg-ops
+                res1 = client.post(
+                    "/api/bots/ops-one-shot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "mode:oneshot_and_link on 192.168.0.69"},
+                )
+                self.assertEqual(res1.status_code, 200, res1.text)
+                self.assertTrue(captured_sys_prompts)
+                self.assertIn("ssh_exec (vault-ssh)", captured_sys_prompts[-1])
+                self.assertIn("linked_accounts", captured_sys_prompts[-1])
+                self.assertTrue(captured_user_envs[-1].get("current_time_utc"))
+
+                bot_mid = client.get("/api/bots/ops-one-shot", headers=self._sso_headers()).json()
+                one_shot_rtn = next(
+                    r for r in bot_mid["routines"] if r.get("label") == "Tonight Driver Check"
+                )
+                self.assertEqual(one_shot_rtn["type"], "once")
+                self.assertTrue(one_shot_rtn["one_shot"])
+                self.assertRegex(one_shot_rtn["schedule"], r"^Once at \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+                self.assertTrue(one_shot_rtn["enabled"])
+
+                # Approve linked_accounts escalation -> merges tg-ops with existing gmail-work
+                pending = client.get("/api/approvals?tab=pending", headers=self._sso_headers()).json()
+                cfg_aprs = [a for a in pending if a["action_type"] == "update_bot_config"]
+                self.assertEqual(len(cfg_aprs), 1)
+                apr_res = client.post(
+                    f"/api/approvals/{cfg_aprs[0]['id']}/resolve",
+                    headers=self._sso_headers(),
+                    json={"action": "approve"},
+                )
+                self.assertEqual(apr_res.status_code, 200, apr_res.text)
+                bot_linked = client.get("/api/bots/ops-one-shot", headers=self._sso_headers()).json()
+                self.assertEqual(sorted(bot_linked["linked_accounts"]), ["gmail-work", "tg-ops"])
+
+                # Turn 2: chat prompt exposes bot_routines and run_routine loads prompt + skill_slugs for immediate test
+                res2 = client.post(
+                    "/api/bots/ops-one-shot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "mode:run_routine_chat"},
+                ).json()["result"]
+                self.assertIn("bot_routines", captured_user_envs[1])
+                self.assertIn("Inspect nodes 192.168.0.69", res2["summary"])
+                self.assertIn("Always run modinfo r8152 first.", res2["summary"])
+
+                # Fire one-shot routine via BotScheduler -> runs once and auto-disables with completed_at
+                sched = BotScheduler(repo=app.state.repo, runner=app.state.bot_runner)
+                asyncio.run(sched._run_scheduled_routine("ops-one-shot", one_shot_rtn["id"]))
+                self.assertEqual(scheduled_runs, [f"cron:{one_shot_rtn['id']}"])
+                bot_after_once = client.get("/api/bots/ops-one-shot", headers=self._sso_headers()).json()
+                done_rtn = next(
+                    r for r in bot_after_once["routines"] if r["id"] == one_shot_rtn["id"]
+                )
+                self.assertFalse(done_rtn["enabled"])
+                self.assertTrue(done_rtn["one_shot"])
+                self.assertTrue(done_rtn.get("completed_at"))
+
 
 if __name__ == "__main__":
     unittest.main()

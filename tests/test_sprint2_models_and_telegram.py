@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import time
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,10 +27,12 @@ from argo_core.bus.valkey_bus import EventBus
 from argo_core.config import ArgoSettings
 from argo_core.connectors.telegram_bot import (
     STOP_IDLE_DESKTOPS_CALLBACK,
+    AiogramTelegramTransport,
     TelegramBotService,
     TelegramConfigError,
     TelegramIntegrationError,
     build_inline_keyboard,
+    format_telegram_html,
     validate_callback_data,
 )
 from argo_core.db.repositories import ArgoRepository
@@ -970,6 +974,376 @@ class TestSprint2RouterAndTelegram(unittest.TestCase):
             self.assertIn(
                 "Custom bot status reply for chat query: Give me the latest bot job report",
                 tg_transport.sent_messages[-1]["text"],
+            )
+
+    def test_telegram_html_markdown_formatting_and_parse_mode_fallback(self) -> None:
+        screenshot_markdown = (
+            "📢 **Open Source & Infrastructure Update: Kubernetes Deprecating kube-proxy IPVS Mode**\n\n"
+            "• **Project**: Kubernetes (SIG Network)\n"
+            "• **Context**: Official roadmap update on `kube-proxy` datapaths.\n"
+            "• **Technical Summary**: Kubernetes is formally scheduling the removal of the IPVS backend from "
+            "`kube-proxy`. While IPVS originally provided significant scalability advantages over legacy iptables, "
+            "modern developments—notably the production maturation of the `nftables` proxy backend and standard "
+            "adoption of eBPF-based CNIs (Cilium, Calico eBPF)—have rendered IPVS maintenance unsustainable. "
+            "Enterprise cluster operators running IPVS should evaluate migration paths toward nftables or eBPF dataplanes.\n"
+            "• **Reference**: https://kubernetes.io/blog/2026/11/16/ipvs-removal/"
+        )
+        formatted_screenshot = format_telegram_html(screenshot_markdown)
+        self.assertIn(
+            "📢 <b>Open Source &amp; Infrastructure Update: Kubernetes Deprecating kube-proxy IPVS Mode</b>",
+            formatted_screenshot,
+        )
+        self.assertIn("• <b>Project</b>: Kubernetes (SIG Network)", formatted_screenshot)
+        self.assertIn("<code>kube-proxy</code>", formatted_screenshot)
+        self.assertIn("<code>nftables</code>", formatted_screenshot)
+        self.assertIn(
+            "• <b>Reference</b>: https://kubernetes.io/blog/2026/11/16/ipvs-removal/",
+            formatted_screenshot,
+        )
+        self.assertNotIn("**", formatted_screenshot)
+        self.assertNotIn("`kube-proxy`", formatted_screenshot)
+
+        rich_markdown = "\n".join(
+            [
+                "## Cluster **Summary** ###",
+                "```python",
+                "x = a < b and c & d",
+                "```",
+                "Docs: [Kubernetes **IPVS**](https://kubernetes.io/docs/kube_proxy/?a=1&b=2)",
+                "Link: (https://example.com/path_with_underscores/run?x=1&y=2).",
+                "Vars: snake_case_name, _italic text_, *star italic*, ~~old~~, __under__, ||secret||",
+                "Alert: RAM <80% -> ok & 2 > 1",
+                "> Quote line 1 with **bold**",
+                "> Quote line 2 with `kubectl get svc`",
+                "---",
+                "- First **bullet**",
+                "* Second _bullet_",
+                "<b>Preserved</b> and <script>alert(1)</script>",
+            ]
+        )
+        formatted_rich = format_telegram_html(rich_markdown)
+        self.assertIn("<b>Cluster Summary</b>", formatted_rich)
+        self.assertIn(
+            '<pre><code class="language-python">x = a &lt; b and c &amp; d</code></pre>',
+            formatted_rich,
+        )
+        self.assertIn(
+            '<a href="https://kubernetes.io/docs/kube_proxy/?a=1&amp;b=2">Kubernetes <b>IPVS</b></a>',
+            formatted_rich,
+        )
+        self.assertIn(
+            "(https://example.com/path_with_underscores/run?x=1&amp;y=2).",
+            formatted_rich,
+        )
+        self.assertIn("Vars: snake_case_name,", formatted_rich)
+        self.assertIn("<i>italic text</i>", formatted_rich)
+        self.assertIn("<i>star italic</i>", formatted_rich)
+        self.assertIn("<s>old</s>", formatted_rich)
+        self.assertIn("<u>under</u>", formatted_rich)
+        self.assertIn("<tg-spoiler>secret</tg-spoiler>", formatted_rich)
+        self.assertIn("Alert: RAM &lt;80% -&gt; ok &amp; 2 &gt; 1", formatted_rich)
+        self.assertIn(
+            "<blockquote>Quote line 1 with <b>bold</b>\nQuote line 2 with <code>kubectl get svc</code></blockquote>",
+            formatted_rich,
+        )
+        self.assertIn("──────────", formatted_rich)
+        self.assertIn("• First <b>bullet</b>", formatted_rich)
+        self.assertIn("• Second <i>bullet</i>", formatted_rich)
+        self.assertIn("<b>Preserved</b> and &lt;script&gt;alert(1)&lt;/script&gt;", formatted_rich)
+
+        oversized = ("**word** " * 600).strip()
+        bounded_html = format_telegram_html(oversized)
+        self.assertLessEqual(len(bounded_html), 4096)
+        self.assertEqual(bounded_html.count("<b>"), bounded_html.count("</b>"))
+
+        transport = AiogramTelegramTransport()
+        bot_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ12345"
+
+        # Verify stdlib HTTPS transport branch sets parse_mode="HTML" and retries without parse_mode on entity errors.
+        recorded_http_calls: list[tuple[str, dict[str, Any]]] = []
+        fail_next_with_entity_error = {"active": False}
+
+        class _FakeHTTPResponse:
+            def __init__(self, body: dict[str, Any]) -> None:
+                self._raw = json.dumps(body).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._raw
+
+            def __enter__(self) -> "_FakeHTTPResponse":
+                return self
+
+            def __exit__(self, *_args: Any) -> bool:
+                return False
+
+        def _fake_urlopen(req: Any, timeout: float = 15) -> _FakeHTTPResponse:  # noqa: ARG001
+            method = req.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(req.data.decode("utf-8"))
+            recorded_http_calls.append((method, payload))
+            if fail_next_with_entity_error["active"]:
+                fail_next_with_entity_error["active"] = False
+                err_payload = json.dumps(
+                    {
+                        "ok": False,
+                        "description": "Bad Request: can't parse entities: Can't find end tag",
+                    }
+                ).encode("utf-8")
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    400,
+                    "Bad Request",
+                    None,
+                    io.BytesIO(err_payload),
+                )
+            return _FakeHTTPResponse(
+                {"ok": True, "result": {"message_id": 77, "chat": {"id": 998877}}}
+            )
+
+        with (
+            patch.dict(sys.modules, {"aiogram": None, "aiogram.types": None}),
+            patch("urllib.request.urlopen", side_effect=_fake_urlopen),
+        ):
+            sent = asyncio.run(
+                transport.send_message(bot_token, chat_id=998877, text="**Hello** `world`")
+            )
+            self.assertEqual(sent["message_id"], 77)
+            self.assertEqual(recorded_http_calls[-1][0], "sendMessage")
+            self.assertEqual(recorded_http_calls[-1][1]["parse_mode"], "HTML")
+            self.assertEqual(recorded_http_calls[-1][1]["text"], "<b>Hello</b> <code>world</code>")
+
+            edited = asyncio.run(
+                transport.edit_message_text(
+                    bot_token, chat_id=998877, message_id=77, text="Updated **card**"
+                )
+            )
+            self.assertEqual(edited["message_id"], 77)
+            self.assertEqual(recorded_http_calls[-1][0], "editMessageText")
+            self.assertEqual(recorded_http_calls[-1][1]["parse_mode"], "HTML")
+            self.assertEqual(recorded_http_calls[-1][1]["text"], "Updated <b>card</b>")
+
+            fail_next_with_entity_error["active"] = True
+            retried_send = asyncio.run(
+                transport.send_message(bot_token, chat_id=998877, text="Plain **fallback** text")
+            )
+            self.assertEqual(retried_send["message_id"], 77)
+            self.assertEqual(recorded_http_calls[-2][1].get("parse_mode"), "HTML")
+            self.assertNotIn("parse_mode", recorded_http_calls[-1][1])
+            self.assertEqual(recorded_http_calls[-1][1]["text"], "Plain **fallback** text")
+
+            fail_next_with_entity_error["active"] = True
+            retried_edit = asyncio.run(
+                transport.edit_message_text(
+                    bot_token, chat_id=998877, message_id=77, text="Edit **fallback** text"
+                )
+            )
+            self.assertEqual(retried_edit["message_id"], 77)
+            self.assertEqual(recorded_http_calls[-2][1].get("parse_mode"), "HTML")
+            self.assertNotIn("parse_mode", recorded_http_calls[-1][1])
+            self.assertEqual(recorded_http_calls[-1][1]["text"], "Edit **fallback** text")
+
+        # Verify aiogram.Bot branch passes parse_mode="HTML" and falls back cleanly on entity errors.
+        aiogram_calls: list[tuple[str, dict[str, Any]]] = []
+        fail_aiogram_entity = {"active": False}
+
+        class _FakeAiogramBot:
+            def __init__(self, *, token: str) -> None:
+                self.token = token
+
+            async def __aenter__(self) -> "_FakeAiogramBot":
+                return self
+
+            async def __aexit__(self, *_args: Any) -> bool:
+                return False
+
+            async def send_message(self, **kwargs: Any) -> Any:
+                aiogram_calls.append(("send_message", dict(kwargs)))
+                if fail_aiogram_entity["active"]:
+                    fail_aiogram_entity["active"] = False
+                    raise RuntimeError("TelegramBadRequest: can't parse entities: unsupported tag")
+                return SimpleNamespace(message_id=88, chat=SimpleNamespace(id=998877))
+
+            async def edit_message_text(self, **kwargs: Any) -> Any:
+                aiogram_calls.append(("edit_message_text", dict(kwargs)))
+                if fail_aiogram_entity["active"]:
+                    fail_aiogram_entity["active"] = False
+                    raise RuntimeError("TelegramBadRequest: can't parse entities: unsupported tag")
+                return SimpleNamespace(message_id=88)
+
+        fake_aiogram = types.ModuleType("aiogram")
+        fake_aiogram.Bot = _FakeAiogramBot  # type: ignore[attr-defined]
+        fake_aiogram_types = types.ModuleType("aiogram.types")
+
+        class _FakeInlineKeyboardMarkup:
+            @classmethod
+            def model_validate(cls, data: Any) -> Any:
+                return data
+
+        fake_aiogram_types.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup  # type: ignore[attr-defined]
+
+        with patch.dict(
+            sys.modules,
+            {"aiogram": fake_aiogram, "aiogram.types": fake_aiogram_types},
+        ):
+            aio_sent = asyncio.run(
+                transport.send_message(bot_token, chat_id=998877, text="**Aiogram** `check`")
+            )
+            self.assertEqual(aio_sent["message_id"], 88)
+            self.assertEqual(aiogram_calls[-1][0], "send_message")
+            self.assertEqual(aiogram_calls[-1][1]["parse_mode"], "HTML")
+            self.assertEqual(aiogram_calls[-1][1]["text"], "<b>Aiogram</b> <code>check</code>")
+
+            aio_edited = asyncio.run(
+                transport.edit_message_text(
+                    bot_token, chat_id=998877, message_id=88, text="**Aiogram** edited"
+                )
+            )
+            self.assertEqual(aio_edited["message_id"], 88)
+            self.assertEqual(aiogram_calls[-1][0], "edit_message_text")
+            self.assertEqual(aiogram_calls[-1][1]["parse_mode"], "HTML")
+            self.assertEqual(aiogram_calls[-1][1]["text"], "<b>Aiogram</b> edited")
+
+            fail_aiogram_entity["active"] = True
+            asyncio.run(
+                transport.send_message(bot_token, chat_id=998877, text="Aiogram **fallback**")
+            )
+            self.assertEqual(aiogram_calls[-2][1].get("parse_mode"), "HTML")
+            self.assertNotIn("parse_mode", aiogram_calls[-1][1])
+            self.assertEqual(aiogram_calls[-1][1]["text"], "Aiogram **fallback**")
+
+            fail_aiogram_entity["active"] = True
+            asyncio.run(
+                transport.edit_message_text(
+                    bot_token, chat_id=998877, message_id=88, text="Aiogram edit **fallback**"
+                )
+            )
+            self.assertEqual(aiogram_calls[-2][1].get("parse_mode"), "HTML")
+            self.assertNotIn("parse_mode", aiogram_calls[-1][1])
+            self.assertEqual(aiogram_calls[-1][1]["text"], "Aiogram edit **fallback**")
+
+    def test_model_discovery_custom_pricing_and_per_model_attribution(self) -> None:
+        from unittest.mock import AsyncMock, patch
+        from argo_core.llm.router import estimate_cost_usd, resolve_model_pricing
+
+        # Verify custom pricing override takes precedence over built-in catalog.
+        self.assertEqual(resolve_model_pricing("google:gemini-4-argon")["source"], "catalog")
+        self.assertEqual(
+            resolve_model_pricing("google:gemini-4-argon", custom_input=2.0, custom_output=8.0),
+            {"input_per_million": 2.0, "output_per_million": 8.0, "source": "custom"},
+        )
+        self.assertAlmostEqual(
+            estimate_cost_usd(
+                "google:gemini-4-argon",
+                500_000,
+                250_000,
+                input_price_per_million=2.0,
+                output_price_per_million=8.0,
+            ),
+            3.0,
+            places=5,
+        )
+
+        async def fake_transport(req):
+            return {"text": f"ok:{req.model_id}", "input_tokens": 1000, "output_tokens": 500}
+
+        with TestClient(
+            create_app(
+                settings=self._make_settings(),
+                llm_transport=fake_transport,
+            )
+        ) as client:
+            # Save Argon with custom input/output pricing.
+            save_res = client.post(
+                "/api/models",
+                json={
+                    "slug": "google_gemini_argon",
+                    "provider_type": "google",
+                    "model_id": "google:gemini-4-argon",
+                    "api_key": "AIzaSyTestKey1234567890",
+                    "input_price_per_million": 2.0,
+                    "output_price_per_million": 8.0,
+                },
+            )
+            self.assertEqual(save_res.status_code, 201)
+            saved = save_res.json()
+            self.assertEqual(saved["pricing_source"], "custom")
+            self.assertEqual(saved["effective_input_price_per_million"], 2.0)
+            self.assertEqual(saved["effective_output_price_per_million"], 8.0)
+
+            # Discover endpoint forwards stored provider key when api_key is omitted.
+            fake_discovery = {
+                "provider_type": "google",
+                "models": [
+                    {
+                        "model_id": "google:gemini-4-argon",
+                        "display_name": "Gemini 4 Argon",
+                        "context_window": 1048576,
+                        "input_price_per_million": 1.25,
+                        "output_price_per_million": 5.0,
+                        "pricing_source": "catalog",
+                    }
+                ],
+                "pricing_mode": "estimated",
+                "source_note": "Live list",
+            }
+            with patch(
+                "argo_core.api.routes.discover_provider_models",
+                new=AsyncMock(return_value=fake_discovery),
+            ) as mock_disc:
+                disc_res = client.post(
+                    "/api/models/discover",
+                    json={"provider_type": "google", "provider_slug": "google_gemini_argon"},
+                )
+                self.assertEqual(disc_res.status_code, 200)
+                self.assertEqual(disc_res.json()["models"][0]["model_id"], "google:gemini-4-argon")
+                mock_disc.assert_awaited_once()
+                self.assertEqual(mock_disc.call_args.kwargs["api_key"], "AIzaSyTestKey1234567890")
+
+            # Seed runs across two models (including a deleted/system slug on Argon).
+            repo = client.app.state.repo
+            bot = client.post(
+                "/api/bots",
+                json={"name": "Flash Bot", "role": "Triage", "model": "google:gemini-3.8-flash"},
+            ).json()
+            repo.record_bot_run(
+                correlation_id="corr_f1",
+                bot_slug=bot["slug"],
+                trigger_type="manual",
+                hop_count=1,
+                llm_model_used="google:gemini-3.8-flash",
+                input_tokens=10000,
+                output_tokens=2000,
+                estimated_cost_usd=0.0027,
+                status="success",
+                summary="Flash run",
+            )
+            repo.record_bot_run(
+                correlation_id="corr_a1",
+                bot_slug="deleted-architect",
+                trigger_type="manual",
+                hop_count=1,
+                llm_model_used="google:gemini-4-argon",
+                input_tokens=100000,
+                output_tokens=20000,
+                estimated_cost_usd=0.225,
+                status="success",
+                summary="Argon run",
+            )
+
+            all_models = client.get("/api/models").json()
+            by_slug = {b["bot_slug"]: b for b in all_models["usage_by_bot"]}
+            self.assertTrue(by_slug[bot["slug"]]["exists"])
+            self.assertFalse(by_slug["deleted-architect"]["exists"])
+            self.assertEqual(
+                by_slug["deleted-architect"]["models_used"][0]["model_id"],
+                "google:gemini-4-argon",
+            )
+
+            argon_only = client.get("/api/models?model_id=google:gemini-4-argon").json()
+            self.assertEqual(len(argon_only["recent_runs"]), 1)
+            self.assertEqual(argon_only["recent_runs"][0]["bot_slug"], "deleted-architect")
+            self.assertEqual(
+                argon_only["recent_runs"][0]["llm_model_used"],
+                "google:gemini-4-argon",
             )
 
 

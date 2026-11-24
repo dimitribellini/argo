@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+from argo_core import resolve_version_info
 from argo_core.bus.valkey_bus import EventBus, HopLimitExceededError
 from argo_core.config import ArgoSettings
 from argo_core.db.repositories import ArgoRepository
@@ -226,6 +228,16 @@ class TestSprint1CoreAPI(unittest.TestCase):
 
     def test_atomic_approval_lock_and_style_memory(self) -> None:
         with self._make_client() as client:
+            conn_res = client.post(
+                "/api/integrations",
+                json={
+                    "slug": "tg_community",
+                    "provider": "webhook",
+                    "display_name": "Community Publish Channel",
+                    "secrets": {},
+                },
+            )
+            self.assertEqual(conn_res.status_code, 201, conn_res.text)
             created = client.post(
                 "/api/approvals",
                 json={
@@ -254,7 +266,7 @@ class TestSprint1CoreAPI(unittest.TestCase):
                 },
             )
             self.assertEqual(first.status_code, 200)
-            self.assertEqual(first.json()["status"], "approved")
+            self.assertEqual(first.json()["status"], "executed")
 
             second = client.post(
                 f"/api/approvals/{approval_id}/resolve",
@@ -334,6 +346,41 @@ class TestSprint1CoreAPI(unittest.TestCase):
             self.assertEqual(res.status_code, 200)
             self.assertIn("text/html", res.headers["content-type"])
             self.assertIn('<div id="root"></div>', res.text)
+
+    def test_release_version_resolution_and_summary_exposure(self) -> None:
+        self.assertEqual(
+            resolve_version_info(env={"APP_VERSION": "v0.1.4", "APP_COMMIT_SHA": "997378e315d7"}),
+            ("0.1.4", "997378e"),
+        )
+        self.assertEqual(
+            resolve_version_info(env={"APP_VERSION": "v0.1.0-4-g997378e"}),
+            ("0.1.4", "997378e"),
+        )
+        self.assertEqual(
+            resolve_version_info(env={}, repo_root=Path("/nonexistent-no-git")),
+            ("0.1.0", ""),
+        )
+
+        live_version, live_commit = resolve_version_info(env={}, repo_root=REPO_ROOT)
+        self.assertIsNotNone(re.match(r"^\d+\.\d+\.\d+$", live_version))
+        self.assertIsNotNone(re.match(r"^[0-9a-f]{7}$", live_commit))
+
+        with self._make_client() as client:
+            health = client.get("/api/health")
+            self.assertEqual(health.status_code, 200)
+            health_body = health.json()
+            self.assertIn("version", health_body)
+            self.assertIn("commit_sha", health_body)
+            self.assertEqual(health_body["version"], live_version)
+            self.assertEqual(health_body["commit_sha"], live_commit)
+
+            summary = client.get("/api/workspace/summary")
+            self.assertEqual(summary.status_code, 200)
+            summary_body = summary.json()
+            self.assertIn("version", summary_body)
+            self.assertIn("commit_sha", summary_body)
+            self.assertEqual(summary_body["version"], live_version)
+            self.assertEqual(summary_body["commit_sha"], live_commit)
 
 
 if __name__ == "__main__":

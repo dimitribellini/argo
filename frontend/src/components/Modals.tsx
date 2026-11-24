@@ -9,11 +9,15 @@ import {
   Square,
   Video,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { api } from "../api";
+import { useIsMobile } from "../hooks/useIsMobile";
 import type {
   ApprovalItem,
   BotDraftResponse,
+  SsoPrincipal,
   BotRecord,
   CollectionRecord,
   DebugOverviewResponse,
@@ -21,15 +25,18 @@ import type {
   DesktopInfo,
   DesktopRecordingStatus,
   DesktopRecordingStopResponse,
+  DiscoveredProviderModel,
   GoogleAuthorizeResponse,
   GoogleWizardConfig,
   IntegrationAccount,
   ModelProvider,
-  TeamPackRecord,
+  ResourceVisibility,
+  TeamGroupRecord,
   WebhookOnboardResponse,
 } from "../types";
 import { computeWordDiff, friendlyModelName } from "../utils/format";
 import { BOT_ICON_OPTIONS, BotAvatar } from "./BotAvatar";
+import { VisibilityPicker } from "./VisibilityPicker";
 
 export type NewBotModalTab = "quick" | "builder" | "room" | "packs";
 
@@ -37,7 +44,7 @@ export type ActiveModal =
   | { type: "new-bot"; initialTab?: NewBotModalTab }
   | { type: "new-page" }
   | { type: "edit-approval"; item: ApprovalItem }
-  | { type: "new-integration" }
+  | { type: "new-integration"; defaultProvider?: IntegrationAccount["provider"] }
   | { type: "google-wizard"; reauthAccount?: IntegrationAccount }
   | { type: "telegram-onboard" }
   | { type: "linkedin-onboard" }
@@ -73,7 +80,7 @@ interface ModalsProps {
   onClearDebug: () => Promise<unknown>;
   onDraftBotSpec: (payload: {
     prompt: string;
-    preferred_runtime?: "auto" | "api" | "desktop";
+    preferred_runtime?: "auto" | "api" | "sandbox" | "desktop";
     preferred_rbac?: "auto" | "internal" | "draft" | "execute";
     preferred_model?: string;
     linked_accounts?: string[];
@@ -82,7 +89,7 @@ interface ModalsProps {
     name: string;
     role?: string;
     role_prompt?: string;
-    runtime: "api" | "desktop";
+    runtime: "api" | "sandbox" | "desktop";
     outbound_rbac: "internal" | "draft" | "execute";
     model: string;
     daily_cap: number;
@@ -96,6 +103,8 @@ interface ModalsProps {
     section?: string;
     handoff_bot_slug?: string;
     onboarding_mode?: "configured" | "interview";
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onCreateRoom?: (payload: {
     title: string;
@@ -105,6 +114,8 @@ interface ModalsProps {
     ask_before_bot_handoff?: boolean;
     max_bot_turns_per_message?: number;
     section?: string;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onImportTeamPack?: (payload: {
     pack: Record<string, unknown>;
@@ -119,6 +130,8 @@ interface ModalsProps {
     writerName: string;
     writerStyle: string;
     writerAccounts: string[];
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onImportBlueprint?: (payload: {
     blueprint: Record<string, unknown>;
@@ -130,18 +143,23 @@ interface ModalsProps {
     render_mode: "declarative_json" | "sandboxed_html";
     content_payload?: string;
     allowed_collections?: string[];
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onGeneratePage?: (payload: {
     prompt: string;
     title?: string;
     owner_bot_slug?: string;
     allowed_collections?: string[];
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
     template_key?:
       | "auto"
       | "live_operations_map"
       | "bot_hub_board"
       | "collection_analytics"
-      | "interactive_playground";
+      | "interactive_playground"
+      | "data_dashboard";
   }) => Promise<void>;
   onStartTakeover: (slug: string) => Promise<DesktopInfo>;
   onReleaseTakeover: (slug: string) => Promise<DesktopInfo>;
@@ -158,6 +176,8 @@ interface ModalsProps {
     account_identifier?: string;
     scopes?: string[];
     secrets?: Record<string, unknown>;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onOnboardTelegram: (payload: {
     bot_token: string;
@@ -167,6 +187,8 @@ interface ModalsProps {
     admin_channels?: string[];
     public_channels?: string[];
     register_webhook?: boolean;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onLoadGoogleWizardConfig: () => Promise<GoogleWizardConfig>;
   onStartGoogleOAuth: (payload: {
@@ -178,6 +200,8 @@ interface ModalsProps {
     display_name?: string;
     login_hint?: string;
     scope_groups?: string[];
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<GoogleAuthorizeResponse>;
   onCompleteGoogleOAuth: (payload: { code: string; state: string }) => Promise<IntegrationAccount>;
   onOnboardLinkedIn: (payload: {
@@ -186,6 +210,8 @@ interface ModalsProps {
     linkedin_version?: string;
     slug?: string;
     display_name?: string;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
   onOnboardWebhook: (payload: {
     display_name: string;
@@ -193,6 +219,8 @@ interface ModalsProps {
     signing_secret?: string;
     event_type?: string;
     target_collection?: string | null;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<WebhookOnboardResponse>;
   onUpsertModel: (payload: {
     slug: string;
@@ -203,7 +231,11 @@ interface ModalsProps {
     is_default: boolean;
     daily_token_limit?: number;
     monthly_budget_usd?: number;
+    input_price_per_million?: number;
+    output_price_per_million?: number;
   }) => Promise<void>;
+  teams?: TeamGroupRecord[];
+  principal?: SsoPrincipal | null;
 }
 
 export function Modals({
@@ -236,12 +268,18 @@ export function Modals({
   onOnboardLinkedIn,
   onOnboardWebhook,
   onUpsertModel,
+  teams = [],
+  principal = null,
 }: ModalsProps) {
+  const isMultiUser = Boolean(principal?.multi_user);
+  const [resourceVisibility, setResourceVisibility] = useState<ResourceVisibility>("private");
+  const [resourceGroups, setResourceGroups] = useState<string[]>([]);
   const [botBuilderPrompt, setBotBuilderPrompt] = useState("");
   const [botName, setBotName] = useState("");
   const [botRole, setBotRole] = useState("");
   const [botRolePrompt, setBotRolePrompt] = useState("");
-  const [botRuntime, setBotRuntime] = useState<"api" | "desktop">("api");
+  const [botRuntime, setBotRuntime] = useState<"api" | "sandbox" | "desktop">("api");
+  const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [botRbac, setBotRbac] = useState<"internal" | "draft" | "execute">("draft");
   const [botModel, setBotModel] = useState("google:gemini-3.8-flash");
   const [botDailyCap, setBotDailyCap] = useState("0");
@@ -285,20 +323,19 @@ export function Modals({
 
   const [newBotTab, setNewBotTab] = useState<NewBotModalTab>("quick");
   const [quickBotHint, setQuickBotHint] = useState("");
+  useEffect(() => {
+    setResourceVisibility("private");
+    setResourceGroups([]);
+  }, [modal?.type, newBotTab]);
   const [roomTitle, setRoomTitle] = useState("");
   const [roomMembers, setRoomMembers] = useState<string[]>([]);
   const [roomCoordinator, setRoomCoordinator] = useState<string>("");
   const [roomRoutingMode, setRoomRoutingMode] = useState<"auto" | "lead" | "stage">("auto");
   const [roomAskBeforeHandoff, setRoomAskBeforeHandoff] = useState(false);
   const [roomSection, setRoomSection] = useState("");
-  const [starterPacks, setStarterPacks] = useState<TeamPackRecord[]>([]);
-  const [loadingStarterPacks, setLoadingStarterPacks] = useState(false);
 
   const [pagePrompt, setPagePrompt] = useState("");
-  const [pageTemplateKey, setPageTemplateKey] = useState<
-    "auto" | "live_operations_map" | "bot_hub_board" | "collection_analytics" | "interactive_playground"
-  >("auto");
-  const [pageOwnerBot, setPageOwnerBot] = useState("operations-coordinator");
+  const [pageOwnerBot, setPageOwnerBot] = useState("");
   const [pageSelectedCols, setPageSelectedCols] = useState<string[]>([]);
   const [pageColsTouched, setPageColsTouched] = useState(false);
   const [pageManualMode, setPageManualMode] = useState(false);
@@ -315,8 +352,16 @@ export function Modals({
   const [takeoverLoading, setTakeoverLoading] = useState(false);
   const [takeoverError, setTakeoverError] = useState<string | null>(null);
   const [iframeKey, setIframeKey] = useState(0);
+  const isMobile = useIsMobile();
   const [desktopFullscreen, setDesktopFullscreen] = useState(false);
+  const [mobileDesktopWide, setMobileDesktopWide] = useState(false);
   const selkiesIframeRef = useRef<HTMLIFrameElement | null>(null);
+
+  useEffect(() => {
+    if (modal?.type !== "selkies") {
+      setMobileDesktopWide(false);
+    }
+  }, [modal?.type]);
   const detachSelkiesIframe = () => {
     const frame = selkiesIframeRef.current;
     if (!frame) return;
@@ -372,7 +417,20 @@ export function Modals({
   const [mdlKey, setMdlKey] = useState("");
   const [mdlDailyLimit, setMdlDailyLimit] = useState("");
   const [mdlMonthlyBudget, setMdlMonthlyBudget] = useState("100");
+  const [mdlInputPrice, setMdlInputPrice] = useState("");
+  const [mdlOutputPrice, setMdlOutputPrice] = useState("");
   const [mdlDefault, setMdlDefault] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredProviderModel[]>([]);
+  const [discoveringModels, setDiscoveringModels] = useState(false);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [discoverNote, setDiscoverNote] = useState<string | null>(null);
+  const [discoverFilter, setDiscoverFilter] = useState("");
+
+  useEffect(() => {
+    if (modal?.type === "new-integration" && modal.defaultProvider) {
+      setIntProvider(modal.defaultProvider);
+    }
+  }, [modal]);
 
   useEffect(() => {
     if (modal?.type === "new-bot") {
@@ -384,12 +442,6 @@ export function Modals({
       setRoomRoutingMode("auto");
       setRoomAskBeforeHandoff(false);
       setRoomSection("");
-      setLoadingStarterPacks(true);
-      api
-        .listStarterTeamPacks()
-        .then((packs) => setStarterPacks(packs))
-        .catch(() => setStarterPacks([]))
-        .finally(() => setLoadingStarterPacks(false));
       setSelectedLinkedAccounts([]);
       setShowAdvancedBotOptions(false);
       setBuilderError(null);
@@ -398,23 +450,27 @@ export function Modals({
       setBlueprintImportMode(false);
       setBlueprintJson("");
       setPipelineMode(false);
-      setPipeScoutName("Inbox & Web Scout");
+      setPipeScoutName("Source Bot");
       setPipeScoutSource(
         "Check unread emails (or websites) for valuable leads or personal messages, ignoring newsletters and automated receipts.",
       );
       setPipeScoutSchedule("Every 15m");
       setPipeScoutAccounts([]);
-      setPipeWriterName("Story Writer");
+      setPipeWriterName("Drafting Bot");
       setPipeWriterStyle(
-        "Read the collected items from the Scout, write a clear engaging story or reply with key facts and source links, and queue it in Approvals.",
+        "Read the collected items from the Source Bot, write a clear engaging summary or reply with key facts and source links, and queue it in Approvals.",
       );
       setPipeWriterAccounts([]);
       setBotBoundaries([]);
       setBotAvatarColor("slate");
       setBotAvatarIcon("bot");
       setBotSection("");
+      setBotRuntime("api");
+      setRuntimeTouched(false);
     } else if (modal?.type === "new-page") {
-      const initialOwner = bots[0]?.slug ?? "operations-coordinator";
+      const initialOwner = bots[0]?.slug ?? "";
+      setPagePrompt("");
+      setPageTitle("");
       const hiddenCols = new Set([
         "oauth_pending_states",
         "http_feed_cache",
@@ -434,7 +490,6 @@ export function Modals({
         )
         .map((c) => c.slug);
       setPagePrompt("");
-      setPageTemplateKey("auto");
       setPageOwnerBot(initialOwner);
       setPageSelectedCols(ownerCols);
       setPageColsTouched(false);
@@ -460,6 +515,16 @@ export function Modals({
         setMdlMonthlyBudget(
           modal.initial.monthly_budget_usd != null ? String(modal.initial.monthly_budget_usd) : "",
         );
+        setMdlInputPrice(
+          modal.initial.input_price_per_million != null
+            ? String(modal.initial.input_price_per_million)
+            : "",
+        );
+        setMdlOutputPrice(
+          modal.initial.output_price_per_million != null
+            ? String(modal.initial.output_price_per_million)
+            : "",
+        );
         setMdlDefault(modal.initial.is_default);
       } else {
         setMdlSlug("");
@@ -469,8 +534,15 @@ export function Modals({
         setMdlKey("");
         setMdlDailyLimit("");
         setMdlMonthlyBudget("100");
+        setMdlInputPrice("");
+        setMdlOutputPrice("");
         setMdlDefault(false);
       }
+      setDiscoveredModels([]);
+      setDiscoveringModels(false);
+      setDiscoverError(null);
+      setDiscoverNote(null);
+      setDiscoverFilter("");
     }
   }, [modal]);
 
@@ -601,24 +673,14 @@ export function Modals({
               enabled: true,
             },
           ]
-        : botRuntime === "desktop"
-          ? [
-              {
-                type: "manual_trigger",
-                label: "Manual Run",
-                schedule: "Manual",
-                enabled: true,
-              },
-            ]
-          : [
-              {
-                type: "interval",
-                interval_minutes: 15,
-                label: "Scheduled polling loop",
-                schedule: "Every 15m",
-                enabled: true,
-              },
-            ];
+        : [
+            {
+              type: "manual_trigger",
+              label: "Manual Run",
+              schedule: "Manual",
+              enabled: true,
+            },
+          ];
 
   function toggleLinkedAccount(accountSlug: string) {
     setSelectedLinkedAccounts((prev) =>
@@ -658,7 +720,7 @@ export function Modals({
     try {
       const res = await onDraftBotSpec({
         prompt,
-        preferred_runtime: botRuntime,
+        preferred_runtime: runtimeTouched ? botRuntime : "auto",
         preferred_rbac: botRbac,
         preferred_model: botModel,
         linked_accounts: selectedLinkedAccounts,
@@ -704,6 +766,10 @@ export function Modals({
     e.preventDefault();
     const instructions = (botRolePrompt || botBuilderPrompt || botRole).trim();
     if (!botName.trim() && !instructions) return;
+    if (isMultiUser && resourceVisibility === "team" && resourceGroups.length === 0) {
+      setBuilderError("Select at least one Team Group when Visibility is set to Team.");
+      return;
+    }
 
     setCreatingBot(true);
     setBuilderError(null);
@@ -711,6 +777,7 @@ export function Modals({
       let finalName = botName.trim();
       let finalRole = botRole.trim();
       let finalRolePrompt = instructions;
+      let finalRuntime: "api" | "sandbox" | "desktop" = botRuntime;
       let finalRoutines = effectiveRoutines;
       let finalTools = botDraftedTools;
       let finalRead = parseCsvList(botCollectionsRead);
@@ -723,7 +790,7 @@ export function Modals({
         try {
           const res = await onDraftBotSpec({
             prompt: instructions,
-            preferred_runtime: botRuntime,
+            preferred_runtime: runtimeTouched ? botRuntime : "auto",
             preferred_rbac: botRbac,
             preferred_model: botModel,
             linked_accounts: selectedLinkedAccounts,
@@ -732,6 +799,7 @@ export function Modals({
           if (!finalName) finalName = draft.name;
           if (!finalRole) finalRole = draft.role;
           if (!finalRolePrompt) finalRolePrompt = draft.role_prompt;
+          if (!runtimeTouched && draft.runtime) finalRuntime = draft.runtime;
           if (
             !(botTriggerMode === "on_event" && trimmedEvent) &&
             Array.isArray(draft.routines) &&
@@ -774,7 +842,7 @@ export function Modals({
         name: finalName,
         role: finalRole,
         role_prompt: finalRolePrompt || finalRole,
-        runtime: botRuntime,
+        runtime: finalRuntime,
         outbound_rbac: botRbac,
         model: botModel.trim() || "google:gemini-3.8-flash",
         daily_cap: Number.isFinite(parsedCap) ? parsedCap : botRbac === "execute" ? 10 : 0,
@@ -789,6 +857,12 @@ export function Modals({
         avatar_icon: finalAvatarIcon,
         boundaries: finalBoundaries,
         section: botSection.trim() || undefined,
+        ...(isMultiUser
+          ? {
+              visibility: resourceVisibility,
+              ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+            }
+          : {}),
       });
 
       setBotBuilderPrompt("");
@@ -813,6 +887,8 @@ export function Modals({
       setBotAvatarColor("slate");
       setBotAvatarIcon("bot");
       setBotSection("");
+      setBotRuntime("api");
+      setRuntimeTouched(false);
       setRestatedSummary(null);
       setBlueprintImportMode(false);
       setBlueprintJson("");
@@ -829,6 +905,10 @@ export function Modals({
     const cleanName = botName.trim();
     if (!cleanName) {
       setBuilderError("Give your bot a short name to start.");
+      return;
+    }
+    if (isMultiUser && resourceVisibility === "team" && resourceGroups.length === 0) {
+      setBuilderError("Select at least one Team Group when Visibility is set to Team.");
       return;
     }
     setCreatingBot(true);
@@ -849,6 +929,12 @@ export function Modals({
         avatar_icon: botAvatarIcon,
         section: botSection.trim() || undefined,
         onboarding_mode: "interview",
+        ...(isMultiUser
+          ? {
+              visibility: resourceVisibility,
+              ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+            }
+          : {}),
       });
       setBotName("");
       setQuickBotHint("");
@@ -872,6 +958,10 @@ export function Modals({
       setBuilderError("Select between 2 and 6 bots for a shared Room.");
       return;
     }
+    if (isMultiUser && resourceVisibility === "team" && resourceGroups.length === 0) {
+      setBuilderError("Select at least one Team Group when Visibility is set to Team.");
+      return;
+    }
     setCreatingBot(true);
     setBuilderError(null);
     try {
@@ -886,27 +976,16 @@ export function Modals({
         ask_before_bot_handoff: roomAskBeforeHandoff,
         max_bot_turns_per_message: 3,
         section: roomSection.trim() || undefined,
+        ...(isMultiUser
+          ? {
+              visibility: resourceVisibility,
+              ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+            }
+          : {}),
       });
       onClose();
     } catch (err) {
       setBuilderError(err instanceof Error ? err.message : "Failed to create Room.");
-    } finally {
-      setCreatingBot(false);
-    }
-  }
-
-  async function installStarterPack(pack: TeamPackRecord) {
-    if (!onImportTeamPack) return;
-    setCreatingBot(true);
-    setBuilderError(null);
-    try {
-      await onImportTeamPack({
-        pack: pack as unknown as Record<string, unknown>,
-        linked_accounts: selectedLinkedAccounts,
-      });
-      onClose();
-    } catch (err) {
-      setBuilderError(err instanceof Error ? err.message : "Failed to install Team Pack.");
     } finally {
       setCreatingBot(false);
     }
@@ -959,6 +1038,12 @@ export function Modals({
         writerName: pipeWriterName.trim(),
         writerStyle: pipeWriterStyle.trim(),
         writerAccounts: pipeWriterAccounts,
+        ...(isMultiUser
+          ? {
+              visibility: resourceVisibility,
+              ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+            }
+          : {}),
       });
       setPipelineMode(false);
       onClose();
@@ -980,6 +1065,12 @@ export function Modals({
       render_mode: pageMode,
       content_payload: pageCustomPayload.trim() || undefined,
       allowed_collections: allowed,
+      ...(isMultiUser
+        ? {
+            visibility: resourceVisibility,
+            ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+          }
+        : {}),
     });
     setPageTitle("");
     setPageDesc("");
@@ -991,7 +1082,7 @@ export function Modals({
 
   async function submitGeneratePage(e: FormEvent) {
     e.preventDefault();
-    if (!pagePrompt.trim() && pageTemplateKey === "auto") return;
+    if (!pagePrompt.trim()) return;
     if (!onGeneratePage) {
       await submitPage(e);
       return;
@@ -1001,11 +1092,17 @@ export function Modals({
       const allowed =
         pageSelectedCols.length > 0 ? pageSelectedCols : parseCsvList(pageAllowedCollections);
       await onGeneratePage({
-        prompt: pagePrompt.trim() || `Create a ${pageTemplateKey.replace(/_/g, " ")} page`,
+        prompt: pagePrompt.trim(),
         title: pageTitle.trim() || undefined,
         owner_bot_slug: pageOwnerBot || undefined,
         allowed_collections: allowed,
-        template_key: pageTemplateKey,
+        template_key: "auto",
+        ...(isMultiUser
+          ? {
+              visibility: resourceVisibility,
+              ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+            }
+          : {}),
       });
       setPagePrompt("");
       setPageTitle("");
@@ -1034,6 +1131,12 @@ export function Modals({
       account_identifier: intIdent.trim() || undefined,
       scopes: ["default"],
       secrets: intToken.trim() ? { token: intToken.trim() } : {},
+      ...(isMultiUser
+        ? {
+            visibility: resourceVisibility,
+            ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+          }
+        : {}),
     });
     setIntSlug("");
     setIntName("");
@@ -1061,6 +1164,12 @@ export function Modals({
       admin_channels: channels,
       public_channels: publicChannels,
       register_webhook: tgWebhook,
+      ...(isMultiUser
+        ? {
+            visibility: resourceVisibility,
+            ...(resourceVisibility === "team" ? { allowed_groups: resourceGroups } : {}),
+          }
+        : {}),
     });
     setTgToken("");
     setTgSlug("");
@@ -1072,11 +1181,59 @@ export function Modals({
     onClose();
   }
 
+  async function handleDiscoverModels() {
+    setDiscoveringModels(true);
+    setDiscoverError(null);
+    setDiscoverNote(null);
+    try {
+      const res = await api.discoverModels({
+        provider_type: mdlProvider,
+        provider_slug: modal?.type === "new-model" ? modal.initial?.slug : undefined,
+        api_key: mdlKey.trim() || undefined,
+        api_base: mdlBase.trim() || undefined,
+      });
+      setDiscoveredModels(res.models);
+      setDiscoverNote(res.source_note);
+      if (res.models.length === 0) {
+        setDiscoverError("No compatible models returned by this provider.");
+      }
+    } catch (err) {
+      setDiscoveredModels([]);
+      setDiscoverError(err instanceof Error ? err.message : "Failed to fetch provider models.");
+    } finally {
+      setDiscoveringModels(false);
+    }
+  }
+
+  function handleSelectDiscoveredModel(modelId: string) {
+    setMdlId(modelId);
+    const picked = discoveredModels.find((m) => m.model_id === modelId);
+    if (!mdlSlug.trim()) {
+      const autoSlug = modelId
+        .replace(/[^a-zA-Z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .toLowerCase()
+        .slice(0, 48);
+      if (autoSlug) setMdlSlug(autoSlug);
+    }
+    if (picked) {
+      if (picked.pricing_source === "live" || picked.pricing_source === "local") {
+        setMdlInputPrice(String(picked.input_price_per_million));
+        setMdlOutputPrice(String(picked.output_price_per_million));
+      } else if (!mdlInputPrice.trim() && !mdlOutputPrice.trim()) {
+        setMdlInputPrice("");
+        setMdlOutputPrice("");
+      }
+    }
+  }
+
   async function submitModel(e: FormEvent) {
     e.preventDefault();
     if (!mdlSlug.trim() || !mdlId.trim()) return;
     const dailyCapNum = mdlDailyLimit.trim() ? Number(mdlDailyLimit.trim()) : undefined;
     const monthlyNum = mdlMonthlyBudget.trim() ? Number(mdlMonthlyBudget.trim()) : undefined;
+    const inPriceNum = mdlInputPrice.trim() ? Number(mdlInputPrice.trim()) : undefined;
+    const outPriceNum = mdlOutputPrice.trim() ? Number(mdlOutputPrice.trim()) : undefined;
     await onUpsertModel({
       slug: mdlSlug.trim(),
       provider_type: mdlProvider,
@@ -1086,23 +1243,27 @@ export function Modals({
       is_default: mdlDefault,
       daily_token_limit: Number.isFinite(dailyCapNum) ? dailyCapNum : undefined,
       monthly_budget_usd: Number.isFinite(monthlyNum) ? monthlyNum : undefined,
+      input_price_per_million: Number.isFinite(inPriceNum) ? inPriceNum : undefined,
+      output_price_per_million: Number.isFinite(outPriceNum) ? outPriceNum : undefined,
     });
     setMdlSlug("");
     setMdlBase("");
     setMdlKey("");
+    setMdlInputPrice("");
+    setMdlOutputPrice("");
     onClose();
   }
 
   const modalWidthClass =
     modal.type === "selkies"
       ? desktopFullscreen
-        ? "w-screen h-screen max-w-none max-h-none rounded-none border-0 argo-desktop-studio"
-        : "w-[96vw] max-w-[1680px] h-[93vh] max-h-[93vh] rounded-xl argo-desktop-studio"
+        ? "w-screen h-[100dvh] max-w-none max-h-none rounded-none border-0 argo-desktop-studio"
+        : "w-screen h-[100dvh] sm:w-[96vw] sm:max-w-[1680px] sm:h-[93vh] sm:max-h-[93vh] rounded-none sm:rounded-xl border-0 sm:border argo-desktop-studio"
       : modal.type === "debug"
-        ? "max-w-4xl max-h-[92vh] rounded-2xl argo-modal-panel"
+        ? "sm:max-w-4xl h-[100dvh] sm:h-auto max-h-[100dvh] sm:max-h-[92vh] rounded-none sm:rounded-2xl border-0 sm:border argo-modal-panel"
         : modal.type === "new-bot" || modal.type === "new-page"
-          ? "max-w-2xl max-h-[92vh] rounded-2xl argo-modal-panel"
-          : "max-w-lg max-h-[92vh] rounded-2xl argo-modal-panel";
+          ? "sm:max-w-2xl h-[100dvh] sm:h-auto max-h-[100dvh] sm:max-h-[92vh] rounded-none sm:rounded-2xl border-0 sm:border argo-modal-panel"
+          : "sm:max-w-lg h-[100dvh] sm:h-auto max-h-[100dvh] sm:max-h-[92vh] rounded-none sm:rounded-2xl border-0 sm:border argo-modal-panel";
 
   const canDismissBackdrop =
     modal.type !== "selkies" && !creatingBot && !generatingPage;
@@ -1122,8 +1283,8 @@ export function Modals({
         modal.type === "selkies"
           ? desktopFullscreen
             ? "p-0"
-            : "p-2 sm:p-3"
-          : "p-4"
+            : "p-0 sm:p-2 md:p-3"
+          : "p-0 sm:p-4"
       }`}
       onClick={(e) => {
         if (canDismissBackdrop && e.target === e.currentTarget) {
@@ -1134,7 +1295,7 @@ export function Modals({
       <div
         role="dialog"
         aria-modal="true"
-        className={`w-full ${modalWidthClass} flex flex-col overflow-hidden`}
+        className={`w-full ${modalWidthClass} flex flex-col overflow-hidden argo-safe-top argo-safe-bottom`}
       >
         {modal.type === "new-bot" && (
           <>
@@ -1153,8 +1314,8 @@ export function Modals({
                     : newBotTab === "room"
                       ? "Bring 2 to 6 specialist bots into one shared multi-bot chat room."
                       : newBotTab === "packs"
-                        ? "Install a prebuilt multi-bot crew or import an exported Team Pack / Blueprint JSON."
-                        : "Configure templates, pipelines, models, and collections upfront."}
+                        ? "Import a portable Bot Blueprint (argo.bot_blueprint.v1) or Team Pack (argo.team_pack.v1) JSON."
+                        : "Configure job instructions, pipelines, models, and collections upfront."}
                 </p>
               </div>
               <button
@@ -1173,7 +1334,7 @@ export function Modals({
                   { id: "quick", label: "Quick Setup (Chat)" },
                   { id: "builder", label: "Detailed Builder" },
                   { id: "room", label: "Team Room" },
-                  { id: "packs", label: "Team Packs" },
+                  { id: "packs", label: "Import JSON" },
                 ] as const
               ).map((tab) => (
                 <button
@@ -1293,6 +1454,18 @@ export function Modals({
                     />
                   </div>
                 </div>
+
+                {isMultiUser && (
+                  <VisibilityPicker
+                    value={resourceVisibility}
+                    allowedGroups={resourceGroups}
+                    teams={teams}
+                    onChange={(vis, groups) => {
+                      setResourceVisibility(vis);
+                      setResourceGroups(groups);
+                    }}
+                  />
+                )}
 
                 {builderError && (
                   <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
@@ -1449,6 +1622,18 @@ export function Modals({
                   </div>
                 </label>
 
+                {isMultiUser && (
+                  <VisibilityPicker
+                    value={resourceVisibility}
+                    allowedGroups={resourceGroups}
+                    teams={teams}
+                    onChange={(vis, groups) => {
+                      setResourceVisibility(vis);
+                      setResourceGroups(groups);
+                    }}
+                  />
+                )}
+
                 {builderError && (
                   <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
                     {builderError}
@@ -1481,43 +1666,6 @@ export function Modals({
 
             {newBotTab === "packs" && (
               <div className="p-5 space-y-4 overflow-y-auto custom-scroll">
-                <div className="space-y-2">
-                  <div className="text-xs font-semibold text-slate-900">
-                    1-Click Starter Team Packs
-                  </div>
-                  {loadingStarterPacks ? (
-                    <div className="text-xs text-slate-500 py-2">Loading starter packs...</div>
-                  ) : (
-                    <div className="grid grid-cols-1 gap-2">
-                      {starterPacks.map((pack) => (
-                        <div
-                          key={pack.id || pack.title}
-                          className="rounded-xl border border-slate-200 bg-white p-3 flex items-center justify-between gap-3"
-                        >
-                          <div className="min-w-0">
-                            <div className="text-xs font-semibold text-slate-900">{pack.title}</div>
-                            <div className="text-[11px] text-slate-500 mt-0.5">
-                              {pack.description}
-                            </div>
-                            <div className="text-[10px] text-slate-400 mt-1">
-                              {pack.bots?.length ?? 0} bots · {pack.rooms?.length ?? 0} room ·{" "}
-                              {pack.pages?.length ?? 0} page
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={creatingBot}
-                            onClick={() => installStarterPack(pack)}
-                            className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
-                          >
-                            Install Crew
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
                 {integrations.length > 0 && (
                   <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
                     <div className="text-[11px] font-semibold text-slate-800">
@@ -1551,7 +1699,7 @@ export function Modals({
                   </div>
                 )}
 
-                <form onSubmit={submitImportBlueprint} className="space-y-2.5 border-t border-slate-200 pt-3">
+                <form onSubmit={submitImportBlueprint} className="space-y-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <label className="text-xs font-semibold text-slate-900">
                       Import Team Pack or Bot Blueprint (.json)
@@ -1604,146 +1752,22 @@ export function Modals({
 
             {newBotTab === "builder" && (
               <>
-            <div className="px-5 py-3 border-b border-slate-100 bg-slate-50 space-y-2 shrink-0">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-slate-500">Choose a Workflow Starter</span>
-                {onImportBlueprint && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setNewBotTab("packs");
-                      setBuilderError(null);
-                    }}
-                    className="px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 text-[11px] font-medium cursor-pointer"
-                  >
-                    Import Team Pack / Blueprint
-                  </button>
-                )}
-              </div>
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            <div className="px-5 py-2.5 border-b border-slate-100 bg-slate-50 flex flex-wrap items-center justify-between gap-2 shrink-0">
+              <div className="flex items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => {
                     setBlueprintImportMode(false);
                     setPipelineMode(false);
-                    setBotName("");
-                    setBotRolePrompt(
-                      "Check my inbox or https://news.example.com/feed every 15 minutes, ignore automated newsletters and case studies, save new items, and summarize only what matters.",
-                    );
-                    setBotBuilderPrompt(
-                      "Check my inbox or https://news.example.com/feed every 15 minutes, ignore automated newsletters and case studies, save new items, and summarize only what matters.",
-                    );
-                    setBotRbac("draft");
-                    setBotTriggerMode("schedule");
-                    setBotEventName("");
-                    setBotDraftedRoutines(null);
-                    setBotAvatarColor("blue");
-                    setBotAvatarIcon("mail");
-                    setBotDraftedTools([]);
+                    setBuilderError(null);
                   }}
-                  className="text-left rounded-xl border border-slate-200 bg-white hover:bg-slate-100 p-2.5 cursor-pointer"
+                  className={`px-3 py-1 rounded-full border text-[11px] font-medium cursor-pointer ${
+                    !pipelineMode
+                      ? "border-slate-900 bg-slate-900 text-white"
+                      : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
+                  }`}
                 >
-                  <div className="text-[11px] font-semibold text-slate-900">Email / Web Scout</div>
-                  <div className="text-[10px] text-slate-500 mt-0.5">
-                    Screens mail or feeds &amp; filters noise
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBlueprintImportMode(false);
-                    setPipelineMode(false);
-                    setBotName("Story Writer");
-                    setBotRole("Craft engaging stories, posts, or replies from collected items");
-                    setBotRolePrompt(
-                      "Read collected leads or articles, write a clear engaging story or post with key facts and source links, and queue drafts for human review.",
-                    );
-                    setBotBuilderPrompt(
-                      "Read collected leads or articles, write a clear engaging story or post with key facts and source links, and queue drafts for human review.",
-                    );
-                    setBotModel("google:gemini-4-argon");
-                    setBotRbac("draft");
-                    setBotTriggerMode("schedule");
-                    setBotEventName("");
-                    setBotDraftedRoutines(null);
-                    setBotAvatarColor("violet");
-                    setBotAvatarIcon("pen");
-                    setBotDraftedTools([]);
-                  }}
-                  className="text-left rounded-xl border border-slate-200 bg-white hover:bg-slate-100 p-2.5 cursor-pointer"
-                >
-                  <div className="text-[11px] font-semibold text-slate-900">Story &amp; Copy Writer</div>
-                  <div className="text-[10px] text-slate-500 mt-0.5">
-                    Turns notes into polished drafts
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBlueprintImportMode(false);
-                    setPipelineMode(false);
-                    setBotName("Approval Notifier");
-                    setBotRole(
-                      "Forward approval notifications to Telegram, Slack, or Webhook when drafts arrive",
-                    );
-                    setBotRolePrompt(
-                      "Listen for approval.queued events from other bots. Summarize the queued draft clearly (bot, target account, recipient/subject, short preview) and deliver the alert with notify_approval using your linked Telegram or Webhook/Slack integration.",
-                    );
-                    setBotBuilderPrompt(
-                      "Notify me on Telegram or Slack whenever any bot queues an approval draft.",
-                    );
-                    setBotModel("google:gemini-3.8-flash");
-                    setBotRbac("execute");
-                    setBotDailyCap("50");
-                    setBotTriggerMode("on_event");
-                    setBotEventName("approval.queued");
-                    setBotCollectionsRead("");
-                    setBotCollectionsWrite("");
-                    setBotAvatarColor("amber");
-                    setBotAvatarIcon("bell");
-                    setBotDraftedTools([{ type: "builtin", name: "notify_approval" }]);
-                    setBotDraftedRoutines([
-                      {
-                        type: "on_event",
-                        event: "approval.queued",
-                        label: "On Approval Queued",
-                        schedule: "on:approval.queued",
-                        enabled: true,
-                      },
-                    ]);
-                  }}
-                  className="text-left rounded-xl border border-slate-200 bg-white hover:bg-slate-100 p-2.5 cursor-pointer"
-                >
-                  <div className="text-[11px] font-semibold text-slate-900">Approval Notifier</div>
-                  <div className="text-[10px] text-slate-500 mt-0.5">
-                    Alerts Telegram / Slack on approvals
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBlueprintImportMode(false);
-                    setPipelineMode(false);
-                    setBotName("Workspace Supervisor");
-                    setBotRole("Monitor all bots, pending approvals, schedules, and spending");
-                    setBotRolePrompt(
-                      "Act as the workspace supervisor overseeing all other bots. Check schedules, recent runs, pending approvals, and token usage; help delegate tasks with @mentions; and propose optimizations or new specialist bots for approval.",
-                    );
-                    setBotBuilderPrompt(
-                      "Act as the workspace supervisor overseeing all other bots. Check schedules, recent runs, pending approvals, and token usage; help delegate tasks with @mentions; and propose optimizations or new specialist bots for approval.",
-                    );
-                    setBotModel("google:gemini-4-argon");
-                    setBotRbac("draft");
-                    setBotAvatarColor("indigo");
-                    setBotAvatarIcon("shield");
-                    setBotDraftedTools([{ type: "builtin", name: "platform_status" }]);
-                  }}
-                  className="text-left rounded-xl border border-slate-200 bg-white hover:bg-slate-100 p-2.5 cursor-pointer"
-                >
-                  <div className="text-[11px] font-semibold text-slate-900">Supervisor Bot</div>
-                  <div className="text-[10px] text-slate-500 mt-0.5">
-                    Oversees all bots &amp; approvals
-                  </div>
+                  Single Bot
                 </button>
                 {onCreatePipeline && (
                   <button
@@ -1753,21 +1777,28 @@ export function Modals({
                       setPipelineMode(true);
                       setBuilderError(null);
                     }}
-                    className={`text-left rounded-xl border p-2.5 cursor-pointer ${
+                    className={`px-3 py-1 rounded-full border text-[11px] font-medium cursor-pointer ${
                       pipelineMode
-                        ? "border-emerald-500 bg-emerald-50"
-                        : "border-slate-200 bg-white hover:bg-slate-100"
+                        ? "border-emerald-700 bg-emerald-700 text-white"
+                        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
                     }`}
                   >
-                    <div className="text-[11px] font-semibold text-slate-900">
-                      2-Bot Pipeline
-                    </div>
-                    <div className="text-[10px] text-slate-500 mt-0.5">
-                      Scout finds items → Writer drafts
-                    </div>
+                    2-Bot Pipeline
                   </button>
                 )}
               </div>
+              {onImportBlueprint && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewBotTab("packs");
+                    setBuilderError(null);
+                  }}
+                  className="px-2.5 py-1 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 text-[11px] font-medium cursor-pointer"
+                >
+                  Import JSON
+                </button>
+              )}
             </div>
 
             {pipelineMode ? (
@@ -2176,16 +2207,21 @@ export function Modals({
                   <label className="block text-xs font-medium text-slate-900">
                     Execution Environment:
                   </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                     {[
                       {
                         value: "api" as const,
                         title: "Cloud API (Fast, 0 MB)",
-                        desc: "Uses direct Gmail, Telegram, RSS, and web APIs",
+                        desc: "Direct connected APIs & MCP tools with zero container RAM",
+                      },
+                      {
+                        value: "sandbox" as const,
+                        title: "Script Sandbox (512 MB CLI)",
+                        desc: "Isolated Fedora 45 CLI container with Python 3, curl, jq & /workspace",
                       },
                       {
                         value: "desktop" as const,
-                        title: "Virtual Desktop",
+                        title: "Virtual Desktop (2 GB GUI)",
                         desc: "Dedicated Fedora XFCE desktop with Chromium, GUI apps & live screen",
                       },
                     ].map((opt) => (
@@ -2194,8 +2230,12 @@ export function Modals({
                         type="button"
                         onClick={() => {
                           setBotRuntime(opt.value);
+                          setRuntimeTouched(true);
                           setBotDraftedRoutines(null);
-                          if (opt.value === "desktop" && botAvatarIcon === "bot") {
+                          if (opt.value === "sandbox" && botAvatarIcon === "bot") {
+                            setBotAvatarColor("emerald");
+                            setBotAvatarIcon("terminal");
+                          } else if (opt.value === "desktop" && botAvatarIcon === "bot") {
                             setBotAvatarColor("amber");
                             setBotAvatarIcon("globe");
                           }
@@ -2334,12 +2374,14 @@ export function Modals({
                           <select
                             value={botRuntime}
                             onChange={(e) => {
-                              setBotRuntime(e.target.value as "api" | "desktop");
+                              setBotRuntime(e.target.value as "api" | "sandbox" | "desktop");
+                              setRuntimeTouched(true);
                               setBotDraftedRoutines(null);
                             }}
                             className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs bg-white"
                           >
                             <option value="api">Cloud API (Fast, 0 MB)</option>
+                            <option value="sandbox">Script Sandbox (512 MB CLI)</option>
                             <option value="desktop">Dedicated Virtual Desktop</option>
                           </select>
                         </div>
@@ -2439,6 +2481,18 @@ export function Modals({
                   )}
                 </div>
 
+                {isMultiUser && (
+                  <VisibilityPicker
+                    value={resourceVisibility}
+                    allowedGroups={resourceGroups}
+                    teams={teams}
+                    onChange={(vis, groups) => {
+                      setResourceVisibility(vis);
+                      setResourceGroups(groups);
+                    }}
+                  />
+                )}
+
                 <div className="flex justify-end gap-2 pt-2">
                   <button
                     type="button"
@@ -2498,91 +2552,16 @@ export function Modals({
                 onSubmit={submitGeneratePage}
                 className="p-5 space-y-4 overflow-y-auto custom-scroll"
               >
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-medium text-slate-900">
-                      Choose a Starting Layout
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => setPageTemplateKey("auto")}
-                      className={`text-[11px] px-2 py-0.5 rounded-full border cursor-pointer ${
-                        pageTemplateKey === "auto"
-                          ? "border-slate-900 bg-slate-900 text-white"
-                          : "border-slate-200 text-slate-600 hover:bg-slate-100"
-                      }`}
-                    >
-                      Auto-detect from prompt
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {[
-                      {
-                        key: "bot_hub_board" as const,
-                        title: "Bot Hub Board",
-                        desc: "Live overview of bots, Rooms, schedules & approvals (1-click jump)",
-                      },
-                      {
-                        key: "live_operations_map" as const,
-                        title: "Live Operations Map",
-                        desc: "Live canvas of your bots, schedules, approvals & run states",
-                      },
-                      {
-                        key: "collection_analytics" as const,
-                        title: "Data Explorer & Charts",
-                        desc: "Searchable table, KPIs & breakdown over saved data",
-                      },
-                      {
-                        key: "interactive_playground" as const,
-                        title: "Concept Playground",
-                        desc: "Interactive explainer, simulator & controls",
-                      },
-                    ].map((tpl) => (
-                      <button
-                        key={tpl.key}
-                        type="button"
-                        onClick={() => {
-                          setPageTemplateKey(tpl.key);
-                          if (!pagePrompt.trim()) {
-                            if (tpl.key === "bot_hub_board") {
-                              setPagePrompt("Build a central Bot Hub Board listing all bots, Rooms, latest summaries, schedules, and approvals with quick open actions.");
-                            } else if (tpl.key === "live_operations_map") {
-                              setPagePrompt("Build a live interactive map of all active bots, their states, pending approvals, and run buttons.");
-                            } else if (tpl.key === "collection_analytics") {
-                              setPagePrompt("Build an interactive chart and searchable table summarizing collected items.");
-                            } else {
-                              setPagePrompt("Build an interactive visual playground where users can tweak inputs and explore results live.");
-                            }
-                          }
-                        }}
-                        className={`text-left rounded-lg border p-2.5 cursor-pointer transition-colors ${
-                          pageTemplateKey === tpl.key
-                            ? "border-slate-900 bg-slate-900 text-white"
-                            : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
-                        }`}
-                      >
-                        <div className="text-xs font-medium">{tpl.title}</div>
-                        <div
-                          className={`text-[10px] mt-0.5 ${
-                            pageTemplateKey === tpl.key ? "text-slate-300" : "text-slate-500"
-                          }`}
-                        >
-                          {tpl.desc}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
                 <div>
                   <label className="block text-xs font-medium text-slate-900 mb-1">
                     What should this Page show or let users explore?
                   </label>
                   <textarea
-                    rows={3}
+                    rows={4}
+                    required
                     value={pagePrompt}
                     onChange={(e) => setPagePrompt(e.target.value)}
-                    placeholder="e.g. Build a live map of my bots and pending approvals, or a searchable chart of saved release articles..."
+                    placeholder="e.g. Build a searchable table and chart of saved items, an executive PDF summary, or a live status overview..."
                     className="w-full rounded-lg border border-slate-200 bg-white p-2.5 text-xs"
                   />
                 </div>
@@ -2633,6 +2612,7 @@ export function Modals({
                       }}
                       className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs bg-white"
                     >
+                      <option value="">Unassigned (Workspace Page)</option>
                       {bots.map((b) => (
                         <option key={b.slug} value={b.slug}>
                           {b.name}
@@ -2710,6 +2690,18 @@ export function Modals({
                   })()}
                 </div>
 
+                {isMultiUser && (
+                  <VisibilityPicker
+                    value={resourceVisibility}
+                    allowedGroups={resourceGroups}
+                    teams={teams}
+                    onChange={(vis, groups) => {
+                      setResourceVisibility(vis);
+                      setResourceGroups(groups);
+                    }}
+                  />
+                )}
+
                 <div className="flex justify-end gap-2 pt-2">
                   <button
                     type="button"
@@ -2720,7 +2712,7 @@ export function Modals({
                   </button>
                   <button
                     type="submit"
-                    disabled={generatingPage || (!pagePrompt.trim() && pageTemplateKey === "auto")}
+                    disabled={generatingPage || !pagePrompt.trim()}
                     className="bg-slate-900 text-white px-4 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50 cursor-pointer"
                   >
                     {generatingPage ? "Building Page..." : "Build Living Page"}
@@ -2796,6 +2788,18 @@ export function Modals({
                     className="w-full rounded-lg border border-slate-200 p-2.5 text-xs font-mono"
                   />
                 </div>
+                {isMultiUser && (
+                  <VisibilityPicker
+                    value={resourceVisibility}
+                    allowedGroups={resourceGroups}
+                    teams={teams}
+                    onChange={(vis, groups) => {
+                      setResourceVisibility(vis);
+                      setResourceGroups(groups);
+                    }}
+                  />
+                )}
+
                 <div className="flex justify-end gap-2 pt-2">
                   <button
                     type="button"
@@ -2927,7 +2931,7 @@ export function Modals({
                     required
                     value={intSlug}
                     onChange={(e) => setIntSlug(e.target.value)}
-                    placeholder="tg_main"
+                    placeholder={intProvider === "mcp" ? "mcp_github" : "tg_main"}
                     className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
                   />
                 </div>
@@ -2959,34 +2963,50 @@ export function Modals({
                   required
                   value={intName}
                   onChange={(e) => setIntName(e.target.value)}
-                  placeholder="Community Telegram Bot"
+                  placeholder={intProvider === "mcp" ? "GitHub MCP Server" : "Community Telegram Bot"}
                   className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
                 />
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-900 mb-1">
-                  Identifier (email, @handle, or URL)
+                  {intProvider === "mcp"
+                    ? "MCP Endpoint URL (Streamable HTTP JSON-RPC 2.0)"
+                    : "Identifier (email, @handle, or URL)"}
                 </label>
                 <input
                   type="text"
+                  required={intProvider === "mcp"}
                   value={intIdent}
                   onChange={(e) => setIntIdent(e.target.value)}
-                  placeholder="@argo_ops_bot"
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                  placeholder={intProvider === "mcp" ? "https://mcp.example.com/rpc" : "@argo_ops_bot"}
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
                 />
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-900 mb-1">
-                  Credential / Token (encrypted via Fernet)
+                  {intProvider === "mcp"
+                    ? "Bearer Token (optional, encrypted via Fernet)"
+                    : "Credential / Token (encrypted via Fernet)"}
                 </label>
                 <input
                   type="password"
                   value={intToken}
                   onChange={(e) => setIntToken(e.target.value)}
-                  placeholder="Optional token or secret"
+                  placeholder={intProvider === "mcp" ? "Optional Bearer secret" : "Optional token or secret"}
                   className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
                 />
               </div>
+              {isMultiUser && (
+                <VisibilityPicker
+                  value={resourceVisibility}
+                  allowedGroups={resourceGroups}
+                  teams={teams}
+                  onChange={(vis, groups) => {
+                    setResourceVisibility(vis);
+                    setResourceGroups(groups);
+                  }}
+                />
+              )}
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
@@ -3112,6 +3132,17 @@ export function Modals({
                 />
                 Register HTTPS webhook endpoint with Bot API
               </label>
+              {isMultiUser && (
+                <VisibilityPicker
+                  value={resourceVisibility}
+                  allowedGroups={resourceGroups}
+                  teams={teams}
+                  onChange={(vis, groups) => {
+                    setResourceVisibility(vis);
+                    setResourceGroups(groups);
+                  }}
+                />
+              )}
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
@@ -3146,7 +3177,7 @@ export function Modals({
                 Close
               </button>
             </div>
-            <form onSubmit={submitModel} className="p-5 space-y-3">
+            <form onSubmit={submitModel} className="p-5 space-y-3 overflow-y-auto custom-scroll">
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-900 mb-1">Slug</label>
@@ -3166,8 +3197,14 @@ export function Modals({
                     onChange={(e) => {
                       const nextProvider = e.target.value as ModelProvider["provider_type"];
                       setMdlProvider(nextProvider);
+                      setDiscoveredModels([]);
+                      setDiscoverError(null);
+                      setDiscoverNote(null);
+                      setDiscoverFilter("");
                       if (!modal.initial) {
                         setMdlId(SUGGESTED_MODELS[nextProvider]);
+                        setMdlInputPrice("");
+                        setMdlOutputPrice("");
                       }
                     }}
                     className="w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs bg-white"
@@ -3181,19 +3218,7 @@ export function Modals({
                   </select>
                 </div>
               </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-900 mb-1">
-                  PydanticAI Model ID
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={mdlId}
-                  onChange={(e) => setMdlId(e.target.value)}
-                  placeholder="google:gemini-3.8-flash"
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
-                />
-              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-900 mb-1">
@@ -3203,7 +3228,13 @@ export function Modals({
                     type="password"
                     value={mdlKey}
                     onChange={(e) => setMdlKey(e.target.value)}
-                    placeholder={modal.initial?.has_api_key ? "Leave blank to keep stored" : "Optional for Ollama"}
+                    placeholder={
+                      modal.initial?.has_api_key
+                        ? "Leave blank to keep stored"
+                        : mdlProvider === "ollama"
+                          ? "Optional for Ollama"
+                          : "Paste provider key or reuse saved"
+                    }
                     className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
                   />
                 </div>
@@ -3220,6 +3251,126 @@ export function Modals({
                   />
                 </div>
               </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="block text-xs font-medium text-slate-900">
+                    PydanticAI Model ID
+                  </label>
+                  <button
+                    type="button"
+                    disabled={discoveringModels}
+                    onClick={() => void handleDiscoverModels()}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer disabled:opacity-50"
+                  >
+                    {discoveringModels ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3 h-3" />
+                    )}
+                    <span>{discoveringModels ? "Fetching..." : "Fetch Available Models"}</span>
+                  </button>
+                </div>
+
+                {discoveredModels.length > 0 && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-2.5 space-y-2">
+                    <input
+                      type="text"
+                      value={discoverFilter}
+                      onChange={(e) => setDiscoverFilter(e.target.value)}
+                      placeholder={`Filter ${discoveredModels.length} live models...`}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
+                    />
+                    <select
+                      size={Math.min(5, Math.max(2, discoveredModels.length))}
+                      value={mdlId}
+                      onChange={(e) => handleSelectDiscoveredModel(e.target.value)}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-mono"
+                    >
+                      {discoveredModels
+                        .filter((m) => {
+                          const q = discoverFilter.trim().toLowerCase();
+                          if (!q) return true;
+                          return (
+                            m.model_id.toLowerCase().includes(q) ||
+                            m.display_name.toLowerCase().includes(q)
+                          );
+                        })
+                        .map((m) => {
+                          const rateTag =
+                            m.pricing_source === "local"
+                              ? "Local ($0)"
+                              : `$${m.input_price_per_million}/$${m.output_price_per_million} per 1M (${
+                                  m.pricing_source === "live" ? "Live" : "Est."
+                                })`;
+                          return (
+                            <option key={m.model_id} value={m.model_id}>
+                              {m.model_id} — {rateTag}
+                            </option>
+                          );
+                        })}
+                    </select>
+                    {discoverNote && (
+                      <p className="text-[10.5px] text-slate-500">{discoverNote}</p>
+                    )}
+                  </div>
+                )}
+
+                {discoverError && (
+                  <div className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-700">
+                    {discoverError}
+                  </div>
+                )}
+
+                <input
+                  type="text"
+                  required
+                  value={mdlId}
+                  onChange={(e) => setMdlId(e.target.value)}
+                  placeholder="google:gemini-3.8-flash"
+                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-900 mb-1">
+                    Input Price ($ / 1M tokens)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={mdlInputPrice}
+                    onChange={(e) => setMdlInputPrice(e.target.value)}
+                    placeholder={
+                      modal.initial?.effective_input_price_per_million != null
+                        ? `Auto (${modal.initial.effective_input_price_per_million})`
+                        : "Auto (catalog / live)"
+                    }
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-900 mb-1">
+                    Output Price ($ / 1M tokens)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={mdlOutputPrice}
+                    onChange={(e) => setMdlOutputPrice(e.target.value)}
+                    placeholder={
+                      modal.initial?.effective_output_price_per_million != null
+                        ? `Auto (${modal.initial.effective_output_price_per_million})`
+                        : "Auto (catalog / live)"
+                    }
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
+                  />
+                </div>
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-900 mb-1">
@@ -3367,10 +3518,28 @@ export function Modals({
             (rec?.typed_inputs?.length ?? 0) +
             (rec?.clicks?.length ?? 0);
 
+          const handleReleaseAndClose = () => {
+            detachSelkiesIframe();
+            const cleanup = isRecording
+              ? api.stopDesktopRecording(desktop.bot_slug, { save_skill: false }).catch(() => {})
+              : Promise.resolve();
+            void cleanup.finally(() =>
+              onReleaseTakeover(desktop.bot_slug).finally(() => window.setTimeout(onClose, 50)),
+            );
+          };
+
           return (
             <>
-              <div className="h-11 px-3 border-b border-slate-800 flex items-center justify-between gap-2 bg-[#161920] text-slate-100 shrink-0">
+              <div className="min-h-12 sm:h-11 px-3 border-b border-slate-800 flex items-center justify-between gap-2 bg-[#161920] text-slate-100 shrink-0">
                 <div className="flex items-center gap-2 min-w-0">
+                  <button
+                    type="button"
+                    onClick={handleReleaseAndClose}
+                    aria-label="Back and release desktop"
+                    className="sm:hidden w-8 h-8 -ml-1 rounded-full bg-[#222732] border border-[#353d4d] text-slate-100 flex items-center justify-center shrink-0 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
                   <span
                     className={`w-2 h-2 rounded-full shrink-0 ${
                       desktop.awaiting_takeover ? "bg-[#c98a2c]" : "bg-[#3b8c62]"
@@ -3443,9 +3612,27 @@ export function Modals({
 
                       <button
                         type="button"
+                        onClick={() => setMobileDesktopWide((prev) => !prev)}
+                        title={
+                          mobileDesktopWide
+                            ? "Fit Virtual Desktop to phone screen"
+                            : "Switch to scrollable 1280×720 desktop view"
+                        }
+                        className="argo-studio-btn inline-flex md:hidden items-center gap-1 px-2 py-1 rounded-md text-xs cursor-pointer"
+                      >
+                        {mobileDesktopWide ? (
+                          <ZoomOut className="w-3.5 h-3.5" />
+                        ) : (
+                          <ZoomIn className="w-3.5 h-3.5" />
+                        )}
+                        <span>{mobileDesktopWide ? "Fit" : "Wide"}</span>
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={() => setDesktopFullscreen((v) => !v)}
                         title={desktopFullscreen ? "Exit Fullscreen" : "Expand Fullscreen"}
-                        className="argo-studio-btn inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs cursor-pointer"
+                        className="argo-studio-btn hidden sm:inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs cursor-pointer"
                       >
                         {desktopFullscreen ? (
                           <Minimize2 className="w-3.5 h-3.5" />
@@ -3468,15 +3655,7 @@ export function Modals({
 
                   <button
                     type="button"
-                    onClick={() => {
-                      detachSelkiesIframe();
-                      const cleanup = isRecording
-                        ? api.stopDesktopRecording(desktop.bot_slug, { save_skill: false }).catch(() => {})
-                        : Promise.resolve();
-                      void cleanup.finally(() =>
-                        onReleaseTakeover(desktop.bot_slug).finally(() => window.setTimeout(onClose, 50)),
-                      );
-                    }}
+                    onClick={handleReleaseAndClose}
                     className="px-2.5 py-1 rounded-md bg-[#2a3140] hover:bg-[#343d50] border border-[#3d475c] text-xs font-medium text-white cursor-pointer"
                   >
                     Release
@@ -3608,12 +3787,24 @@ export function Modals({
                     </div>
                     <p className="text-xs text-slate-300 max-w-md">{takeoverError}</p>
                   </div>
+                ) : isMobile && mobileDesktopWide ? (
+                  <div className="flex-1 min-h-0 overflow-auto bg-[#0b0e14]">
+                    <iframe
+                      ref={selkiesIframeRef}
+                      key={iframeKey}
+                      src={selkiesUrl}
+                      allow="autoplay; clipboard-read; clipboard-write; fullscreen"
+                      title={`Selkies live screen for ${desktop.bot_name}`}
+                      style={{ width: "1280px", height: "720px" }}
+                      className="block border-0 bg-[#13161c]"
+                    />
+                  </div>
                 ) : (
                   <iframe
                     ref={selkiesIframeRef}
                     key={iframeKey}
                     src={selkiesUrl}
-                    allow="clipboard-read; clipboard-write; fullscreen"
+                    allow="autoplay; clipboard-read; clipboard-write; fullscreen"
                     title={`Selkies live screen for ${desktop.bot_name}`}
                     className="flex-1 w-full h-full min-h-0 border-0 bg-[#13161c]"
                   />
@@ -3625,6 +3816,8 @@ export function Modals({
 
         {modal.type === "google-wizard" && (
           <GoogleWizardModal
+            isMultiUser={isMultiUser}
+            teams={teams}
             reauthAccount={modal.reauthAccount}
             onClose={onClose}
             onLoadConfig={onLoadGoogleWizardConfig}
@@ -3634,11 +3827,21 @@ export function Modals({
         )}
 
         {modal.type === "linkedin-onboard" && (
-          <LinkedInOnboardModal onClose={onClose} onSubmit={onOnboardLinkedIn} />
+          <LinkedInOnboardModal
+            isMultiUser={isMultiUser}
+            teams={teams}
+            onClose={onClose}
+            onSubmit={onOnboardLinkedIn}
+          />
         )}
 
         {modal.type === "webhook-onboard" && (
-          <WebhookOnboardModal onClose={onClose} onSubmit={onOnboardWebhook} />
+          <WebhookOnboardModal
+            isMultiUser={isMultiUser}
+            teams={teams}
+            onClose={onClose}
+            onSubmit={onOnboardWebhook}
+          />
         )}
 
         {modal.type === "debug" && (
@@ -3669,12 +3872,16 @@ function extractOAuthCode(rawInput: string): string {
 }
 
 function GoogleWizardModal({
+  isMultiUser = false,
+  teams = [],
   reauthAccount,
   onClose,
   onLoadConfig,
   onStartOAuth,
   onCompleteOAuth,
 }: {
+  isMultiUser?: boolean;
+  teams?: TeamGroupRecord[];
   reauthAccount?: IntegrationAccount;
   onClose: () => void;
   onLoadConfig: () => Promise<GoogleWizardConfig>;
@@ -3687,6 +3894,8 @@ function GoogleWizardModal({
     display_name?: string;
     login_hint?: string;
     scope_groups?: string[];
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<GoogleAuthorizeResponse>;
   onCompleteOAuth: (payload: { code: string; state: string }) => Promise<IntegrationAccount>;
 }) {
@@ -3704,6 +3913,12 @@ function GoogleWizardModal({
   const [displayName, setDisplayName] = useState(reauthAccount?.display_name ?? "");
   const [slug, setSlug] = useState(reauthAccount?.slug ?? "");
   const [loginHint, setLoginHint] = useState(reauthAccount?.account_identifier ?? "");
+  const [visibility, setVisibility] = useState<ResourceVisibility>(
+    reauthAccount?.visibility === "shared" || reauthAccount?.visibility === "team"
+      ? reauthAccount.visibility
+      : "private",
+  );
+  const [allowedGroups, setAllowedGroups] = useState<string[]>(reauthAccount?.allowed_groups ?? []);
   const [scopeGroups, setScopeGroups] = useState<string[]>([
     "gmail_read",
     "gmail_compose",
@@ -3803,6 +4018,10 @@ function GoogleWizardModal({
         return;
       }
     }
+    if (isMultiUser && visibility === "team" && allowedGroups.length === 0) {
+      setErrorMsg("Select at least one Team Group when Visibility is set to Team.");
+      return;
+    }
     setErrorMsg(null);
     setBusy(true);
     try {
@@ -3815,6 +4034,12 @@ function GoogleWizardModal({
         display_name: displayName.trim() || undefined,
         login_hint: loginHint.trim() || undefined,
         scope_groups: scopeGroups,
+        ...(isMultiUser
+          ? {
+              visibility,
+              ...(visibility === "team" ? { allowed_groups: allowedGroups } : {}),
+            }
+          : {}),
       });
       setAuthResponse(res);
       if (autoRedirect) {
@@ -4080,6 +4305,18 @@ function GoogleWizardModal({
               </div>
             )}
 
+            {isMultiUser && (
+              <VisibilityPicker
+                value={visibility}
+                allowedGroups={allowedGroups}
+                teams={teams}
+                onChange={(vis, groups) => {
+                  setVisibility(vis);
+                  setAllowedGroups(groups);
+                }}
+              />
+            )}
+
             <div className="rounded-lg border border-slate-200 bg-slate-50">
               <button
                 type="button"
@@ -4175,9 +4412,13 @@ function GoogleWizardModal({
 }
 
 function LinkedInOnboardModal({
+  isMultiUser = false,
+  teams = [],
   onClose,
   onSubmit,
 }: {
+  isMultiUser?: boolean;
+  teams?: TeamGroupRecord[];
   onClose: () => void;
   onSubmit: (payload: {
     access_token: string;
@@ -4185,6 +4426,8 @@ function LinkedInOnboardModal({
     linkedin_version?: string;
     slug?: string;
     display_name?: string;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<void>;
 }) {
   const [accessToken, setAccessToken] = useState("");
@@ -4192,12 +4435,18 @@ function LinkedInOnboardModal({
   const [authorUrn, setAuthorUrn] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [slug, setSlug] = useState("");
+  const [visibility, setVisibility] = useState<ResourceVisibility>("private");
+  const [allowedGroups, setAllowedGroups] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!accessToken.trim()) return;
+    if (isMultiUser && visibility === "team" && allowedGroups.length === 0) {
+      setErrorMsg("Select at least one Team Group when Visibility is set to Team.");
+      return;
+    }
     setErrorMsg(null);
     setBusy(true);
     try {
@@ -4207,6 +4456,12 @@ function LinkedInOnboardModal({
         author_urn: authorUrn.trim() || undefined,
         display_name: displayName.trim() || undefined,
         slug: slug.trim() || undefined,
+        ...(isMultiUser
+          ? {
+              visibility,
+              ...(visibility === "team" ? { allowed_groups: allowedGroups } : {}),
+            }
+          : {}),
       });
       onClose();
     } catch (err) {
@@ -4296,6 +4551,17 @@ function LinkedInOnboardModal({
             />
           </div>
         </div>
+        {isMultiUser && (
+          <VisibilityPicker
+            value={visibility}
+            allowedGroups={allowedGroups}
+            teams={teams}
+            onChange={(vis, groups) => {
+              setVisibility(vis);
+              setAllowedGroups(groups);
+            }}
+          />
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -4318,9 +4584,13 @@ function LinkedInOnboardModal({
 }
 
 function WebhookOnboardModal({
+  isMultiUser = false,
+  teams = [],
   onClose,
   onSubmit,
 }: {
+  isMultiUser?: boolean;
+  teams?: TeamGroupRecord[];
   onClose: () => void;
   onSubmit: (payload: {
     display_name: string;
@@ -4328,6 +4598,8 @@ function WebhookOnboardModal({
     signing_secret?: string;
     event_type?: string;
     target_collection?: string | null;
+    visibility?: ResourceVisibility;
+    allowed_groups?: string[];
   }) => Promise<WebhookOnboardResponse>;
 }) {
   const [displayName, setDisplayName] = useState("");
@@ -4335,6 +4607,8 @@ function WebhookOnboardModal({
   const [eventType, setEventType] = useState("webhook.received");
   const [targetCollection, setTargetCollection] = useState("webhook_events");
   const [signingSecret, setSigningSecret] = useState("");
+  const [visibility, setVisibility] = useState<ResourceVisibility>("private");
+  const [allowedGroups, setAllowedGroups] = useState<string[]>([]);
   const [created, setCreated] = useState<WebhookOnboardResponse | null>(null);
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -4343,6 +4617,10 @@ function WebhookOnboardModal({
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!displayName.trim()) return;
+    if (isMultiUser && visibility === "team" && allowedGroups.length === 0) {
+      setErrorMsg("Select at least one Team Group when Visibility is set to Team.");
+      return;
+    }
     setErrorMsg(null);
     setBusy(true);
     try {
@@ -4352,6 +4630,12 @@ function WebhookOnboardModal({
         event_type: eventType.trim() || "webhook.received",
         target_collection: targetCollection.trim() || null,
         signing_secret: signingSecret.trim() || undefined,
+        ...(isMultiUser
+          ? {
+              visibility,
+              ...(visibility === "team" ? { allowed_groups: allowedGroups } : {}),
+            }
+          : {}),
       });
       setCreated(res);
     } catch (err) {
@@ -4501,6 +4785,17 @@ function WebhookOnboardModal({
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono"
             />
           </div>
+          {isMultiUser && (
+          <VisibilityPicker
+            value={visibility}
+            allowedGroups={allowedGroups}
+            teams={teams}
+            onChange={(vis, groups) => {
+              setVisibility(vis);
+              setAllowedGroups(groups);
+            }}
+          />
+        )}
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"

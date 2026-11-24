@@ -456,7 +456,7 @@ export function ActivityView({
                 onClick={() => setGroupByThread((v) => !v)}
                 className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition cursor-pointer ${
                   groupByThread
-                    ? "bg-indigo-600 text-white border-transparent"
+                    ? "bg-slate-900 text-white border-transparent"
                     : "bg-white border-slate-200 text-slate-600 hover:text-slate-900"
                 }`}
               >
@@ -509,7 +509,7 @@ export function ActivityView({
                 />
               </div>
               <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-500">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                 Live
               </span>
             </div>
@@ -626,15 +626,15 @@ export function ActivityView({
       </div>
 
       {bots.length > 0 && (
-        <footer className="shrink-0 px-5 py-3 border-t border-slate-200 bg-white">
+        <footer className="shrink-0 px-3 md:px-5 py-2.5 md:py-3 border-t border-slate-200 bg-white">
           <form onSubmit={handleSubmit} className="max-w-4xl mx-auto flex items-center gap-2">
-            <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-700 shrink-0">
+            <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-700 shrink-0 max-w-[135px] md:max-w-none">
               <Sparkles className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
               <select
                 value={activeTargetBot?.slug ?? ""}
                 onChange={(e) => setTargetBotSlug(e.target.value)}
                 aria-label="Target bot"
-                className="bg-transparent border-0 text-xs font-medium text-slate-800 focus:outline-none cursor-pointer"
+                className="bg-transparent border-0 text-xs font-medium text-slate-800 focus:outline-none cursor-pointer truncate min-w-0"
               >
                 {bots.map((b) => (
                   <option key={b.slug} value={b.slug}>
@@ -652,12 +652,12 @@ export function ActivityView({
                   ? `Ask @${activeTargetBot.name} to run a task...`
                   : "Send an instruction to a bot..."
               }
-              className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-300"
+              className="flex-1 min-w-0 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-[16px] md:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-300"
             />
             <button
               type="submit"
               disabled={submitting || !instruction.trim()}
-              className="bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-medium cursor-pointer hover:bg-slate-800 disabled:opacity-50"
+              className="bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-medium cursor-pointer hover:bg-slate-800 disabled:opacity-50 shrink-0"
             >
               {submitting ? "Sending..." : "Send"}
             </button>

@@ -93,7 +93,7 @@ def _default_metrics_sample() -> dict[str, float]:
         }
 
 
-_PROTECTED_PREFIXES = ("/data", "/srv/argo/desktops")
+_PROTECTED_PREFIXES = ("/data", "/srv/argo/desktops", "/srv/argo/sandboxes")
 _PROTECTED_SUFFIXES = (".db", ".db-wal", ".db-shm", "-wal", "-shm")
 
 
@@ -214,6 +214,7 @@ class HostResourceGuard:
         bus: EventBus | None = None,
         telegram: TelegramBotService | None = None,
         desktop_manager: DesktopManager | None = None,
+        sandbox_manager: Any = None,
         force_notify: bool = False,
     ) -> dict[str, Any]:
         """Evaluate host telemetry, enforce critical auto-stops, and dispatch Telegram alerts."""
@@ -230,6 +231,7 @@ class HostResourceGuard:
 
         actions: list[str] = []
         stopped_desktops: list[str] = []
+        stopped_sandboxes: list[str] = []
         deliveries: list[dict[str, Any]] = []
 
         if telemetry.ram_critical:
@@ -237,12 +239,19 @@ class HostResourceGuard:
                 stopped_desktops = await desktop_manager.stop_all_desktops(reason="ram_critical")
             elif repo is not None:
                 stopped_desktops = repo.stop_running_desktops()
+            if sandbox_manager is not None:
+                stopped_sandboxes = await sandbox_manager.stop_all_sandboxes(reason="ram_critical")
+            elif repo is not None and hasattr(repo, "stop_running_sandboxes"):
+                stopped_sandboxes = repo.stop_running_sandboxes()
             if stopped_desktops:
                 actions.append(f"auto_stopped_desktops:{len(stopped_desktops)}")
-            if stopped_desktops or force_notify or self._cooldown_elapsed("ram_critical", now):
+            if stopped_sandboxes:
+                actions.append(f"auto_stopped_sandboxes:{len(stopped_sandboxes)}")
+            if stopped_desktops or stopped_sandboxes or force_notify or self._cooldown_elapsed("ram_critical", now):
                 self._last_alert_at["ram_critical"] = now
                 self._last_alert_at["ram_warning"] = now
                 actions.append("notified_ram_critical")
+                stopped_all = [*stopped_desktops, *[f"sandbox:{s}" for s in stopped_sandboxes]]
                 deliveries.extend(
                     await self._dispatch_threshold_alert(
                         alert_kind="ram_critical",
@@ -254,7 +263,7 @@ class HostResourceGuard:
                         badge_tone="rose",
                         summary=(
                             f"Host RAM reached {telemetry.ram_percent}% (>= 90%). "
-                            f"Stopped desktop containers: {', '.join(stopped_desktops) or 'none running'}."
+                            f"Stopped containers: {', '.join(stopped_all) or 'none running'}."
                         ),
                         meta="Host Resource Guard (>90% Critical Auto-Stop)",
                         stopped_desktops=stopped_desktops,
@@ -310,6 +319,7 @@ class HostResourceGuard:
             "telemetry": telemetry.to_dict(),
             "actions": actions,
             "stopped_desktops": stopped_desktops,
+            "stopped_sandboxes": stopped_sandboxes,
             "telegram_deliveries": deliveries,
         }
 

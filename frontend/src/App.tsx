@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Columns2, FileText, Loader2, Monitor, X } from "lucide-react";
-import { api } from "./api";
+import { ChevronLeft, Columns2, Loader2, Monitor, MoreHorizontal, Settings, Terminal, X } from "lucide-react";
+import { ApiError, api } from "./api";
+import { AuthGate } from "./components/AuthGate";
 import { BotAvatar } from "./components/BotAvatar";
 import { Inspector } from "./components/Inspector";
+import { MobileBotsHub } from "./components/MobileBotsHub";
+import { MobileBottomNav } from "./components/MobileBottomNav";
+import { MobilePagesHub } from "./components/MobilePagesHub";
 import { Modals, type ActiveModal } from "./components/Modals";
+import { SSHTerminalPanel } from "./components/SSHTerminalPanel";
 import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
+import { useIsMobile } from "./hooks/useIsMobile";
 import { ActivityView } from "./components/views/ActivityView";
 import { ApprovalsView } from "./components/views/ApprovalsView";
 import { BotThreadView } from "./components/views/BotThreadView";
@@ -18,6 +24,7 @@ import type {
   ActiveThreadStream,
   ActivityEvent,
   ApprovalItem,
+  AuthConfigResponse,
   BotMessage,
   BotRecord,
   BotRunActivity,
@@ -34,10 +41,12 @@ import type {
   PageRecord,
   RoomMessage,
   RoomRecord,
+  SandboxInfo,
   SettingsTab,
   SkillRecord,
   SsoPrincipal,
   StyleRule,
+  TeamGroupRecord,
   VaultSecretRecord,
   ViewId,
   WorkspaceFileRecord,
@@ -54,7 +63,10 @@ function readInitialTheme(): "light" | "dark" {
 }
 
 export function App() {
+  const isMobile = useIsMobile();
   const [activeView, setActiveView] = useState<ViewId>("activity");
+  const [mobileThreadOpen, setMobileThreadOpen] = useState(false);
+  const [mobilePageOpen, setMobilePageOpen] = useState(false);
   const [selectedBotSlug, setSelectedBotSlug] = useState<string | null>(null);
   const [selectedRoomSlug, setSelectedRoomSlug] = useState<string | null>(null);
   const [selectedPageSlug, setSelectedPageSlug] = useState<string | null>(null);
@@ -67,6 +79,10 @@ export function App() {
 
   const [searchQuery, setSearchQuery] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorTabOverride, setInspectorTabOverride] = useState<"details" | "library" | "computer" | null>(null);
+  const [terminalModalBotSlug, setTerminalModalBotSlug] = useState<string | null>(null);
+  const [terminalModalSessionId, setTerminalModalSessionId] = useState<string | null>(null);
+  const [sshRefreshTick, setSshRefreshTick] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("integrations");
   const [theme, setTheme] = useState<"light" | "dark">(readInitialTheme);
@@ -75,8 +91,20 @@ export function App() {
   const [approvalTab, setApprovalTab] = useState<"pending" | "history">("pending");
   const [modal, setModal] = useState<ActiveModal>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [prefillDraft, setPrefillDraft] = useState<{ id: number; text: string } | null>(null);
+  const prefillSeqRef = useRef(0);
 
+  const [authConfig, setAuthConfig] = useState<AuthConfigResponse | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authErrorParam, setAuthErrorParam] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get("auth_error");
+    } catch {
+      return null;
+    }
+  });
   const [principal, setPrincipal] = useState<SsoPrincipal | null>(null);
+  const [teams, setTeams] = useState<TeamGroupRecord[]>([]);
   const [summary, setSummary] = useState<WorkspaceSummary | null>(null);
   const [liveStatus, setLiveStatus] = useState<LiveWorkspaceStatusResponse | null>(null);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
@@ -94,11 +122,17 @@ export function App() {
   const [loadingOlderRoomMessages, setLoadingOlderRoomMessages] = useState(false);
   const activeMsgBotSlugRef = useRef<string | null>(null);
   const activeMsgRoomSlugRef = useRef<string | null>(null);
+  const selectedBotSlugRef = useRef<string | null>(selectedBotSlug);
+  selectedBotSlugRef.current = selectedBotSlug;
+  const selectedRoomSlugRef = useRef<string | null>(selectedRoomSlug);
+  selectedRoomSlugRef.current = selectedRoomSlug;
   const botMessagesRef = useRef<BotMessage[]>([]);
   botMessagesRef.current = botMessages;
   const botMessagesTotalRef = useRef<number>(0);
   botMessagesTotalRef.current = botMessagesTotal;
   const refreshCoreInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshCorePendingRef = useRef<boolean>(false);
+  const refreshCoreRef = useRef<() => Promise<void>>(async () => undefined);
   const sseRefreshTimerRef = useRef<number | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [styleRules, setStyleRules] = useState<StyleRule[]>([]);
@@ -108,6 +142,7 @@ export function App() {
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFileRecord[]>([]);
   const [desktopHost, setDesktopHost] = useState<HostTelemetry | null>(null);
   const [desktops, setDesktops] = useState<DesktopInfo[]>([]);
+  const [sandboxes, setSandboxes] = useState<SandboxInfo[]>([]);
   const [desktopQueuedLaunches, setDesktopQueuedLaunches] = useState<DesktopLaunchQueueItem[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationAccount[]>([]);
   const [vaultSecrets, setVaultSecrets] = useState<VaultSecretRecord[]>([]);
@@ -119,12 +154,33 @@ export function App() {
   const [queuedCountByThread, setQueuedCountByThread] = useState<Record<string, number>>({});
   const [desktopBootBySlug, setDesktopBootBySlug] = useState<Record<string, DesktopBootProgress>>({});
   const [togglingDesktops, setTogglingDesktops] = useState<Record<string, boolean>>({});
+  const [togglingSandboxes, setTogglingSandboxes] = useState<Record<string, boolean>>({});
 
   const didInitViewRef = useRef(false);
   const urlRequestedViewRef = useRef(false);
 
   useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const syncViewportHeight = () => {
+      document.documentElement.style.setProperty("--argo-vh", `${Math.round(vv.height)}px`);
+    };
+    syncViewportHeight();
+    vv.addEventListener("resize", syncViewportHeight);
+    vv.addEventListener("scroll", syncViewportHeight);
+    return () => {
+      vv.removeEventListener("resize", syncViewportHeight);
+      vv.removeEventListener("scroll", syncViewportHeight);
+      document.documentElement.style.removeProperty("--argo-vh");
+    };
+  }, []);
+
+  useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta) {
+      themeMeta.setAttribute("content", theme === "dark" ? "#13161c" : "#ffffff");
+    }
     try {
       window.localStorage.setItem("argo_theme", theme);
     } catch {
@@ -141,6 +197,7 @@ export function App() {
 
   const refreshCore = useCallback(async () => {
     if (refreshCoreInFlightRef.current) {
+      refreshCorePendingRef.current = true;
       return refreshCoreInFlightRef.current;
     }
     const run = (async () => {
@@ -162,6 +219,7 @@ export function App() {
           deskRes,
           roomsRes,
           filesRes,
+          teamsRes,
         ] = await Promise.all([
           api.getMe(),
           api.getSummary(),
@@ -172,16 +230,18 @@ export function App() {
           api.listIntegrations(),
           api.listVaultSecrets(),
           api.listStyleRules(),
-          api.listApprovals(approvalTab),
+          api.listApprovals("all"),
           api.listSkills(),
           api.listCollections(),
           api.getLiveStatus(),
           api.listDesktops(),
           api.listRooms(),
           api.listWorkspaceFiles(),
+          api.listMyTeams().catch(() => [] as TeamGroupRecord[]),
         ]);
 
         setPrincipal(meRes);
+        setTeams(teamsRes);
         setSummary(sumRes);
         setBots(botsRes);
         setRooms(roomsRes);
@@ -198,6 +258,7 @@ export function App() {
         setLiveStatus(liveRes);
         setDesktopHost(deskRes.host);
         setDesktops(deskRes.desktops);
+        setSandboxes(deskRes.sandboxes ?? []);
         setDesktopQueuedLaunches(deskRes.queued_launches ?? []);
 
         if (!didInitViewRef.current) {
@@ -224,14 +285,90 @@ export function App() {
           prev && pagesRes.some((p) => p.slug === prev) ? prev : null,
         );
       } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          setPrincipal(null);
+          void api.getAuthConfig().then(setAuthConfig).catch(() => undefined);
+          return;
+        }
         showToast(err instanceof Error ? err.message : "Failed to load workspace data");
       } finally {
         refreshCoreInFlightRef.current = null;
+        if (refreshCorePendingRef.current) {
+          refreshCorePendingRef.current = false;
+          void refreshCoreRef.current();
+        }
       }
     })();
     refreshCoreInFlightRef.current = run;
     return run;
-  }, [approvalTab, showToast]);
+  }, [showToast]);
+  refreshCoreRef.current = refreshCore;
+
+  const workspaceSessionReady =
+    authChecked &&
+    !authConfig?.needs_setup &&
+    (authConfig?.auth_mode === "sso" || Boolean(principal?.authenticated)) &&
+    !principal?.must_change_password;
+
+  const loadAuthAndWorkspace = useCallback(async () => {
+    try {
+      const cfg = await api.getAuthConfig();
+      setAuthConfig(cfg);
+      if (cfg.needs_setup) {
+        setPrincipal(null);
+        setTeams([]);
+        setAuthChecked(true);
+        return;
+      }
+      try {
+        const me = await api.getMe();
+        setPrincipal(me);
+        setAuthChecked(true);
+        if (!me.must_change_password) {
+          await refreshCoreRef.current();
+        }
+      } catch (err) {
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          setPrincipal(null);
+          if (err.status === 403 && err.message) {
+            setAuthErrorParam(err.message);
+          }
+          setAuthChecked(true);
+          return;
+        }
+        setAuthChecked(true);
+        showToast(err instanceof Error ? err.message : "Failed to verify session");
+      }
+    } catch {
+      setAuthChecked(true);
+      await refreshCoreRef.current();
+    }
+  }, [showToast]);
+
+  const handleSignOut = useCallback(async () => {
+    const mode = authConfig?.auth_mode ?? principal?.auth_mode ?? "sso";
+    if (mode === "sso") {
+      window.location.assign(`/oauth2/sign_out?rd=${encodeURIComponent("/oauth2/sign_in")}`);
+      return;
+    }
+    try {
+      await api.logout();
+    } catch {
+      // Ignore network/session cleanup errors during sign-out
+    }
+    setPrincipal(null);
+    setTeams([]);
+    setSettingsOpen(false);
+    setInspectorOpen(false);
+    setAuthErrorParam(null);
+    didInitViewRef.current = false;
+    try {
+      const cfg = await api.getAuthConfig();
+      setAuthConfig(cfg);
+    } catch {
+      // Ignore refresh failures on sign-out
+    }
+  }, [authConfig, principal?.auth_mode]);
 
   const applyTailMessages = useCallback(
     (
@@ -377,6 +514,11 @@ export function App() {
     [],
   );
 
+  const loadBotMessagesWindowRef = useRef(loadBotMessagesWindow);
+  loadBotMessagesWindowRef.current = loadBotMessagesWindow;
+  const loadRoomMessagesWindowRef = useRef(loadRoomMessagesWindow);
+  loadRoomMessagesWindowRef.current = loadRoomMessagesWindow;
+
   const handleLoadOlderRoomMessages = useCallback(async () => {
     if (!selectedRoomSlug || loadingOlderRoomMessages || !roomMessagesHasMore) return;
     const targetSlug = selectedRoomSlug;
@@ -410,10 +552,11 @@ export function App() {
   ]);
 
   const refreshViewSpecific = useCallback(async () => {
+    if (!workspaceSessionReady) return;
     try {
       if (activeView === "approvals") {
         const [aprRes, rulesRes] = await Promise.all([
-          api.listApprovals(approvalTab),
+          api.listApprovals("all"),
           api.listStyleRules(),
         ]);
         setApprovals(aprRes);
@@ -422,6 +565,7 @@ export function App() {
         const deskRes = await api.listDesktops();
         setDesktopHost(deskRes.host);
         setDesktops(deskRes.desktops);
+        setSandboxes(deskRes.sandboxes ?? []);
         setDesktopQueuedLaunches(deskRes.queued_launches ?? []);
       } else if (activeView === "integrations") {
         setIntegrations(await api.listIntegrations());
@@ -436,8 +580,8 @@ export function App() {
       showToast(err instanceof Error ? err.message : "Failed to refresh view");
     }
   }, [
+    workspaceSessionReady,
     activeView,
-    approvalTab,
     selectedBotSlug,
     selectedRoomSlug,
     loadBotMessagesWindow,
@@ -452,6 +596,7 @@ export function App() {
     const oauthStatus = params.get("oauth");
     const standaloneParam = params.get("standalone_page");
     const editPageParam = params.get("edit_page");
+    const authErrorQuery = params.get("auth_error");
 
     if (standaloneParam) {
       urlRequestedViewRef.current = true;
@@ -471,11 +616,17 @@ export function App() {
       setActiveView(viewParam);
     } else if (viewParam === "bot") {
       urlRequestedViewRef.current = true;
-      if (slugParam) setSelectedBotSlug(slugParam);
+      if (slugParam) {
+        setSelectedBotSlug(slugParam);
+        setMobileThreadOpen(true);
+      }
       setActiveView("bot");
     } else if (viewParam === "page") {
       urlRequestedViewRef.current = true;
-      if (slugParam) setSelectedPageSlug(slugParam);
+      if (slugParam) {
+        setSelectedPageSlug(slugParam);
+        setMobilePageOpen(true);
+      }
       setActiveView("page");
     }
 
@@ -494,20 +645,51 @@ export function App() {
       );
     }
 
-    if (viewParam || oauthStatus || editPageParam) {
+    if (viewParam || oauthStatus || editPageParam || authErrorQuery) {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, [refreshCore, showToast]);
 
   useEffect(() => {
-    void refreshCore();
-  }, [refreshCore]);
+    void loadAuthAndWorkspace();
+  }, [loadAuthAndWorkspace]);
 
   useEffect(() => {
     void refreshViewSpecific();
   }, [refreshViewSpecific]);
 
   useEffect(() => {
+    if (!workspaceSessionReady) {
+      return;
+    }
+    const clearLiveBotRunningState = (botSlug: string) => {
+      if (!botSlug) return;
+      setLiveStatus((prev) => {
+        if (!prev?.bots) return prev;
+        let changed = false;
+        const nextBots = prev.bots.map((b) => {
+          if (b.slug === botSlug && b.state === "running") {
+            changed = true;
+            return { ...b, state: "idle" as const, active_step: undefined };
+          }
+          return b;
+        });
+        return changed ? { ...prev, bots: nextBots } : prev;
+      });
+    };
+    const syncApprovalsNow = () =>
+      api
+        .listApprovals("all")
+        .then((aprRes) => {
+          setApprovals(aprRes);
+          const pendingCnt = aprRes.filter((a) => a.status === "pending").length;
+          setSummary((prev) =>
+            prev
+              ? { ...prev, counts: { ...prev.counts, pending_approvals: pendingCnt } }
+              : prev,
+          );
+        })
+        .catch(() => undefined);
     const scheduleSseRefresh = () => {
       if (sseRefreshTimerRef.current !== null) return;
       sseRefreshTimerRef.current = window.setTimeout(() => {
@@ -517,7 +699,36 @@ export function App() {
       }, 300);
     };
     const source = new EventSource("/api/activity/stream");
-    source.addEventListener("activity", () => {
+    source.addEventListener("activity", (ev) => {
+      try {
+        const parsed = JSON.parse(String((ev as MessageEvent).data ?? "{}")) as {
+          event_type?: string;
+          payload?: {
+            target_type?: string;
+            slug?: string;
+          };
+        };
+        const eventType = String(parsed.event_type ?? "");
+        if (eventType.startsWith("ssh.")) {
+          setSshRefreshTick((t) => t + 1);
+        }
+        if (eventType === "approval.queued" || eventType === "approval.resolved") {
+          void syncApprovalsNow();
+        }
+        if (eventType === "thread.cleared" && parsed.payload) {
+          const tType = String(parsed.payload.target_type ?? "");
+          const tSlug = String(parsed.payload.slug ?? "");
+          const curRoom = selectedRoomSlugRef.current;
+          const curBot = selectedBotSlugRef.current;
+          if (curRoom && (tType === "all" || (tType === "room" && tSlug === curRoom))) {
+            void loadRoomMessagesWindowRef.current(curRoom, { reset: true });
+          } else if (!curRoom && curBot && (tType === "all" || (tType === "bot" && tSlug === curBot))) {
+            void loadBotMessagesWindowRef.current(curBot, { reset: true });
+          }
+        }
+      } catch {
+        // Ignore malformed activity payload
+      }
       scheduleSseRefresh();
     });
     source.addEventListener("bot_progress", (ev) => {
@@ -530,8 +741,14 @@ export function App() {
         const slug = String(data.bot_slug ?? "").trim();
         if (!slug) return;
         const stepText = String(data.step ?? "").trim();
-        const isDesktopStep =
-          /virtual desktop|fedora|chromium|selkies|mcp|container|x11|installing/i.test(stepText);
+        const isDesktopBootStep =
+          /starting virtual desktop|waking fedora|creating isolated|pulling fedora|injecting desktop|checking host memory gate|waiting for virtual desktop|warming up selkies|first-time setup: installing/i.test(
+            stepText,
+          );
+        const isDesktopActiveStep =
+          /browsing in virtual desktop|capturing virtual desktop|running virtual desktop action|interacting with browser/i.test(
+            stepText,
+          );
 
         if (data.state === "running" || data.state === "working") {
           setRunningBots((prev) => ({
@@ -541,7 +758,7 @@ export function App() {
               startedAt: prev[slug]?.startedAt ?? Date.now(),
             },
           }));
-          if (isDesktopStep) {
+          if (isDesktopBootStep) {
             setDesktopBootBySlug((prev) => ({
               ...prev,
               [slug]: {
@@ -550,6 +767,14 @@ export function App() {
                 updatedAt: Date.now(),
               },
             }));
+          } else if (isDesktopActiveStep) {
+            setDesktopBootBySlug((prev) => {
+              const cur = prev[slug];
+              if (!cur || cur.state !== "booting") return prev;
+              const next = { ...prev };
+              delete next[slug];
+              return next;
+            });
           }
         } else if (data.state === "desktop_boot") {
           setDesktopBootBySlug((prev) => ({
@@ -595,6 +820,7 @@ export function App() {
             delete next[slug];
             return next;
           });
+          clearLiveBotRunningState(slug);
           setDesktopBootBySlug((prev) => {
             const cur = prev[slug];
             if (!cur || cur.state === "error") return prev;
@@ -705,6 +931,9 @@ export function App() {
             };
           });
         } else if (data.type === "chip_started" && runId && data.chip_id) {
+          if (String(data.action_type ?? "").startsWith("ssh_")) {
+            setSshRefreshTick((t) => t + 1);
+          }
           const newChip: LiveTurnChip = {
             chip_id: data.chip_id,
             action_type: String(data.action_type ?? "action"),
@@ -721,6 +950,9 @@ export function App() {
             };
           });
         } else if (data.type === "chip_finished" && runId && data.chip_id) {
+          if (String(data.action_type ?? "").startsWith("ssh_")) {
+            setSshRefreshTick((t) => t + 1);
+          }
           setActiveStreamByThread((prev) => {
             const cur = prev[threadKey];
             if (!cur || cur.runId !== runId) return prev;
@@ -751,6 +983,16 @@ export function App() {
           if (data.status === "error" && data.error) {
             showToast(String(data.error));
           }
+          const botSlug = String(data.bot_slug ?? "").trim();
+          if (botSlug) {
+            setRunningBots((prev) => {
+              if (!(botSlug in prev)) return prev;
+              const next = { ...prev };
+              delete next[botSlug];
+              return next;
+            });
+            clearLiveBotRunningState(botSlug);
+          }
           const slug = String(data.target_slug ?? threadKey.split(":", 2)[1] ?? "");
           const finalize = () => {
             setActiveStreamByThread((prev) => {
@@ -761,8 +1003,9 @@ export function App() {
               return next;
             });
           };
+          const approvalsSync = syncApprovalsNow();
           if (threadKey.startsWith("room:") && activeMsgRoomSlugRef.current === slug) {
-            void api
+            const messagesSync = api
               .listRoomMessagesPage(slug, { limit: 40 })
               .then((res) => {
                 if (activeMsgRoomSlugRef.current !== slug) return;
@@ -772,10 +1015,10 @@ export function App() {
                 const lastBotMsg = [...res.messages].reverse().find((m) => m.sender === "bot");
                 detectAndOpenPageAction(lastBotMsg?.metadata?.actions);
               })
-              .catch(() => undefined)
-              .finally(finalize);
+              .catch(() => undefined);
+            void Promise.all([messagesSync, approvalsSync]).finally(finalize);
           } else if (threadKey.startsWith("bot:") && activeMsgBotSlugRef.current === slug) {
-            void api
+            const messagesSync = api
               .listBotMessagesPage(slug, { limit: 40 })
               .then((res) => {
                 if (activeMsgBotSlugRef.current !== slug) return;
@@ -783,9 +1026,10 @@ export function App() {
                 const lastBotMsg = [...res.messages].reverse().find((m) => m.sender === "bot");
                 detectAndOpenPageAction(lastBotMsg?.metadata?.actions);
               })
-              .catch(() => undefined)
-              .finally(finalize);
+              .catch(() => undefined);
+            void Promise.all([messagesSync, approvalsSync]).finally(finalize);
           } else {
+            void approvalsSync;
             finalize();
           }
           scheduleSseRefresh();
@@ -796,12 +1040,13 @@ export function App() {
     });
     return () => {
       source.close();
+      refreshCorePendingRef.current = false;
       if (sseRefreshTimerRef.current !== null) {
         window.clearTimeout(sseRefreshTimerRef.current);
         sseRefreshTimerRef.current = null;
       }
     };
-  }, [applyTailMessages, refreshCore, refreshViewSpecific, showToast]);
+  }, [applyTailMessages, refreshCore, refreshViewSpecific, showToast, workspaceSessionReady]);
 
   const selectedBot = bots.find((b) => b.slug === selectedBotSlug) ?? bots[0] ?? null;
   const selectedRoom = selectedRoomSlug
@@ -829,14 +1074,19 @@ export function App() {
       return;
     }
     setActiveView(view);
+    setInspectorTabOverride(null);
     if (view !== "bot" && view !== "page") {
       setContextCorrelationId(null);
       setInspectorOpen(false);
     }
     if (view === "bot") {
       setSelectedRoomSlug(null);
+      if (slug && slug !== selectedBotSlug) {
+        setContextCorrelationId(null);
+      }
       if (slug) {
         setSelectedBotSlug(slug);
+        setMobileThreadOpen(true);
         setLiveStatus((prev) =>
           prev
             ? {
@@ -851,13 +1101,19 @@ export function App() {
     }
     if (view === "page") {
       setSplitPageSlug(null);
-      if (slug) setSelectedPageSlug(slug);
+      if (slug) {
+        setSelectedPageSlug(slug);
+        setMobilePageOpen(true);
+      }
     }
   }
 
   function handleSelectRoom(roomSlug: string) {
+    setInspectorTabOverride(null);
+    setContextCorrelationId(null);
     setSelectedRoomSlug(roomSlug);
     setActiveView("bot");
+    setMobileThreadOpen(true);
     setLiveStatus((prev) =>
       prev && prev.rooms
         ? {
@@ -872,7 +1128,7 @@ export function App() {
   }
 
   function handleOpenPage(pageSlug: string, sideBySide = false) {
-    if (sideBySide) {
+    if (sideBySide && !isMobile) {
       setSplitPageSlug(pageSlug);
       if (activeView !== "bot") {
         setActiveView("bot");
@@ -881,6 +1137,24 @@ export function App() {
     }
     setSplitPageSlug(null);
     handleSwitchView("page", pageSlug);
+  }
+
+  function handlePrefillChat(botSlug: string, prompt: string) {
+    const cleanPrompt = prompt.trim();
+    if (!cleanPrompt) return;
+    const requested = botSlug.trim();
+    const targetBot =
+      (requested && bots.find((b) => b.slug === requested)) ||
+      selectedBot ||
+      bots[0] ||
+      null;
+    if (targetBot) {
+      handleSwitchView("bot", targetBot.slug);
+    } else {
+      setActiveView("bot");
+    }
+    prefillSeqRef.current += 1;
+    setPrefillDraft({ id: prefillSeqRef.current, text: cleanPrompt });
   }
 
   function detectAndOpenPageAction(actions?: Array<Record<string, unknown>>) {
@@ -936,6 +1210,27 @@ export function App() {
     }
   }
 
+  async function handleToggleSandbox(slug: string) {
+    setTogglingSandboxes((prev) => ({ ...prev, [slug]: true }));
+    try {
+      await api.toggleSandbox(slug);
+      await refreshCore();
+      await refreshViewSpecific();
+      showToast(`Updated script sandbox for ${slug}.`);
+    } catch (err) {
+      await refreshCore();
+      await refreshViewSpecific();
+      showToast(err instanceof Error ? err.message : "Sandbox action blocked");
+    } finally {
+      setTogglingSandboxes((prev) => {
+        if (!(slug in prev)) return prev;
+        const next = { ...prev };
+        delete next[slug];
+        return next;
+      });
+    }
+  }
+
   async function handleTriggerBot(slug: string, routineId?: string) {
     setRunningBots((prev) => ({
       ...prev,
@@ -979,20 +1274,67 @@ export function App() {
     }
   }
 
-  async function handleApproveItem(id: string) {
+  async function handleApproveItem(id: string, opts?: { trust_command?: boolean }) {
     try {
-      const res = await api.resolveApproval(id, { action: "approve" });
+      const res = await api.resolveApproval(id, {
+        action: "approve",
+        ...(opts?.trust_command ? { trust_command: true } : {}),
+      });
       await refreshCore();
       await refreshViewSpecific();
-      showToast(
-        res.status === "executed"
-          ? "Approved and executed."
-          : "Approved.",
-      );
+      const isSsh = res.action_type === "ssh_exec" || res.action_type === "ssh_input";
+      const added =
+        res.trusted_prefixes_added ?? res.payload.execution_result?.trusted_prefixes_added ?? [];
+      if (res.error_message) {
+        showToast(res.error_message);
+      } else if (isSsh && res.status === "executed") {
+        showToast(
+          added.length > 0
+            ? `Approved, ran SSH command, and always allowed: ${added.join(", ")}`
+            : "Approved and ran SSH command — output sent to bot chat.",
+        );
+      } else {
+        showToast(
+          res.status === "executed"
+            ? "Approved and executed."
+            : "Approved.",
+        );
+      }
     } catch (err) {
       await refreshCore();
       await refreshViewSpecific();
       showToast(err instanceof Error ? err.message : "Approval failed");
+    }
+  }
+
+  async function handleBatchResolveApprovals(
+    ids: string[],
+    action: "approve" | "reject",
+    opts?: { trust_command?: boolean },
+  ) {
+    if (ids.length === 0) return;
+    try {
+      const res = await api.batchResolveApprovals({
+        approval_ids: ids,
+        action,
+        trust_command: Boolean(opts?.trust_command),
+      });
+      await refreshCore();
+      await refreshViewSpecific();
+      const added = res.trusted_prefixes_added ?? [];
+      if (action === "reject") {
+        showToast(`Rejected ${res.resolved_count} item(s).`);
+      } else if (added.length > 0) {
+        showToast(
+          `Approved ${res.resolved_count} item(s) and always allowed: ${added.join(", ")}`,
+        );
+      } else {
+        showToast(`Approved and executed ${res.resolved_count} item(s).`);
+      }
+    } catch (err) {
+      await refreshCore();
+      await refreshViewSpecific();
+      showToast(err instanceof Error ? err.message : "Batch approval failed");
     }
   }
 
@@ -1006,6 +1348,41 @@ export function App() {
       await refreshCore();
       await refreshViewSpecific();
       showToast(err instanceof Error ? err.message : "Reject failed");
+    }
+  }
+
+  function applyQueuedAckStreamState(params: {
+    threadKey: string;
+    targetType: "bot" | "room";
+    targetSlug: string;
+    botSlug: string;
+    botName: string;
+    ack: { run_id: string; queued_behind: number };
+  }) {
+    const { threadKey, targetType, targetSlug, botSlug, botName, ack } = params;
+    if (ack.queued_behind > 0) {
+      setQueuedCountByThread((prev) => ({
+        ...prev,
+        [threadKey]: Math.max(prev[threadKey] ?? 0, ack.queued_behind),
+      }));
+    } else {
+      setActiveStreamByThread((prev) => {
+        if (prev[threadKey] && !prev[threadKey].finishing) return prev;
+        return {
+          ...prev,
+          [threadKey]: {
+            runId: ack.run_id,
+            threadKey,
+            targetType,
+            targetSlug,
+            botSlug,
+            botName,
+            text: "",
+            chips: [],
+            startedAt: Date.now(),
+          },
+        };
+      });
     }
   }
 
@@ -1027,33 +1404,54 @@ export function App() {
       if (ack.user_message) {
         applyTailMessages(slug, [ack.user_message as BotMessage]);
       }
-      if (ack.queued_behind > 0) {
-        setQueuedCountByThread((prev) => ({
-          ...prev,
-          [threadKey]: Math.max(prev[threadKey] ?? 0, ack.queued_behind),
-        }));
-      } else {
-        setActiveStreamByThread((prev) => {
-          if (prev[threadKey] && !prev[threadKey].finishing) return prev;
-          return {
-            ...prev,
-            [threadKey]: {
-              runId: ack.run_id,
-              threadKey,
-              targetType: "bot",
-              targetSlug: slug,
-              botSlug: slug,
-              botName: targetBot?.name ?? slug,
-              text: "",
-              chips: [],
-              startedAt: Date.now(),
-            },
-          };
-        });
-      }
+      applyQueuedAckStreamState({
+        threadKey,
+        targetType: "bot",
+        targetSlug: slug,
+        botSlug: slug,
+        botName: targetBot?.name ?? slug,
+        ack,
+      });
       setContextCorrelationId(null);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Failed to send message");
+      throw err;
+    }
+  }
+
+  async function handleEditLastBotMessage(slug: string, messageId: string, newText: string) {
+    const threadKey = `bot:${slug}`;
+    const targetBot = bots.find((b) => b.slug === slug);
+    try {
+      const ack = await api.editLastBotMessage(slug, messageId, newText);
+      const removed = new Set(ack.removed_message_ids ?? [messageId]);
+      if (activeMsgBotSlugRef.current === slug || selectedBotSlugRef.current === slug) {
+        const filtered = botMessagesRef.current.filter((m) => !removed.has(m.id));
+        const nextUserMsg = ack.user_message as BotMessage | null;
+        const nextMessages =
+          nextUserMsg && !filtered.some((m) => m.id === nextUserMsg.id)
+            ? [...filtered, nextUserMsg]
+            : filtered;
+        const nextTotal = Math.max(
+          nextMessages.length,
+          botMessagesTotalRef.current - removed.size + (nextUserMsg ? 1 : 0),
+        );
+        botMessagesRef.current = nextMessages;
+        botMessagesTotalRef.current = nextTotal;
+        setBotMessages(nextMessages);
+        setBotMessagesTotal(nextTotal);
+      }
+      applyQueuedAckStreamState({
+        threadKey,
+        targetType: "bot",
+        targetSlug: slug,
+        botSlug: slug,
+        botName: targetBot?.name ?? slug,
+        ack,
+      });
+      void refreshCore();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Failed to re-submit edited message");
       throw err;
     }
   }
@@ -1081,32 +1479,52 @@ export function App() {
           prev.some((m) => m.id === userRoomMsg.id) ? prev : [...prev, userRoomMsg],
         );
       }
-      if (ack.queued_behind > 0) {
-        setQueuedCountByThread((prev) => ({
-          ...prev,
-          [threadKey]: Math.max(prev[threadKey] ?? 0, ack.queued_behind),
-        }));
-      } else {
-        setActiveStreamByThread((prev) => {
-          if (prev[threadKey] && !prev[threadKey].finishing) return prev;
-          return {
-            ...prev,
-            [threadKey]: {
-              runId: ack.run_id,
-              threadKey,
-              targetType: "room",
-              targetSlug: roomSlug,
-              botSlug: leadSlug,
-              botName: leadBot?.name ?? rm?.title ?? "Room",
-              text: "",
-              chips: [],
-              startedAt: Date.now(),
-            },
-          };
-        });
-      }
+      applyQueuedAckStreamState({
+        threadKey,
+        targetType: "room",
+        targetSlug: roomSlug,
+        botSlug: leadSlug,
+        botName: leadBot?.name ?? rm?.title ?? "Room",
+        ack,
+      });
+      setContextCorrelationId(null);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Failed to send room message");
+      throw err;
+    }
+  }
+
+  async function handleEditLastRoomMessage(roomSlug: string, messageId: string, newText: string) {
+    const threadKey = `room:${roomSlug}`;
+    const rm = rooms.find((r) => r.slug === roomSlug);
+    const leadSlug = rm?.coordinator_bot_slug || rm?.member_bot_slugs[0] || "";
+    const leadBot = bots.find((b) => b.slug === leadSlug);
+    try {
+      const ack = await api.editLastRoomMessage(roomSlug, messageId, newText);
+      const removed = new Set(ack.removed_message_ids ?? [messageId]);
+      if (activeMsgRoomSlugRef.current === roomSlug || selectedRoomSlugRef.current === roomSlug) {
+        const nextUserMsg = ack.user_message as RoomMessage | null;
+        setRoomMessages((prev) => {
+          const filtered = prev.filter((m) => !removed.has(m.id));
+          return nextUserMsg && !filtered.some((m) => m.id === nextUserMsg.id)
+            ? [...filtered, nextUserMsg]
+            : filtered;
+        });
+        setRoomMessagesTotal((prev) =>
+          Math.max(0, prev - removed.size + (nextUserMsg ? 1 : 0)),
+        );
+      }
+      applyQueuedAckStreamState({
+        threadKey,
+        targetType: "room",
+        targetSlug: roomSlug,
+        botSlug: leadSlug,
+        botName: leadBot?.name ?? rm?.title ?? "Room",
+        ack,
+      });
+      void refreshCore();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Failed to re-submit edited room message");
       throw err;
     }
   }
@@ -1155,27 +1573,6 @@ export function App() {
       showToast(err instanceof Error ? err.message : "Failed to run delegation plan");
       throw err;
     }
-  }
-
-  async function handleOpenOrCreateHubBoard() {
-    const existingHub = pages.find(
-      (p) =>
-        p.slug === "bot-hub-board" ||
-        p.title.toLowerCase().includes("hub board"),
-    );
-    if (existingHub) {
-      setSplitPageSlug(existingHub.slug);
-      return;
-    }
-    const created = await api.generatePage({
-      template_key: "bot_hub_board",
-      title: "Bot Hub Board",
-      prompt: "Create central Bot Hub Board",
-      owner_bot_slug: selectedBot?.slug || bots[0]?.slug || "operations-coordinator",
-    });
-    await refreshCore();
-    setSplitPageSlug(created.slug);
-    showToast(`Opened ${created.title} beside chat.`);
   }
 
   async function handleExportTeamPack(opts?: {
@@ -1281,6 +1678,9 @@ export function App() {
       if (remaining.length === 0 && activeView === "bot") {
         setActiveView("activity");
       }
+      if (selectedBotSlug === slug) {
+        setMobileThreadOpen(false);
+      }
       setInspectorOpen(false);
       await refreshCore();
       showToast(`Removed bot ${botName}.`);
@@ -1288,6 +1688,48 @@ export function App() {
       showToast(err instanceof Error ? err.message : `Failed to remove bot ${botName}`);
       throw err;
     }
+  }
+
+  async function handleClearBotMessages(slug: string, opts?: { keep_last?: number }) {
+    const res = await api.clearBotMessages(slug, opts);
+    if (activeMsgBotSlugRef.current === slug || selectedBotSlugRef.current === slug) {
+      botMessagesRef.current = res.messages;
+      botMessagesTotalRef.current = res.total_count;
+      setBotMessages(res.messages);
+      setBotMessagesHasMore(res.has_more);
+      setBotMessagesTotal(res.total_count);
+    }
+    await refreshCore();
+    showToast(
+      res.deleted_count > 0
+        ? `Cleared ${res.deleted_count} message${res.deleted_count === 1 ? "" : "s"}.`
+        : "No messages removed.",
+    );
+  }
+
+  async function handleExportBotMessages(slug: string) {
+    const filename = await api.exportBotMessagesMarkdown(slug);
+    showToast(`Downloaded ${filename}.`);
+  }
+
+  async function handleClearRoomMessages(slug: string, opts?: { keep_last?: number }) {
+    const res = await api.clearRoomMessages(slug, opts);
+    if (activeMsgRoomSlugRef.current === slug || selectedRoomSlugRef.current === slug) {
+      setRoomMessages(res.messages);
+      setRoomMessagesHasMore(res.has_more);
+      setRoomMessagesTotal(res.total_count);
+    }
+    await refreshCore();
+    showToast(
+      res.deleted_count > 0
+        ? `Cleared ${res.deleted_count} room message${res.deleted_count === 1 ? "" : "s"}.`
+        : "No room messages removed.",
+    );
+  }
+
+  async function handleExportRoomMessages(slug: string) {
+    const filename = await api.exportRoomMessagesMarkdown(slug);
+    showToast(`Downloaded ${filename}.`);
   }
 
   function openSelkiesForBot(bot: BotRecord) {
@@ -1365,7 +1807,30 @@ export function App() {
     : selectedBot
       ? runningBots[selectedBot.slug] ?? null
       : null;
-  const isBotSplitActive = activeView === "bot" && Boolean(splitPage);
+  const isBotSplitActive = !isMobile && activeView === "bot" && Boolean(splitPage);
+  const isMobileBotsHub = isMobile && activeView === "bot" && !mobileThreadOpen;
+  const isMobilePagesHub = isMobile && activeView === "page" && !mobilePageOpen;
+  const showMobileBottomNav =
+    isMobile &&
+    (isMobileBotsHub ||
+      isMobilePagesHub ||
+      activeView === "approvals" ||
+      activeView === "activity");
+  const showMainHeader = !isMobileBotsHub && !isMobilePagesHub;
+  const botHasSshAccess = Boolean(
+    !selectedRoom &&
+      selectedBot &&
+      (vaultSecrets.some(
+        (v) =>
+          v.secret_type === "ssh" &&
+          (v.allowed_bots.includes("*") || v.allowed_bots.includes(selectedBot.slug)),
+      ) ||
+        botMessages.some(
+          (m) =>
+            Array.isArray(m.metadata?.actions) &&
+            m.metadata.actions.some((a) => String(a.type ?? "").startsWith("ssh_")),
+        )),
+  );
 
   let centerTitle = "Activity";
   let centerTag: string | null = null;
@@ -1381,7 +1846,11 @@ export function App() {
     } else {
       centerTitle = selectedBot?.name ?? "Bots";
       centerTag =
-        selectedBot?.runtime === "desktop" ? "Virtual Desktop" : null;
+        selectedBot?.runtime === "desktop"
+          ? "Virtual Desktop"
+          : selectedBot?.runtime === "sandbox"
+            ? "Script Sandbox"
+            : null;
       centerSubtitle = activeBotRun
         ? activeBotRun.step
         : selectedBot
@@ -1398,6 +1867,57 @@ export function App() {
     centerSubtitle = "Live data views and interactive pages updated by your bots";
   }
 
+  if (!authChecked) {
+    return (
+      <div className="min-h-dvh w-full bg-slate-100 dark:bg-[#0f1218] text-slate-600 dark:text-slate-300 flex items-center justify-center">
+        <Loader2 className="w-6 h-6 animate-spin" />
+      </div>
+    );
+  }
+
+  if (authConfig?.needs_setup) {
+    return (
+      <AuthGate
+        mode="bootstrap"
+        authConfig={authConfig}
+        initialError={authErrorParam}
+        onAuthenticated={async () => {
+          setAuthErrorParam(null);
+          await loadAuthAndWorkspace();
+        }}
+      />
+    );
+  }
+
+  if (authConfig && authConfig.auth_mode !== "sso" && !principal?.authenticated) {
+    return (
+      <AuthGate
+        mode="login"
+        authConfig={authConfig}
+        initialError={authErrorParam}
+        onAuthenticated={async () => {
+          setAuthErrorParam(null);
+          await loadAuthAndWorkspace();
+        }}
+      />
+    );
+  }
+
+  if (principal?.must_change_password) {
+    return (
+      <AuthGate
+        mode="change_password"
+        authConfig={authConfig}
+        principal={principal}
+        onAuthenticated={async () => {
+          setAuthErrorParam(null);
+          await loadAuthAndWorkspace();
+        }}
+        onLogout={handleSignOut}
+      />
+    );
+  }
+
   if (standalonePageSlug) {
     const ownerBot =
       bots.find((b) => b.slug === standalonePage?.owner_bot_slug) ?? null;
@@ -1405,6 +1925,7 @@ export function App() {
       <div className="h-screen w-screen overflow-hidden bg-slate-50 text-slate-900">
         <PagesView
           standalone
+          theme={theme}
           page={standalonePage}
           liveStatus={liveStatus}
           ownerBot={ownerBot}
@@ -1425,42 +1946,159 @@ export function App() {
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-50 text-slate-900">
-      <Sidebar
-        activeView={activeView}
-        selectedBotSlug={selectedRoom ? null : selectedBot?.slug ?? null}
-        selectedRoomSlug={selectedRoom?.slug ?? null}
-        selectedPageSlug={selectedPage?.slug ?? null}
-        splitPageSlug={splitPage?.slug ?? null}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        onSwitchView={handleSwitchView}
-        onSelectRoom={handleSelectRoom}
-        onOpenNewBot={() => setModal({ type: "new-bot" })}
-        onOpenNewRoom={() => setModal({ type: "new-bot", initialTab: "room" })}
-        onOpenNewPage={() => setModal({ type: "new-page" })}
-        onOpenPageInSplit={(pageSlug) => handleOpenPage(pageSlug, true)}
-        onOpenSettings={handleOpenSettings}
-        onToggleBotPin={(slug, nextPinned) => {
-          void api.updateBot(slug, { pinned: nextPinned }).then(() => refreshCore());
-        }}
-        onToggleBotHidden={(slug, nextHidden) => {
-          void api.updateBot(slug, { hidden_in_sidebar: nextHidden }).then(() => refreshCore());
-        }}
-        onDeleteBot={handleDeleteBot}
-        bots={bots}
-        rooms={rooms}
-        pages={pages}
-        integrations={integrations}
-        runningBots={runningBots}
-        liveStatus={liveStatus}
-        summary={summary}
-        principal={principal}
-        theme={theme}
-        onToggleTheme={setTheme}
-      />
+    <div className="flex h-[var(--argo-vh,100dvh)] w-screen overflow-hidden bg-slate-50 text-slate-900">
+      {!isMobile && (
+        <Sidebar
+          activeView={activeView}
+          selectedBotSlug={selectedRoom ? null : selectedBot?.slug ?? null}
+          selectedRoomSlug={selectedRoom?.slug ?? null}
+          selectedPageSlug={selectedPage?.slug ?? null}
+          splitPageSlug={splitPage?.slug ?? null}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          onSwitchView={handleSwitchView}
+          onSelectRoom={handleSelectRoom}
+          onOpenNewBot={() => setModal({ type: "new-bot" })}
+          onOpenNewRoom={() => setModal({ type: "new-bot", initialTab: "room" })}
+          onOpenNewPage={() => setModal({ type: "new-page" })}
+          onOpenPageInSplit={(pageSlug) => handleOpenPage(pageSlug, true)}
+          onOpenSettings={handleOpenSettings}
+          onToggleBotPin={(slug, nextPinned) => {
+            void api.updateBot(slug, { pinned: nextPinned }).then(() => refreshCore());
+          }}
+          onToggleBotHidden={(slug, nextHidden) => {
+            void api.updateBot(slug, { hidden_in_sidebar: nextHidden }).then(() => refreshCore());
+          }}
+          onDeleteBot={handleDeleteBot}
+          bots={bots}
+          rooms={rooms}
+          pages={pages}
+          integrations={integrations}
+          runningBots={runningBots}
+          liveStatus={liveStatus}
+          summary={summary}
+          principal={principal}
+          theme={theme}
+          onToggleTheme={setTheme}
+          onSignOut={() => void handleSignOut()}
+        />
+      )}
 
       <main className="flex-1 flex flex-col min-w-0 h-full bg-slate-50">
+        {showMainHeader && isMobile && (
+          <header className="shrink-0 argo-safe-top border-b border-slate-200 bg-white px-3">
+            <div className="h-14 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                {(activeView === "bot" || activeView === "page") ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInspectorOpen(false);
+                      if (activeView === "bot") {
+                        setMobileThreadOpen(false);
+                      } else {
+                        setMobilePageOpen(false);
+                      }
+                    }}
+                    aria-label={activeView === "bot" ? "Back to Bots" : "Back to Pages"}
+                    className="w-9 h-9 -ml-1 rounded-full flex items-center justify-center text-slate-700 hover:bg-slate-100 shrink-0 cursor-pointer"
+                  >
+                    <ChevronLeft className="w-5 h-5" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleOpenSettings("integrations")}
+                    aria-label="Settings"
+                    className="w-9 h-9 -ml-1 rounded-full flex items-center justify-center text-slate-700 hover:bg-slate-100 shrink-0 cursor-pointer"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </button>
+                )}
+
+                {activeView === "bot" && !selectedRoom && selectedBot && (
+                  <BotAvatar
+                    icon={selectedBot.avatar_icon}
+                    color={selectedBot.avatar_color}
+                    initials={selectedBot.initials}
+                    size="sm"
+                  />
+                )}
+                {activeView === "bot" && selectedRoom && (
+                  <div className="flex items-center -space-x-1.5 shrink-0">
+                    {selectedRoom.member_bot_slugs
+                      .map((slug) => bots.find((b) => b.slug === slug))
+                      .filter((b): b is BotRecord => Boolean(b))
+                      .slice(0, 2)
+                      .map((mb) => (
+                        <BotAvatar
+                          key={mb.slug}
+                          icon={mb.avatar_icon}
+                          color={mb.avatar_color}
+                          initials={mb.initials}
+                          size="xs"
+                        />
+                      ))}
+                  </div>
+                )}
+
+                <div className="min-w-0 flex-1">
+                  <h1 className="text-[15px] font-semibold text-slate-900 truncate leading-tight">
+                    {centerTitle}
+                  </h1>
+                  <p className="text-[11px] text-slate-500 truncate flex items-center gap-1 leading-tight">
+                    {activeView === "bot" && activeBotRun && (
+                      <Loader2 className="w-3 h-3 animate-spin text-blue-500 shrink-0" />
+                    )}
+                    <span className="truncate">{centerSubtitle}</span>
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1 shrink-0">
+                {activeView === "bot" && botHasSshAccess && selectedBot && (
+                  <button
+                    type="button"
+                    aria-label="Live Terminal"
+                    onClick={() => {
+                      setTerminalModalBotSlug(selectedBot.slug);
+                      setTerminalModalSessionId(null);
+                    }}
+                    className="w-9 h-9 rounded-full border border-slate-200 bg-white text-sky-600 flex items-center justify-center cursor-pointer"
+                  >
+                    <Terminal className="w-4 h-4" />
+                  </button>
+                )}
+                {activeView === "bot" && !selectedRoom && selectedBot?.runtime === "desktop" && (
+                  <button
+                    type="button"
+                    aria-label="Open Virtual Desktop"
+                    onClick={() => openSelkiesForBot(selectedBot)}
+                    className="w-9 h-9 rounded-full border border-slate-200 bg-white text-slate-800 flex items-center justify-center cursor-pointer"
+                  >
+                    <Monitor className="w-4 h-4" />
+                  </button>
+                )}
+                {(activeView === "bot" || activeView === "page") && (
+                  <button
+                    type="button"
+                    aria-label={inspectorOpen ? "Hide Details" : "Bot Details"}
+                    onClick={() => setInspectorOpen((v) => !v)}
+                    className={`w-9 h-9 rounded-full border flex items-center justify-center cursor-pointer ${
+                      inspectorOpen
+                        ? "border-slate-900 bg-slate-900 text-white"
+                        : "border-slate-200 bg-white text-slate-700"
+                    }`}
+                  >
+                    <MoreHorizontal className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            </div>
+          </header>
+        )}
+
+        {showMainHeader && !isMobile && (
         <header className="h-14 shrink-0 px-5 border-b border-slate-200 bg-white flex items-center justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2.5">
@@ -1511,43 +2149,78 @@ export function App() {
             )}
             {activeView === "bot" && (selectedBot || selectedRoom) && (
               <>
+                {(() => {
+                  const contextualPages = selectedRoom
+                    ? pages
+                        .filter(
+                          (pg) =>
+                            pg.slug === selectedRoom.pinned_page_slug ||
+                            selectedRoom.member_bot_slugs.includes(pg.owner_bot_slug),
+                        )
+                        .sort((a, b) =>
+                          a.slug === selectedRoom.pinned_page_slug
+                            ? -1
+                            : b.slug === selectedRoom.pinned_page_slug
+                              ? 1
+                              : 0,
+                        )
+                    : selectedBot
+                      ? pages.filter((pg) => pg.owner_bot_slug === selectedBot.slug)
+                      : [];
+                  return (
+                    <>
+                      {contextualPages
+                        .filter((pg) => pg.slug !== splitPage?.slug)
+                        .slice(0, 2)
+                        .map((pg) => (
+                          <button
+                            key={pg.id}
+                            type="button"
+                            onClick={() => handleOpenPage(pg.slug, true)}
+                            title={`Dock beside chat: ${pg.title}`}
+                            className="hidden md:inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs font-medium text-slate-800 cursor-pointer max-w-[190px]"
+                          >
+                            <Columns2 className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                            <span className="truncate">{pg.title}</span>
+                          </button>
+                        ))}
+                      {splitPage && (
+                        <button
+                          type="button"
+                          onClick={() => setSplitPageSlug(null)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-900 bg-slate-900 text-white text-xs font-medium cursor-pointer"
+                        >
+                          <Columns2 className="w-3.5 h-3.5" />
+                          <span>Hide Page</span>
+                        </button>
+                      )}
+                    </>
+                  );
+                })()}
                 {!selectedRoom &&
                   selectedBot &&
-                  pages
-                    .filter(
-                      (pg) =>
-                        pg.owner_bot_slug === selectedBot.slug &&
-                        pg.slug !== splitPage?.slug &&
-                        pg.slug !== "bot-hub-board",
-                    )
-                    .slice(0, 2)
-                    .map((pg) => (
-                      <button
-                        key={pg.id}
-                        type="button"
-                        onClick={() => handleOpenPage(pg.slug, true)}
-                        title={`Dock beside chat: ${pg.title}`}
-                        className="hidden md:inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs font-medium text-slate-800 cursor-pointer max-w-[190px]"
-                      >
-                        <FileText className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                        <span className="truncate">{pg.title}</span>
-                      </button>
-                    ))}
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (splitPage) setSplitPageSlug(null);
-                    else void handleOpenOrCreateHubBoard();
-                  }}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium cursor-pointer ${
-                    splitPage
-                      ? "border-slate-900 bg-slate-900 text-white"
-                      : "border-slate-200 bg-white text-slate-800 hover:bg-slate-50"
-                  }`}
-                >
-                  <Columns2 className="w-3.5 h-3.5" />
-                  <span>{splitPage ? "Hide Board" : "Hub Board"}</span>
-                </button>
+                  (vaultSecrets.some(
+                    (v) =>
+                      v.secret_type === "ssh" &&
+                      (v.allowed_bots.includes("*") || v.allowed_bots.includes(selectedBot.slug)),
+                  ) ||
+                    botMessages.some(
+                      (m) =>
+                        Array.isArray(m.metadata?.actions) &&
+                        m.metadata.actions.some((a) => String(a.type ?? "").startsWith("ssh_")),
+                    )) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTerminalModalBotSlug(selectedBot.slug);
+                        setTerminalModalSessionId(null);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-200 bg-white text-slate-800 hover:bg-slate-50 text-xs font-medium cursor-pointer"
+                    >
+                      <Terminal className="w-3.5 h-3.5 text-sky-600" />
+                      <span>Live Terminal</span>
+                    </button>
+                  )}
                 {!selectedRoom && selectedBot?.runtime === "desktop" && (
                   <button
                     type="button"
@@ -1617,8 +2290,36 @@ export function App() {
             )}
           </div>
         </header>
+        )}
 
         <section className="flex-1 min-h-0">
+          {isMobileBotsHub ? (
+            <MobileBotsHub
+              bots={bots}
+              rooms={rooms}
+              integrations={integrations}
+              runningBots={runningBots}
+              liveStatus={liveStatus}
+              summary={summary}
+              principal={principal}
+              searchQuery={searchQuery}
+              onSearchChange={setSearchQuery}
+              onSelectBot={(slug) => handleSwitchView("bot", slug)}
+              onSelectRoom={handleSelectRoom}
+              onOpenNewBot={() => setModal({ type: "new-bot" })}
+              onOpenNewRoom={() => setModal({ type: "new-bot", initialTab: "room" })}
+              onOpenSettings={handleOpenSettings}
+            />
+          ) : isMobilePagesHub ? (
+            <MobilePagesHub
+              pages={pages}
+              bots={bots}
+              onSelectPage={(slug) => handleSwitchView("page", slug)}
+              onOpenNewPage={() => setModal({ type: "new-page" })}
+              onOpenSettings={handleOpenSettings}
+            />
+          ) : (
+          <>
           {activeView === "activity" && (
             <ActivityView
               events={events}
@@ -1630,9 +2331,14 @@ export function App() {
                   await handleSendBotMessage(targetSlug, instruction);
                   showToast(`Sent instruction to ${targetSlug}.`);
                 } else {
-                  await api.dispatchActivity(instruction, targetSlug);
+                  const fallbackSlug = bots.find((b) => b.enabled)?.slug ?? bots[0]?.slug;
+                  if (!fallbackSlug) {
+                    showToast("Create a bot first to send workspace instructions.");
+                    return;
+                  }
+                  await api.dispatchActivity(instruction, fallbackSlug);
                   await refreshCore();
-                  showToast("Sent instruction to bots.");
+                  showToast(`Sent instruction to ${fallbackSlug}.`);
                 }
               }}
               onOpenApprovals={() => handleSwitchView("approvals")}
@@ -1641,6 +2347,7 @@ export function App() {
                 setSelectedBotSlug(botSlug);
                 setContextCorrelationId(corrId);
                 setActiveView("bot");
+                setMobileThreadOpen(true);
               }}
             />
           )}
@@ -1688,6 +2395,15 @@ export function App() {
                     onClearContextCorrelation={() => setContextCorrelationId(null)}
                     onSendMessage={handleSendBotMessage}
                     onSendRoomMessage={handleSendRoomMessage}
+                    onEditLastMessage={
+                      selectedRoom
+                        ? (msgId, nextText) =>
+                            handleEditLastRoomMessage(selectedRoom.slug, msgId, nextText)
+                        : selectedBot
+                          ? (msgId, nextText) =>
+                              handleEditLastBotMessage(selectedBot.slug, msgId, nextText)
+                          : undefined
+                    }
                     onCancelRun={handleCancelRun}
                     onUploadFile={handleUploadWorkspaceFile}
                     onExecutePlan={handleExecutePlan}
@@ -1700,12 +2416,17 @@ export function App() {
                       showToast(`Updated ${slug}.`);
                     }}
                     onApproveItem={handleApproveItem}
+                    onBatchResolveApprovals={handleBatchResolveApprovals}
                     onRejectItem={handleRejectItem}
                     onEditApprovalItem={(item) => setModal({ type: "edit-approval", item })}
                     onOpenPage={(pageSlug, sideBySide) =>
                       handleOpenPage(pageSlug, Boolean(sideBySide))
                     }
                     onOpenSelkies={openSelkiesForBot}
+                    onOpenTerminal={(bSlug, sessionId) => {
+                      setTerminalModalBotSlug(bSlug);
+                      setTerminalModalSessionId(sessionId ?? null);
+                    }}
                     onSaveSkill={handleSaveSkill}
                     hasMoreMessages={selectedRoom ? roomMessagesHasMore : botMessagesHasMore}
                     totalMessagesCount={selectedRoom ? roomMessagesTotal : botMessagesTotal}
@@ -1716,10 +2437,12 @@ export function App() {
                     onLoadOlderMessages={
                       selectedRoom ? handleLoadOlderRoomMessages : handleLoadOlderMessages
                     }
+                    prefillDraft={prefillDraft}
+                    onConsumePrefillDraft={() => setPrefillDraft(null)}
                   />
                 </ViewErrorBoundary>
               </div>
-              {splitPage && (
+              {isBotSplitActive && splitPage && (
                 <div className="w-[48%] min-w-[360px] h-full min-h-0 border-l border-slate-200">
                   <ViewErrorBoundary
                     resetKey={`split-page:${splitPage.slug}`}
@@ -1728,6 +2451,7 @@ export function App() {
                   >
                     <PagesView
                       splitMode
+                      theme={theme}
                       page={splitPage}
                       liveStatus={liveStatus}
                       ownerBot={splitPageOwnerBot}
@@ -1737,6 +2461,7 @@ export function App() {
                         splitPageOwnerBot ? runningBots[splitPageOwnerBot.slug] ?? null : null
                       }
                       onSendMessageToOwner={handleSendBotMessage}
+                      onPrefillChat={handlePrefillChat}
                       onOpenBot={(slug) => handleSwitchView("bot", slug)}
                       onOpenRoom={handleSelectRoom}
                       onOpenApprovals={() => handleSwitchView("approvals")}
@@ -1763,8 +2488,13 @@ export function App() {
               bots={bots}
               integrations={integrations}
               onApprove={handleApproveItem}
+              onBatchResolve={handleBatchResolveApprovals}
               onReject={handleRejectItem}
               onEditApproval={(item) => setModal({ type: "edit-approval", item })}
+              onOpenBotTerminal={(botSlug) => {
+                setTerminalModalBotSlug(botSlug);
+                setTerminalModalSessionId(null);
+              }}
               onAddStyleRule={async (ruleText) => {
                 await api.addStyleRule(ruleText);
                 await refreshViewSpecific();
@@ -1784,6 +2514,7 @@ export function App() {
               onRetry={() => void refreshCore()}
             >
               <PagesView
+                theme={theme}
                 page={selectedPage}
                 liveStatus={liveStatus}
                 ownerBot={
@@ -1795,6 +2526,7 @@ export function App() {
                 lastActivityId={events[0]?.id ?? null}
                 activeOwnerRun={pageOwnerBot ? runningBots[pageOwnerBot.slug] ?? null : null}
                 onSendMessageToOwner={handleSendBotMessage}
+                onPrefillChat={handlePrefillChat}
                 onOpenBot={(slug) => handleSwitchView("bot", slug)}
                 onOpenRoom={handleSelectRoom}
                 onDockSideBySide={(slug) => handleOpenPage(slug, true)}
@@ -1818,12 +2550,16 @@ export function App() {
 
           {activeView === "desktops" && (
             <DesktopsView
+              principal={principal}
               host={desktopHost ?? summary?.host ?? null}
               desktops={desktops}
+              sandboxes={sandboxes}
               queuedLaunches={desktopQueuedLaunches}
               togglingDesktops={togglingDesktops}
+              togglingSandboxes={togglingSandboxes}
               desktopBootBySlug={desktopBootBySlug}
               onToggleDesktop={(slug) => void handleToggleDesktop(slug)}
+              onToggleSandbox={(slug) => void handleToggleSandbox(slug)}
               onStopAllDesktops={async () => {
                 const res = await api.stopAllDesktops();
                 await refreshCore();
@@ -1834,6 +2570,16 @@ export function App() {
                     : "No active desktops to pause.",
                 );
               }}
+              onStopAllSandboxes={async () => {
+                const res = await api.stopAllSandboxes();
+                await refreshCore();
+                await refreshViewSpecific();
+                showToast(
+                  res.stopped_sandboxes.length > 0
+                    ? `Stopped sandboxes: ${res.stopped_sandboxes.join(", ")}`
+                    : "No active sandboxes to stop.",
+                );
+              }}
               onOpenSelkies={(desktop) => setModal({ type: "selkies", desktop })}
               onDeleteBot={handleDeleteBot}
             />
@@ -1841,6 +2587,7 @@ export function App() {
 
           {activeView === "integrations" && (
             <IntegrationsView
+              principal={principal}
               integrations={integrations}
               onOpenGoogleWizard={(reauthAccount) =>
                 setModal({ type: "google-wizard", reauthAccount })
@@ -1848,7 +2595,9 @@ export function App() {
               onOpenTelegramWizard={() => setModal({ type: "telegram-onboard" })}
               onOpenLinkedInModal={() => setModal({ type: "linkedin-onboard" })}
               onOpenWebhookModal={() => setModal({ type: "webhook-onboard" })}
-              onOpenNewIntegration={() => setModal({ type: "new-integration" })}
+              onOpenNewIntegration={(defaultProvider) =>
+                setModal({ type: "new-integration", defaultProvider })
+              }
               onAddPublicMonitor={async (channelHandle) => {
                 try {
                   const res = await api.addTelegramPublicMonitor({
@@ -1901,6 +2650,7 @@ export function App() {
 
           {activeView === "models" && (
             <ModelsView
+              principal={principal}
               modelsData={modelsData}
               onOpenNewModel={(initial) => setModal({ type: "new-model", initial })}
               onSetDefaultModel={async (slug) => {
@@ -1920,12 +2670,43 @@ export function App() {
               }}
             />
           )}
+          </>
+          )}
         </section>
+
+        {showMobileBottomNav && (
+          <MobileBottomNav
+            activeView={activeView}
+            pendingApprovals={pendingApprovalsCount}
+            onSelectTab={(tab) => {
+              setInspectorOpen(false);
+              if (tab === "bot") {
+                setMobileThreadOpen(false);
+                setActiveView("bot");
+              } else if (tab === "page") {
+                setMobilePageOpen(false);
+                setActiveView("page");
+              } else {
+                setActiveView(tab);
+              }
+            }}
+          />
+        )}
       </main>
 
       {inspectorOpen && (activeView === "bot" || activeView === "page") && (
-        <div className={isBotSplitActive ? "fixed right-0 top-14 bottom-0 z-40 shadow-2xl" : "h-full shrink-0"}>
+        <div
+          className={
+            isMobile
+              ? "fixed inset-0 z-40 bg-white argo-safe-top argo-safe-bottom"
+              : isBotSplitActive
+                ? "fixed right-0 top-14 bottom-0 z-40 shadow-2xl"
+                : "h-full shrink-0"
+          }
+        >
           <Inspector
+            principal={principal}
+            teams={teams}
             bot={inspectorBot}
             room={activeView === "bot" ? selectedRoom : null}
             bots={bots}
@@ -1934,12 +2715,22 @@ export function App() {
             skills={skills}
             workspaceFiles={workspaceFiles}
             activePageSlug={activeView === "page" ? selectedPage?.slug ?? null : splitPage?.slug ?? null}
-            initialTab={activeView === "page" ? "library" : "details"}
+            initialTab={
+              inspectorTabOverride
+                ? inspectorTabOverride
+                : activeView === "page"
+                  ? "library"
+                  : "details"
+            }
+            theme={theme}
             models={modelsData?.providers ?? []}
             integrations={integrations}
             vaultSecrets={vaultSecrets}
             styleRules={styleRules}
-            onHide={() => setInspectorOpen(false)}
+            onHide={() => {
+              setInspectorOpen(false);
+              setInspectorTabOverride(null);
+            }}
             onInspectDebug={(slug) => setModal({ type: "debug", botSlug: slug })}
             onUpdateBot={async (slug, updates) => {
               await api.updateBot(slug, updates);
@@ -1992,12 +2783,30 @@ export function App() {
           }}
           onTriggerBot={(slug, routineId) => handleTriggerBot(slug, routineId)}
           togglingDesktop={inspectorBot ? Boolean(togglingDesktops[inspectorBot.slug]) : false}
+          togglingSandbox={inspectorBot ? Boolean(togglingSandboxes[inspectorBot.slug]) : false}
           desktopInfo={inspectorBot ? desktops.find((d) => d.bot_slug === inspectorBot.slug) ?? null : null}
           desktopBootProgress={inspectorBot ? desktopBootBySlug[inspectorBot.slug] ?? null : null}
+          sshRefreshTick={sshRefreshTick}
+          onExpandTerminal={(bSlug) => {
+            setTerminalModalBotSlug(bSlug);
+            setTerminalModalSessionId(null);
+          }}
           onToggleDesktop={(slug) => void handleToggleDesktop(slug)}
+          onToggleSandbox={(slug) => void handleToggleSandbox(slug)}
           onOpenSelkies={openSelkiesForBot}
           onExportBlueprint={handleExportBlueprint}
           onDeleteBot={handleDeleteBot}
+          messageCount={
+            selectedRoom
+              ? roomMessagesTotal
+              : activeView === "page" && inspectorBot?.slug !== selectedBot?.slug
+                ? undefined
+                : botMessagesTotal
+          }
+          onClearBotMessages={handleClearBotMessages}
+          onExportBotMessages={handleExportBotMessages}
+          onClearRoomMessages={handleClearRoomMessages}
+          onExportRoomMessages={handleExportRoomMessages}
           onOpenIntegrations={() => handleOpenSettings("integrations")}
           onOpenVault={() => handleOpenSettings("vault")}
           onToggleVaultSecret={async (sec, botSlug) => {
@@ -2069,7 +2878,9 @@ export function App() {
         onOpenTelegramWizard={() => setModal({ type: "telegram-onboard" })}
         onOpenLinkedInModal={() => setModal({ type: "linkedin-onboard" })}
         onOpenWebhookModal={() => setModal({ type: "webhook-onboard" })}
-        onOpenNewIntegration={() => setModal({ type: "new-integration" })}
+        onOpenNewIntegration={(defaultProvider) =>
+          setModal({ type: "new-integration", defaultProvider })
+        }
         onAddPublicMonitor={async (channelHandle) => {
           const res = await api.addTelegramPublicMonitor({
             channel_handle: channelHandle,
@@ -2153,10 +2964,13 @@ export function App() {
         }}
         desktopHost={desktopHost ?? summary?.host ?? null}
         desktops={desktops}
+        sandboxes={sandboxes}
         queuedLaunches={desktopQueuedLaunches}
         togglingDesktops={togglingDesktops}
+        togglingSandboxes={togglingSandboxes}
         desktopBootBySlug={desktopBootBySlug}
         onToggleDesktop={(slug) => void handleToggleDesktop(slug)}
+        onToggleSandbox={(slug) => void handleToggleSandbox(slug)}
         onStopAllDesktops={async () => {
           const res = await api.stopAllDesktops();
           await refreshCore();
@@ -2164,6 +2978,15 @@ export function App() {
             res.stopped_desktops.length > 0
               ? `Paused desktops: ${res.stopped_desktops.join(", ")}`
               : "No active desktops to pause.",
+          );
+        }}
+        onStopAllSandboxes={async () => {
+          const res = await api.stopAllSandboxes();
+          await refreshCore();
+          showToast(
+            res.stopped_sandboxes.length > 0
+              ? `Stopped sandboxes: ${res.stopped_sandboxes.join(", ")}`
+              : "No active sandboxes to stop.",
           );
         }}
         onOpenSelkies={(desktop) => setModal({ type: "selkies", desktop })}
@@ -2191,6 +3014,15 @@ export function App() {
           await refreshCore();
           showToast("Deleted skill.");
         }}
+        onChatHistoryPruned={() => {
+          if (selectedRoomSlugRef.current) {
+            void loadRoomMessagesWindow(selectedRoomSlugRef.current, { reset: true });
+          } else if (selectedBotSlugRef.current) {
+            void loadBotMessagesWindow(selectedBotSlugRef.current, { reset: true });
+          }
+          void refreshCore();
+          showToast("Pruned older chat history.");
+        }}
         debugBotSlug={selectedBot?.slug ?? undefined}
         onLoadDebugOverview={(params) => api.getDebugOverview(params)}
         onClearDebug={() => api.clearDebugData()}
@@ -2210,10 +3042,19 @@ export function App() {
           await refreshCore();
           showToast(`Deleted secret @${slug}.`);
         }}
+        onRefreshVault={async () => {
+          await refreshCore();
+        }}
+        teams={teams}
+        onRefreshTeamsAndUsers={refreshCore}
+        principal={principal}
+        onSignOut={() => void handleSignOut()}
       />
 
       <Modals
         modal={modal}
+        teams={teams}
+        principal={principal}
         onClose={() => setModal(null)}
         models={modelsData?.providers ?? []}
         integrations={integrations}
@@ -2230,6 +3071,7 @@ export function App() {
           setSelectedRoomSlug(null);
           setSelectedBotSlug(created.slug);
           setActiveView("bot");
+          setMobileThreadOpen(true);
           showToast(`Created bot ${created.name}`);
         }}
         onCreateRoom={async (payload) => {
@@ -2237,6 +3079,7 @@ export function App() {
           await refreshCore();
           setSelectedRoomSlug(created.slug);
           setActiveView("bot");
+          setMobileThreadOpen(true);
           void loadRoomMessagesWindow(created.slug, { reset: true });
           showToast(`Created Room "${created.title}"`);
         }}
@@ -2258,6 +3101,14 @@ export function App() {
         }}
         onCreatePipeline={async (pipeline) => {
           const writer = await api.createBot({
+            ...(pipeline.visibility
+              ? {
+                  visibility: pipeline.visibility,
+                  ...(pipeline.visibility === "team" && pipeline.allowed_groups
+                    ? { allowed_groups: pipeline.allowed_groups }
+                    : {}),
+                }
+              : {}),
             name: pipeline.writerName,
             role: pipeline.writerStyle.slice(0, 160) || "Write stories from Scout leads",
             role_prompt: pipeline.writerStyle,
@@ -2280,6 +3131,14 @@ export function App() {
             ],
           });
           const scout = await api.createBot({
+            ...(pipeline.visibility
+              ? {
+                  visibility: pipeline.visibility,
+                  ...(pipeline.visibility === "team" && pipeline.allowed_groups
+                    ? { allowed_groups: pipeline.allowed_groups }
+                    : {}),
+                }
+              : {}),
             name: pipeline.scoutName,
             role: pipeline.scoutSource.slice(0, 160) || "Collect leads for Story Writer",
             role_prompt: `${pipeline.scoutSource}\n\nWhen you find valuable items, save them to collection 'story_leads' and delegate to @${writer.slug}.`,
@@ -2322,6 +3181,7 @@ export function App() {
           await refreshCore();
           setSelectedPageSlug(created.slug);
           setActiveView("page");
+          setMobilePageOpen(true);
           showToast(`Created page ${created.title}`);
         }}
         onGeneratePage={async (payload) => {
@@ -2329,20 +3189,28 @@ export function App() {
           await refreshCore();
           setSelectedPageSlug(created.slug);
           setActiveView("page");
+          setMobilePageOpen(true);
           showToast(`Created living page ${created.title}`);
         }}
         onStartTakeover={handleStartTakeover}
         onReleaseTakeover={handleReleaseTakeover}
         onResolveEditedApproval={async (id, editedText, styleRule) => {
           try {
-            await api.resolveApproval(id, {
+            const res = await api.resolveApproval(id, {
               action: "edit_approve",
               edited_text: editedText,
               style_rule: styleRule || undefined,
             });
             await refreshCore();
             await refreshViewSpecific();
-            showToast("Draft updated, approved, and preference saved.");
+            const isSsh = res.action_type === "ssh_exec" || res.action_type === "ssh_input";
+            if (res.error_message) {
+              showToast(res.error_message);
+            } else if (isSsh && res.status === "executed") {
+              showToast("Updated, approved, and ran SSH command — output sent to bot chat.");
+            } else {
+              showToast("Draft updated, approved, and preference saved.");
+            }
           } catch (err) {
             await refreshCore();
             await refreshViewSpecific();
@@ -2410,8 +3278,71 @@ export function App() {
         }}
       />
 
+      {terminalModalBotSlug && (
+        <div
+          className="fixed inset-0 z-50 argo-modal-backdrop flex items-center justify-center p-0 sm:p-4"
+          onClick={() => {
+            setTerminalModalBotSlug(null);
+            setTerminalModalSessionId(null);
+          }}
+        >
+          <div
+            className="w-full sm:max-w-6xl h-[100dvh] sm:h-auto sm:max-h-[92vh] rounded-none sm:rounded-2xl border-0 sm:border argo-modal-panel overflow-hidden flex flex-col argo-safe-top argo-safe-bottom"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-slate-200 argo-modal-header flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <Terminal className="w-4 h-4 text-slate-600 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-900 truncate">
+                    Live Terminal ·{" "}
+                    {bots.find((b) => b.slug === terminalModalBotSlug)?.name ?? terminalModalBotSlug}
+                  </div>
+                  <div className="hidden sm:block text-[11px] text-slate-500">
+                    Watch live in read-only View Mode, switch host tabs, Take Over anytime, or Replay recordings.
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                aria-label="Close Live Terminal"
+                onClick={() => {
+                  setTerminalModalBotSlug(null);
+                  setTerminalModalSessionId(null);
+                }}
+                className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-slate-900 cursor-pointer shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-3 sm:p-4 flex-1 min-h-0 overflow-y-auto">
+              <SSHTerminalPanel
+                botSlug={terminalModalBotSlug}
+                theme={theme}
+                variant="modal"
+                initialSessionId={terminalModalSessionId}
+                refreshTick={sshRefreshTick}
+                hasPermittedSSH={vaultSecrets.some(
+                  (v) =>
+                    v.secret_type === "ssh" &&
+                    (v.allowed_bots.includes("*") ||
+                      v.allowed_bots.includes(terminalModalBotSlug)),
+                )}
+                onStatusToast={showToast}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && (
-        <div className="fixed bottom-5 right-5 z-[70] px-4 py-2.5 rounded-lg bg-slate-950 text-white border border-slate-700 text-xs font-medium shadow-xl">
+        <div
+          className={`fixed z-[70] px-4 py-2.5 rounded-xl bg-slate-950 text-white border border-slate-700 text-xs font-medium shadow-xl ${
+            showMobileBottomNav
+              ? "bottom-20 left-4 right-4 md:left-auto md:right-5 md:bottom-5"
+              : "bottom-5 left-4 right-4 md:left-auto md:right-5"
+          }`}
+        >
           {toast}
         </div>
       )}

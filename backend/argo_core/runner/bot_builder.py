@@ -32,6 +32,29 @@ _LEGACY_DESKTOP_MARKERS = (
     "browser desktop",
 )
 
+_SANDBOX_SCRIPT_MARKERS = (
+    "python",
+    "python3",
+    "bash",
+    "shell script",
+    "curl",
+    "sandbox",
+    "cli script",
+    "write a script",
+    "run a script",
+)
+
+_GUI_BROWSER_MARKERS = (
+    "browser",
+    "chrome",
+    "chromium",
+    "desktop",
+    "gui",
+    "selkies",
+    "screenshot",
+    "legacy portal",
+)
+
 _ON_EVENT_RE = re.compile(
     r"(?:on_event\s*[:=]\s*|subscribe\s+to\s+|when\s+)([a-z0-9]+(?:[._-][a-z0-9]+)+)",
     re.IGNORECASE,
@@ -65,14 +88,6 @@ def _extract_urls(prompt: str) -> tuple[list[str], list[str]]:
 def _infer_bot_name(prompt: str) -> str:
     cleaned = prompt.strip()
     lower = cleaned.lower()
-    if "news collector" in lower or ("rss" in lower and "collect" in lower):
-        return "News Collector"
-    if "editorial reviewer" in lower or ("review" in lower and "audit" in lower):
-        return "Editorial Reviewer"
-    if "gatekeeper" in lower:
-        return "Release Gatekeeper"
-    if "portal" in lower and any(tok in lower for tok in ("extract", "read", "legacy", "partner")):
-        return "Portal Extractor"
 
     named_match = re.search(
         r"\b(?:called|named)\s+[\"']?([A-Za-z0-9][A-Za-z0-9 _-]{1,40}?)(?:[\"']|\s+(?:that|to|for|with|every|on_event)\b|$)",
@@ -145,6 +160,10 @@ def _infer_boundaries(prompt: str, outbound_rbac: str) -> list[str]:
 def _infer_avatar(lower_prompt: str, runtime: str) -> tuple[str, str]:
     if runtime == "desktop":
         return "amber", "globe"
+    if runtime == "sandbox":
+        return "emerald", "terminal"
+    if any(kw in lower_prompt for kw in ("dashboard", "chart", "analytics", "spreadsheet", "page")):
+        return "indigo", "layers"
     if any(
         kw in lower_prompt
         for kw in ("supervisor", "coordinator", "oversee", "all bots", "fleet", "manage bots")
@@ -262,13 +281,46 @@ def _infer_routines(prompt: str, name: str, *, runtime: str = "api") -> list[dic
             }
         ]
 
+    monitoring_signals = (
+        "every ",
+        "cron",
+        "schedule",
+        "periodic",
+        "recurring",
+        "monitor",
+        "watch",
+        "poll",
+        "rss",
+        "feed",
+        "inbox",
+        "t.me/s/",
+        "channel",
+        "track",
+        "sync",
+        "digest",
+        "alert",
+        "new email",
+        "new post",
+        "new article",
+    )
+    has_monitoring_signal = bool(
+        _URL_RE.search(prompt) or any(kw in lower for kw in monitoring_signals)
+    )
+
     if "hourly" in lower:
         schedule = "Every 1h"
     elif "daily" in lower:
         schedule = "Every 24h"
-    elif "manual" in lower and "cron" not in lower:
-        schedule = "Manual"
-    elif runtime == "desktop":
+    elif (
+        ("manual" in lower and "cron" not in lower)
+        or runtime in {"desktop", "sandbox"}
+        or (
+            any(kw in lower for kw in ("dashboard", "interactive page", "spreadsheet"))
+            and "every " not in lower
+            and "cron" not in lower
+        )
+        or not has_monitoring_signal
+    ):
         schedule = "Manual"
     else:
         schedule = "Every 15m"
@@ -313,12 +365,42 @@ class ConversationalBotBuilder:
         lower = cleaned_prompt.lower()
         warnings: list[str] = []
 
+        wants_analytics_or_pages = any(
+            kw in lower
+            for kw in (
+                "dashboard",
+                "chart",
+                "echarts",
+                "page",
+                "spreadsheet",
+                "csv",
+                "excel",
+                "xlsx",
+                "pdf",
+                "sql",
+                "duckdb",
+                "table",
+                "analyze",
+                "analytics",
+                "source bot",
+            )
+        )
         if preferred_model is not None and preferred_model.strip():
             provider_type, model_name = validate_model_id(preferred_model.strip())
             model = f"{provider_type}:{model_name}"
         elif any(
             kw in lower
-            for kw in ("editorial", "reviewer", "audit", "synthesis", "reasoning", "gemini-4-argon")
+            for kw in (
+                "analyze",
+                "analytics",
+                "dashboard",
+                "editorial",
+                "reviewer",
+                "audit",
+                "synthesis",
+                "reasoning",
+                "gemini-4-argon",
+            )
         ):
             model = "google:gemini-4-argon"
         else:
@@ -326,6 +408,8 @@ class ConversationalBotBuilder:
 
         mentions_api_service = any(marker in lower for marker in _API_SERVICE_MARKERS)
         mentions_legacy_desktop = any(marker in lower for marker in _LEGACY_DESKTOP_MARKERS)
+        mentions_sandbox = any(marker in lower for marker in _SANDBOX_SCRIPT_MARKERS)
+        mentions_gui = any(marker in lower for marker in _GUI_BROWSER_MARKERS)
 
         if preferred_runtime == "desktop":
             runtime = "desktop"
@@ -334,11 +418,15 @@ class ConversationalBotBuilder:
                     "API-First recommendation: Gmail, Google Workspace, Telegram, LinkedIn, and RSS "
                     "use native 0 MB connectors inside argo-core without launching a Selkies container."
                 )
+        elif preferred_runtime == "sandbox":
+            runtime = "sandbox"
         elif preferred_runtime == "api":
             runtime = "api"
         else:
             if mentions_legacy_desktop and not mentions_api_service:
                 runtime = "desktop"
+            elif mentions_sandbox and not mentions_api_service and not mentions_legacy_desktop and not mentions_gui:
+                runtime = "sandbox"
             else:
                 runtime = "api"
                 if mentions_api_service and ("browser" in lower or "chrome" in lower or "desktop" in lower):
@@ -377,6 +465,11 @@ class ConversationalBotBuilder:
                     "review",
                     "audit",
                     "triage",
+                    "analyze",
+                    "analytics",
+                    "dashboard",
+                    "chart",
+                    "summarize",
                 )
             ):
                 outbound_rbac = "internal"
@@ -419,11 +512,20 @@ class ConversationalBotBuilder:
         )
 
         col_matches = [collection_slug(m) for m in _COLLECTION_QUOTED_RE.findall(cleaned_prompt)]
+        is_pure_reader_or_analytics = (
+            wants_analytics_or_pages
+            and not feed_urls
+            and not webpage_urls
+            and not any(kw in lower for kw in ("collect", "fetch", "save", "ingest", "scrape"))
+        )
         if col_matches:
             data_cols = list(dict.fromkeys(col_matches))
-        elif "news" in lower or "rss" in lower or "article" in lower:
-            data_cols = ["news_items"]
-        elif not is_supervisor and not handles_telegram_dm and not handles_approval_queued:
+        elif (
+            not is_supervisor
+            and not handles_telegram_dm
+            and not handles_approval_queued
+            and not is_pure_reader_or_analytics
+        ):
             data_cols = [collection_slug(f"bot_{slug}_items")]
         else:
             data_cols = []
@@ -431,19 +533,34 @@ class ConversationalBotBuilder:
         read_cols = list(dict.fromkeys([*data_cols, "bot_threads"]))
         if "style_memory" in lower and "style_memory" not in read_cols:
             read_cols.append("style_memory")
-        write_cols = (
-            list(dict.fromkeys([*data_cols, "bot_threads"]))
-            if data_cols
-            else ["bot_threads"]
-        )
+        write_cols = list(dict.fromkeys(data_cols))
 
         tools: list[Any] = []
+        if wants_analytics_or_pages:
+            tools.extend(
+                [
+                    {"type": "builtin", "name": "data_describe"},
+                    {"type": "builtin", "name": "data_query"},
+                    {"type": "builtin", "name": "read_workspace_file"},
+                    {"type": "builtin", "name": "upsert_page"},
+                    {"type": "builtin", "name": "open_page"},
+                ]
+            )
+            if webpage_urls or any(kw in lower for kw in ("web", "url", "table", "scrape", "extract")):
+                tools.append({"type": "builtin", "name": "extract_web_data"})
+
         if feed_urls or "rss" in lower or "feed" in lower:
             rss_tool: dict[str, Any] = {"type": "builtin", "name": "fetch_rss_feed"}
             if feed_urls:
                 rss_tool["urls"] = list(feed_urls)
             tools.append(rss_tool)
-        if webpage_urls or "web" in lower or "webpage" in lower or "article" in lower or "blog" in lower:
+        if (
+            webpage_urls
+            or (
+                runtime != "sandbox"
+                and ("web" in lower or "webpage" in lower or "article" in lower or "blog" in lower)
+            )
+        ):
             web_tool: dict[str, Any] = {"type": "builtin", "name": "fetch_public_webpage"}
             if webpage_urls:
                 web_tool["urls"] = list(webpage_urls)
@@ -452,6 +569,13 @@ class ConversationalBotBuilder:
             tools.append({"type": "builtin", "name": "fetch_telegram_public_channel"})
         if any(kw in lower for kw in ("gmail", "email", "inbox", "newsletter", "mail")):
             tools.append({"type": "builtin", "name": "gmail_search"})
+        if any(kw in lower for kw in ("google drive", "gdrive", "google docs", "google sheets")):
+            tools.append({"type": "builtin", "name": "gdrive_search"})
+            tools.append({"type": "builtin", "name": "gdrive_read_file"})
+        if any(kw in lower for kw in ("calendar", "gcal", "meetings")):
+            tools.append({"type": "builtin", "name": "gcal_events"})
+        if runtime == "sandbox":
+            tools.append({"type": "builtin", "name": "sandbox_exec"})
         if runtime == "desktop":
             tools.append({"type": "builtin", "name": "desktop_browse"})
             tools.append({"type": "mcp", "name": "desktop_mcp"})
@@ -475,6 +599,8 @@ class ConversationalBotBuilder:
                         "max_calls_per_day": default_execute_cap if capability == "execute" else 0,
                     }
                 )
+        elif outbound_rbac == "internal":
+            resolved_linked_accounts = []
         elif outbound_rbac in {"draft", "execute"}:
             for acc in integrations:
                 if acc["provider"] in {"telegram", "linkedin", "google"} or (
@@ -513,6 +639,7 @@ class ConversationalBotBuilder:
             "role_prompt": cleaned_prompt,
             "runtime": runtime,
             "desktop_policy": "on_demand" if runtime == "desktop" else "disabled",
+            "sandbox_policy": "on_demand" if runtime == "sandbox" else "disabled",
             "outbound_rbac": outbound_rbac,
             "daily_cap": default_execute_cap if outbound_rbac == "execute" else 0,
             "model": model,
@@ -522,6 +649,7 @@ class ConversationalBotBuilder:
         }
         if resolved_linked_accounts is not None:
             draft["linked_accounts"] = resolved_linked_accounts
+            draft["linked_accounts_restricted"] = True
 
         used_llm = False
         if self._llm_router is not None:
@@ -556,6 +684,17 @@ class ConversationalBotBuilder:
                         if parsed.get("model") and preferred_model is None:
                             p_type, m_name = validate_model_id(str(parsed["model"]))
                             draft["model"] = f"{p_type}:{m_name}"
+                        if (
+                            parsed.get("runtime") in {"api", "sandbox", "desktop"}
+                            and preferred_runtime == "auto"
+                        ):
+                            draft["runtime"] = str(parsed["runtime"])
+                            draft["desktop_policy"] = (
+                                "on_demand" if draft["runtime"] == "desktop" else "disabled"
+                            )
+                            draft["sandbox_policy"] = (
+                                "on_demand" if draft["runtime"] == "sandbox" else "disabled"
+                            )
                         if (
                             parsed.get("outbound_rbac") in {"internal", "draft", "execute"}
                             and preferred_rbac == "auto"

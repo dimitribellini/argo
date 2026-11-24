@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlparse
 
-from argo_core.security.ssrf import SSRFBlockedError, validate_public_url
+from argo_core.security.ssrf import PublicFetchError, SSRFBlockedError, validate_public_url
 
 if TYPE_CHECKING:
     from argo_core.bus.valkey_bus import EventBus
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 DESKTOP_MCP_PORT = 9223
 DESKTOP_MCP_PATH = "/mcp"
-DESKTOP_AGENT_VERSION = "6"
+DESKTOP_AGENT_VERSION = "8"
 
 _MCP_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -160,6 +160,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import glob
+import hmac
 import json
 import os
 import shutil
@@ -175,11 +176,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 PORT = int(os.environ.get("ARGO_DESKTOP_MCP_PORT", "9223"))
-AGENT_VERSION = "6"
+AGENT_VERSION = "8"
 CDP_PROXY_PORT = 9222
 CDP_INTERNAL_PORT = 19222
 PROVISION_STATUS_PATH = "/config/.argo-provision-status"
-SESSION_ID = "argo-desktop-mcp-v6"
+SESSION_ID = "argo-desktop-mcp-v7"
+AGENT_TOKEN = os.environ.get("ARGO_DESKTOP_AGENT_TOKEN", "").strip()
 RECORDER_FLAG_PATH = "/config/.argo-recording-active"
 RECORDER_CMD_LOG = "/config/.argo-recorded-commands.jsonl"
 
@@ -818,12 +820,20 @@ _CDP_DOM_RECORDER_JS = """(() => {
       const t = e.target;
       window.__argoRec.push({ts: new Date().toISOString(), kind: "click", tag: t && t.tagName ? t.tagName.toLowerCase() : "", label: _lbl(t), selector: _sel(t), x: Math.round(e.clientX || 0), y: Math.round(e.clientY || 0), url: location.href});
     }, true);
+    const _isSensitiveInput = (el, lbl) => {
+      const typ = String(el.type || "").toLowerCase();
+      if (typ === "password" || typ === "hidden") return true;
+      const ac = String(el.autocomplete || "").toLowerCase();
+      if (/(current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp)/.test(ac)) return true;
+      const hints = [el.name || "", el.id || "", el.getAttribute("aria-label") || "", el.placeholder || "", lbl || ""].join(" ").toLowerCase();
+      return /\\\\b(password|passwd|secret|token|api[_-]?key|apikey|otp|totp|cvv|cvc|ssn|private[_-]?key|passphrase|pin|auth[_-]?code|bearer)\\\\b/.test(hints);
+    };
     document.addEventListener("change", (e) => {
       const t = e.target;
       if (!t || !("value" in t)) return;
-      const typ = String(t.type || "").toLowerCase();
-      if (typ === "password") return;
-      window.__argoRec.push({ts: new Date().toISOString(), kind: "input", tag: (t.tagName || "").toLowerCase(), label: _lbl(t), selector: _sel(t), value: String(t.value || "").slice(0, 160), url: location.href});
+      const lbl = _lbl(t);
+      if (_isSensitiveInput(t, lbl)) return;
+      window.__argoRec.push({ts: new Date().toISOString(), kind: "input", tag: (t.tagName || "").toLowerCase(), label: lbl, selector: _sel(t), value: String(t.value || "").slice(0, 160), url: location.href});
     }, true);
     document.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === "Tab" || e.key === "Escape") {
@@ -1032,12 +1042,9 @@ def _recorder_sampler_loop(stop_ev: threading.Event) -> None:
             prev_kmap, keys_pressed = _query_x11_keymap_chars(disp, prev_kmap, shared_dpy=dpy)
             if keys_pressed:
                 with _REC_LOCK:
+                    # Only record structural navigation keys; never keylog printable X11 characters.
                     for kn in keys_pressed:
-                        if kn == "BackSpace":
-                            if _REC_STATE["typed_buf"]:
-                                _REC_STATE["typed_buf"].pop()
-                        elif kn in ("Return", "KP_Enter", "Tab", "Escape"):
-                            _flush_typed_buffer_locked(now_iso)
+                        if kn in ("Return", "KP_Enter", "Tab", "Escape"):
                             if len(_REC_STATE["typed_inputs"]) < 200:
                                 _REC_STATE["typed_inputs"].append(
                                     {
@@ -1047,17 +1054,6 @@ def _recorder_sampler_loop(stop_ev: threading.Event) -> None:
                                         "window": str(_REC_STATE.get("last_window") or ""),
                                     }
                                 )
-                        elif len(kn) == 1 and kn.isprintable():
-                            _REC_STATE["typed_buf"].append(kn)
-                            _REC_STATE["typed_last_epoch"] = now_ep
-                        elif kn in _KEYSYM_MAP:
-                            _REC_STATE["typed_buf"].append(_KEYSYM_MAP[kn])
-                            _REC_STATE["typed_last_epoch"] = now_ep
-            else:
-                with _REC_LOCK:
-                    last_t = float(_REC_STATE.get("typed_last_epoch") or 0.0)
-                    if _REC_STATE.get("typed_buf") and last_t and (now_ep - last_t) > 1.5:
-                        _flush_typed_buffer_locked(now_iso)
 
             if tick % 12 == 0:
                 active_w = _active_window_title(disp)
@@ -1340,6 +1336,7 @@ def _perform_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
                     "--user-data-dir=/config/.config/argo-chromium",
                     "--password-store=basic",
                     "--window-size=1280,860",
+                    "--host-resolver-rules=MAP argo-core 127.0.0.1, MAP valkey 127.0.0.1, MAP oauth2-proxy 127.0.0.1, MAP metadata.google.internal 127.0.0.1",
                     *extra_args,
                 ]
         else:
@@ -1377,9 +1374,35 @@ def _perform_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
         }
 
     if act == "focus_window":
+        window_id = str(params.get("window_id") or "").strip()
         title = str(params.get("title") or "").strip()
-        if not title:
-            return {"status": "error", "detail": "title is required"}
+        if not title and not window_id:
+            return {"status": "error", "detail": "title or window_id is required"}
+        if window_id:
+            if shutil.which("wmctrl"):
+                res = subprocess.run(
+                    ["wmctrl", "-i", "-a", window_id],
+                    env=_x_env(display),
+                    capture_output=True,
+                    text=True,
+                    timeout=4,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    return {
+                        "status": "ok",
+                        "action": "focus_window",
+                        "window_id": window_id,
+                        "active_window": _active_window_title(display),
+                    }
+            res = _run_xdotool(["windowactivate", window_id], display)
+            return {
+                "status": "ok",
+                "action": "focus_window",
+                "window_id": window_id,
+                "active_window": _active_window_title(display),
+                "output": res.stdout.strip(),
+            }
         if shutil.which("wmctrl"):
             res = subprocess.run(
                 ["wmctrl", "-a", title],
@@ -1401,13 +1424,15 @@ def _perform_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
             _run_xdotool(["mousemove", "--sync", str(x), str(y)], display)
             return {"status": "ok", "action": "move", "x": x, "y": y}
         button = int(params.get("button", 1) or 1)
+        clicks = max(1, min(5, int(params.get("clicks") or (2 if params.get("double") else 1))))
+        is_double = clicks >= 2 or bool(params.get("double"))
         args = ["mousemove", "--sync", str(x), str(y), "click"]
-        if params.get("double"):
-            args.extend(["--repeat", "2", "--delay", "80"])
+        if clicks > 1:
+            args.extend(["--repeat", str(clicks), "--delay", "80"])
         args.append(str(button))
         _run_xdotool(args, display)
         time.sleep(0.25)
-        return {"status": "ok", "action": "click", "x": x, "y": y, "button": button, "double": bool(params.get("double"))}
+        return {"status": "ok", "action": "click", "x": x, "y": y, "button": button, "clicks": clicks, "double": is_double}
 
     if act == "type":
         text = str(params.get("text") or "")
@@ -1430,11 +1455,55 @@ def _perform_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
         clicks = max(1, min(20, int(params.get("clicks", 3) or 3)))
         btn = "4" if direction == "up" else "5"
         args: list[str] = []
+        target_x: int | None = None
+        target_y: int | None = None
         if params.get("x") is not None and params.get("y") is not None:
-            args.extend(["mousemove", "--sync", str(int(params["x"])), str(int(params["y"]))])
+            target_x = int(params["x"])
+            target_y = int(params["y"])
+        else:
+            if shutil.which("xdotool"):
+                geom_res = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],
+                    env=_x_env(display),
+                    capture_output=True,
+                    text=True,
+                    timeout=4,
+                    check=False,
+                )
+                if geom_res.returncode == 0 and geom_res.stdout:
+                    geom: dict[str, int] = {}
+                    for line in geom_res.stdout.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            try:
+                                geom[k.strip()] = int(v.strip())
+                            except ValueError:
+                                pass
+                    gw = geom.get("WIDTH", 0)
+                    gh = geom.get("HEIGHT", 0)
+                    if gw > 40 and gh > 40:
+                        target_x = geom.get("X", 0) + gw // 2
+                        target_y = geom.get("Y", 0) + gh // 2
+            if target_x is None or target_y is None:
+                scr = _x11_screen_size(display)
+                if scr and scr[0] > 0 and scr[1] > 0:
+                    target_x = scr[0] // 2
+                    target_y = scr[1] // 2
+        if target_x is not None and target_y is not None:
+            args.extend(["mousemove", "--sync", str(target_x), str(target_y)])
         args.extend(["click", "--repeat", str(clicks), btn])
         _run_xdotool(args, display)
-        return {"status": "ok", "action": "scroll", "direction": direction, "clicks": clicks}
+        time.sleep(0.25)
+        scroll_res: dict[str, Any] = {
+            "status": "ok",
+            "action": "scroll",
+            "direction": direction,
+            "clicks": clicks,
+        }
+        if target_x is not None and target_y is not None:
+            scroll_res["x"] = target_x
+            scroll_res["y"] = target_y
+        return scroll_res
 
     if act in ("exec", "shell", "bash", "run_command"):
         raw_commands = params.get("commands")
@@ -1705,10 +1774,31 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b"{}"
         return json.loads(raw.decode("utf-8") or "{}")
 
+    def _is_authorized(self, path: str) -> bool:
+        configured = os.environ.get("ARGO_DESKTOP_AGENT_TOKEN", AGENT_TOKEN).strip()
+        peer_ip = str((self.client_address or ("", 0))[0] or "")
+        is_loopback = peer_ip in ("127.0.0.1", "::1")
+        if not configured:
+            return is_loopback
+        if path == "/health" and is_loopback:
+            return True
+        presented = str(self.headers.get("X-Argo-Desktop-Token") or "").strip()
+        if not presented:
+            auth_hdr = str(self.headers.get("Authorization") or "").strip()
+            if auth_hdr.lower().startswith("bearer "):
+                presented = auth_hdr[7:].strip()
+        if not presented:
+            return False
+        return hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if not self._is_authorized(path):
+            self._send_json(401, {"status": "error", "detail": "Unauthorized desktop agent request."})
+            return
 
         if path == "/health":
             disp = _detect_display()
@@ -1767,6 +1857,10 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if not self._is_authorized(path):
+            self._send_json(401, {"status": "error", "detail": "Unauthorized desktop agent request."})
+            return
+
         if path == "/action":
             try:
                 payload = self._read_json()
@@ -1801,6 +1895,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"status": "error", "detail": f"Unknown path: {path}"})
 
     def do_DELETE(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if not self._is_authorized(path):
+            self._send_json(401, {"status": "error", "detail": "Unauthorized desktop agent request."})
+            return
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -1889,12 +1987,22 @@ class DesktopAgentTransport(Protocol):
 
 
 class _DefaultDesktopAgentTransport:
+    def __init__(self, token_provider: Callable[[str], str] | None = None) -> None:
+        self._token_provider = token_provider
+
+    def _auth_headers(self, bot_slug: str) -> dict[str, str]:
+        if self._token_provider is None:
+            return {}
+        tok = str(self._token_provider(bot_slug) or "").strip()
+        return {"X-Argo-Desktop-Token": tok} if tok else {}
+
     async def _request(
         self,
         method: str,
         url: str,
         *,
         json_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = 15.0,
     ) -> tuple[int, dict[str, str], bytes]:
         try:
@@ -1902,20 +2010,21 @@ class _DefaultDesktopAgentTransport:
         except ImportError:
             aiohttp = None  # type: ignore[assignment]
 
+        req_headers = dict(headers or {})
         if aiohttp is not None:
             client_timeout = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.request(method, url, json=json_body) as resp:
+                async with session.request(method, url, json=json_body, headers=req_headers or None) as resp:
                     raw = await resp.read()
                     return resp.status, dict(resp.headers), raw
 
         def _sync_urllib() -> tuple[int, dict[str, str], bytes]:
             data: bytes | None = None
-            headers: dict[str, str] = {}
+            sync_headers: dict[str, str] = dict(req_headers)
             if json_body is not None:
                 data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
-                headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                sync_headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=sync_headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return int(resp.status), dict(resp.headers.items()), resp.read()
@@ -1928,9 +2037,8 @@ class _DefaultDesktopAgentTransport:
     async def health(
         self, bot_slug: str, endpoint: str, *, timeout: float = 5.0
     ) -> dict[str, Any]:
-        del bot_slug
         url = f"{endpoint.rstrip('/')}/health"
-        status, _, raw = await self._request("GET", url, timeout=timeout)
+        status, _, raw = await self._request("GET", url, headers=self._auth_headers(bot_slug), timeout=timeout)
         data = json.loads(raw.decode("utf-8") or "{}")
         if status >= 400:
             raise DesktopMCPError(f"Desktop health returned HTTP {status}: {data}")
@@ -1939,9 +2047,8 @@ class _DefaultDesktopAgentTransport:
     async def inspect(
         self, bot_slug: str, endpoint: str, *, timeout: float = 15.0
     ) -> dict[str, Any]:
-        del bot_slug
         url = f"{endpoint.rstrip('/')}/status"
-        status, _, raw = await self._request("GET", url, timeout=timeout)
+        status, _, raw = await self._request("GET", url, headers=self._auth_headers(bot_slug), timeout=timeout)
         data = json.loads(raw.decode("utf-8") or "{}")
         if status >= 400:
             raise DesktopMCPError(f"Desktop inspect returned HTTP {status}: {data}")
@@ -1950,9 +2057,10 @@ class _DefaultDesktopAgentTransport:
     async def screenshot(
         self, bot_slug: str, endpoint: str, *, max_width: int = 1280, timeout: float = 20.0
     ) -> tuple[bytes, dict[str, Any]]:
-        del bot_slug
         url = f"{endpoint.rstrip('/')}/screenshot?max_width={int(max_width)}"
-        status, headers, raw = await self._request("GET", url, timeout=timeout)
+        status, headers, raw = await self._request(
+            "GET", url, headers=self._auth_headers(bot_slug), timeout=timeout
+        )
         if status >= 400:
             detail = raw.decode("utf-8", errors="ignore")
             raise DesktopMCPError(f"Desktop screenshot returned HTTP {status}: {detail}")
@@ -1974,7 +2082,6 @@ class _DefaultDesktopAgentTransport:
         *,
         timeout: float = 25.0,
     ) -> dict[str, Any]:
-        del bot_slug
         url = f"{endpoint.rstrip('/')}/action"
         payload = {"action": action, **(params or {})}
         req_timeout = (
@@ -1982,9 +2089,15 @@ class _DefaultDesktopAgentTransport:
             if action in {"exec", "shell", "bash", "run_command"}
             else timeout
         )
-        status, _, raw = await self._request("POST", url, json_body=payload, timeout=req_timeout)
+        status, _, raw = await self._request(
+            "POST",
+            url,
+            json_body=payload,
+            headers=self._auth_headers(bot_slug),
+            timeout=req_timeout,
+        )
         data = json.loads(raw.decode("utf-8") or "{}")
-        if status >= 400 and data.get("status") != "error":
+        if status in (401, 403) or (status >= 400 and data.get("status") != "error"):
             raise DesktopMCPError(f"Desktop action '{action}' returned HTTP {status}: {data}")
         return data
 
@@ -1997,10 +2110,15 @@ class _DefaultDesktopAgentTransport:
         *,
         timeout: float = 25.0,
     ) -> dict[str, Any]:
-        del bot_slug
         url = f"{endpoint.rstrip('/')}{DESKTOP_MCP_PATH}"
         rpc = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
-        status, _, raw = await self._request("POST", url, json_body=rpc, timeout=timeout)
+        status, _, raw = await self._request(
+            "POST",
+            url,
+            json_body=rpc,
+            headers=self._auth_headers(bot_slug),
+            timeout=timeout,
+        )
         data = json.loads(raw.decode("utf-8") or "{}")
         if status >= 400:
             raise DesktopMCPError(f"Desktop MCP '{method}' returned HTTP {status}: {data}")
@@ -2037,11 +2155,19 @@ class DesktopMCPBridge:
     ) -> None:
         self._desktop_manager = desktop_manager
         self._bus = bus
-        self._transport = transport or _DefaultDesktopAgentTransport()
+        self._transport = transport or _DefaultDesktopAgentTransport(
+            token_provider=self._token_for_bot
+        )
         self._using_default_transport = transport is None
         self._probe_interval_seconds = probe_interval_seconds
         self._ready_timeout_seconds = ready_timeout_seconds
         self._sim_states: dict[str, _SimDesktopState] = {}
+
+    def _token_for_bot(self, bot_slug: str) -> str:
+        fn = getattr(self._desktop_manager, "agent_token_for", None)
+        if callable(fn):
+            return str(fn(bot_slug) or "")
+        return ""
 
     def endpoint_for(self, bot_slug: str) -> str:
         return f"http://{self._desktop_manager.container_name_for(bot_slug)}:{DESKTOP_MCP_PORT}"
@@ -2051,17 +2177,25 @@ class DesktopMCPBridge:
 
     def build_mcp_server_config(self, bot_slug: str) -> dict[str, Any]:
         clean_slug = self._desktop_manager.container_name_for(bot_slug).removeprefix("argo-desktop-")
-        return {
+        tok = self._token_for_bot(clean_slug)
+        cfg: dict[str, Any] = {
             "transport": "streamable_http",
             "url": self.mcp_url_for(clean_slug),
             "endpoint": self.endpoint_for(clean_slug),
             "port": DESKTOP_MCP_PORT,
             "path": DESKTOP_MCP_PATH,
         }
+        if tok:
+            cfg["headers"] = {"X-Argo-Desktop-Token": tok}
+        return cfg
 
     @classmethod
     def create_pydantic_ai_mcp_toolset(
-        cls, bot_slug: str, mcp_url: str | None = None
+        cls,
+        bot_slug: str,
+        mcp_url: str | None = None,
+        *,
+        agent_token: str = "",
     ) -> Any:
         """Instantiate pydantic_ai.mcp.MCPToolset with FastMCP StreamableHttpTransport bound to argo-desktop-<slug>:9223/mcp."""
         from fastmcp.client.transports import StreamableHttpTransport  # type: ignore[import-not-found]
@@ -2074,7 +2208,11 @@ class DesktopMCPBridge:
             mcp_url
             or f"http://argo-desktop-{clean_slug}:{DESKTOP_MCP_PORT}{DESKTOP_MCP_PATH}"
         )
-        transport = StreamableHttpTransport(url=target_url)
+        headers = {"X-Argo-Desktop-Token": agent_token.strip()} if agent_token.strip() else None
+        transport = StreamableHttpTransport(
+            url=target_url,
+            **({"headers": headers} if headers else {}),
+        )
         return MCPToolset(transport, id=f"desktop_mcp_{clean_slug}")
 
     def _use_in_memory_simulation(self) -> bool:
@@ -2127,10 +2265,19 @@ class DesktopMCPBridge:
         deadline = asyncio.get_running_loop().time() + (timeout_seconds or self._ready_timeout_seconds)
         last_exc: Exception | None = None
         last_notice = -10.0
+        emitted_wait = False
+        wait_state = "working" if correlation_id else "desktop_boot"
         while True:
             try:
                 health = await self._transport.health(clean_slug, endpoint, timeout=4.0)
                 if health.get("status") == "ok":
+                    if emitted_wait or not correlation_id:
+                        await self._emit_progress(
+                            clean_slug,
+                            "desktop_ready",
+                            "Virtual Desktop ready.",
+                            correlation_id=correlation_id,
+                        )
                     return health
             except Exception as exc:
                 last_exc = exc
@@ -2141,9 +2288,10 @@ class DesktopMCPBridge:
                 )
             if now - last_notice >= 3.0:
                 last_notice = now
+                emitted_wait = True
                 await self._emit_progress(
                     clean_slug,
-                    "working",
+                    wait_state,
                     f"Waiting for Virtual Desktop MCP agent (:{DESKTOP_MCP_PORT})...",
                     correlation_id=correlation_id,
                 )
@@ -2202,9 +2350,17 @@ class DesktopMCPBridge:
         max_width: int = 1280,
         correlation_id: str | None = None,
         ready_timeout_seconds: float | None = None,
+        passive: bool = False,
     ) -> tuple[bytes, dict[str, Any]]:
-        clean_slug, endpoint = await self._ensure_running(bot_slug, correlation_id=correlation_id)
-        if correlation_id:
+        from argo_core.desktop.manager import validate_desktop_slug
+
+        if passive:
+            clean_slug = validate_desktop_slug(bot_slug)
+            endpoint = self.endpoint_for(clean_slug)
+        else:
+            clean_slug, endpoint = await self._ensure_running(bot_slug, correlation_id=correlation_id)
+
+        if correlation_id and not passive:
             await self._emit_progress(
                 clean_slug,
                 "working",
@@ -2223,11 +2379,12 @@ class DesktopMCPBridge:
             self._desktop_manager.record_screenshot(clean_slug, png_bytes, meta)
             return png_bytes, meta
 
-        await self.wait_until_ready(
-            clean_slug,
-            correlation_id=correlation_id,
-            timeout_seconds=ready_timeout_seconds,
-        )
+        if not passive:
+            await self.wait_until_ready(
+                clean_slug,
+                correlation_id=correlation_id,
+                timeout_seconds=ready_timeout_seconds,
+            )
         png_bytes, meta = await self._transport.screenshot(clean_slug, endpoint, max_width=max_width)
         meta["screenshot_url"] = f"/api/desktops/{clean_slug}/screenshot"
         self._desktop_manager.record_screenshot(clean_slug, png_bytes, meta)
@@ -2256,6 +2413,8 @@ class DesktopMCPBridge:
                 payload["url"] = cleaned_url
             except SSRFBlockedError as exc:
                 return {"status": "error", "action": act, "detail": f"URL blocked by SSRF policy: {exc}"}
+            except PublicFetchError as exc:
+                return {"status": "error", "action": act, "detail": f"Unable to resolve or reach URL: {exc}"}
 
         if act == "screenshot":
             png_bytes, meta = await self.capture_screenshot(

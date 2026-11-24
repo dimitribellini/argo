@@ -4,7 +4,7 @@ services:
     mem_limit: 256m
     cpus: 0.5
     networks:
-      - argo-net
+      - argo-core-net
     restart: unless-stopped
     logging:
       driver: json-file
@@ -17,25 +17,43 @@ services:
     mem_limit: 2g
     cpus: 2.0
     environment:
+      # --- Required ---
       # Generate with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-      # All OAuth accounts, Telegram bots, webhooks, and LLM keys are configured in the Web UI (encrypted in SQLite).
-      ARGO_MASTER_KEY: "CHANGE_ME_FERNET_BASE64_KEY"
-      ARGO_DB_PATH: "/data/argo.db"
-      ARGO_VALKEY_URL: "valkey://valkey:6379/0"
-      ARGO_DESKTOP_VOLUMES_ROOT: "/srv/argo/desktops"
-      ARGO_DOCKER_NETWORK: "argo-net"
+      ARGO_MASTER_KEY: "${ARGO_MASTER_KEY:?Set ARGO_MASTER_KEY before starting Argo}"
       ARGO_PUBLIC_BASE_URL: "https://argo.example.com"
-      # Optional shared Google OAuth client for 1-click Gmail onboarding (falls back to UI client setup)
-      # ARGO_GOOGLE_CLIENT_ID: ""
-      # ARGO_GOOGLE_CLIENT_SECRET: ""
+
+      # --- Optional Features (active by default; set "" / "false" if not needed) ---
+      # Team & user isolation (Private | Team | Shared ACLs + Settings -> Users & Teams)
+      ARGO_MULTI_USER: "true"
+      # Single Google OAuth client for BOTH invite-only "Continue with Google" login AND 1-click Gmail/Drive/Calendar onboarding.
+      # Leave "" for Email/Password-only; when set, add these 2 Authorized Redirect URIs in Google Cloud Console:
+      #   - ${ARGO_PUBLIC_BASE_URL}/api/auth/google/callback
+      #   - ${ARGO_PUBLIC_BASE_URL}/api/integrations/google/callback
+      ARGO_GOOGLE_AUTH_CLIENT_ID: ""
+      ARGO_GOOGLE_AUTH_CLIENT_SECRET: ""
+
+      # --- Stack Defaults (no changes needed for standard hybrid deployments) ---
+      ARGO_AUTH_MODE: "hybrid"
+      ARGO_DB_PATH: "/data/argo.db"
+      ARGO_SANDBOX_VOLUMES_ROOT: "/srv/argo/sandboxes"
+      ARGO_SANDBOX_IMAGE: "ghcr.io/dimitribellini/argo-sandbox:latest"
+      ARGO_SANDBOX_NETWORK: "argo-sandbox-net"
+      ARGO_DOCKER_NETWORK: "argo-desktop-net"
+      ARGO_REQUIRE_SSO: "true"
+      # Uncomment only when using external SSO (--profile oauth2-proxy + ARGO_AUTH_MODE "sso"):
+      # ARGO_TRUSTED_PROXY_HOST: "oauth2-proxy"
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - argo-data:/data
       - /srv/argo/desktops:/srv/argo/desktops
+      - /srv/argo/sandboxes:/srv/argo/sandboxes
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - valkey
     networks:
-      - argo-net
+      - argo-core-net
+      - argo-desktop-net
     restart: unless-stopped
     logging:
       driver: json-file
@@ -44,6 +62,7 @@ services:
         max-file: "3"
 
   oauth2-proxy:
+    profiles: ["oauth2-proxy"]
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
     mem_limit: 256m
     cpus: 0.5
@@ -60,12 +79,16 @@ services:
       - --skip-auth-regex=^/(hooks/|favicon\.(svg|ico)$|apple-touch-icon\.png$)
       - --reverse-proxy=true
       - --set-xauthrequest=true
+      - --custom-templates-dir=/etc/oauth2-proxy/templates
+      - --footer=-
+    volumes:
+      - ./oauth2-proxy/templates:/etc/oauth2-proxy/templates:ro
     ports:
       - "127.0.0.1:4180:4180"
     depends_on:
       - argo-core
     networks:
-      - argo-net
+      - argo-core-net
     restart: unless-stopped
     logging:
       driver: json-file
@@ -74,9 +97,17 @@ services:
         max-file: "3"
 
 networks:
-  argo-net:
-    name: argo-net
+  argo-core-net:
+    name: argo-core-net
     driver: bridge
+  argo-desktop-net:
+    name: argo-desktop-net
+    driver: bridge
+  argo-sandbox-net:
+    name: argo-sandbox-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
 
 volumes:
   argo-data:

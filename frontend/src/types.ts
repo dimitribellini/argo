@@ -7,12 +7,15 @@ export type ViewId =
   | "integrations"
   | "models";
 
+export type ResourceVisibility = "private" | "team" | "shared";
+
 export type SettingsTab =
   | "integrations"
   | "vault"
   | "models"
   | "desktops"
   | "memory"
+  | "users"
   | "diagnostics";
 
 export interface HostTelemetry {
@@ -27,6 +30,7 @@ export interface HostTelemetry {
 
 export interface WorkspaceSummary {
   version: string;
+  commit_sha?: string;
   sqlite_wal: boolean;
   valkey_connected: boolean;
   vault_configured: boolean;
@@ -38,6 +42,8 @@ export interface WorkspaceSummary {
     models: number;
     desktops_running: number;
     desktops_total: number;
+    sandboxes_running?: number;
+    sandboxes_total?: number;
   };
   host: HostTelemetry;
 }
@@ -46,6 +52,52 @@ export interface SsoPrincipal {
   authenticated: boolean;
   email: string;
   actor: string;
+  display_name?: string;
+  must_change_password?: boolean;
+  auth_method?: string;
+  auth_mode?: "sso" | "local" | "hybrid" | string;
+  google_auth_enabled?: boolean;
+  is_admin?: boolean;
+  multi_user?: boolean;
+  groups?: Array<{ slug: string; name: string }>;
+  max_active_desktops_per_user?: number;
+  max_active_sandboxes_per_user?: number;
+}
+
+export interface AuthConfigResponse {
+  auth_mode: "sso" | "local" | "hybrid";
+  multi_user: boolean;
+  google_auth_enabled: boolean;
+  needs_setup: boolean;
+  public_base_url: string;
+}
+
+export interface TeamGroupRecord {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  member_emails: string[];
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AdminUserRecord {
+  email: string;
+  display_name: string;
+  role: "admin" | "member";
+  active: boolean;
+  auth_methods: Array<"password" | "google">;
+  has_password: boolean;
+  must_change_password: boolean;
+  max_active_desktops: number | null;
+  max_active_sandboxes: number | null;
+  groups: Array<{ slug: string; name: string }>;
+  last_login_at?: string | null;
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface ActivityEvent {
@@ -81,6 +133,8 @@ export interface BotRoutine {
   skill_slugs?: string[];
   timezone?: string;
   stale_data_policy?: "skip_quietly" | "notify_missing" | "always_run" | string;
+  one_shot?: boolean;
+  completed_at?: string;
 }
 
 export interface BotTriggerResult {
@@ -96,6 +150,9 @@ export interface BotTriggerResult {
 }
 
 export interface BotRecord {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   id: string;
   slug: string;
   name: string;
@@ -111,13 +168,16 @@ export interface BotRecord {
   onboarding_pending?: boolean;
   role: string;
   enabled: boolean;
-  runtime: "api" | "desktop";
+  runtime: "api" | "sandbox" | "desktop";
   desktop_policy: string;
   desktop_state: "none" | "running" | "hibernated";
+  sandbox_policy?: string;
+  sandbox_state?: "none" | "running" | "hibernated";
   ram_mb: number;
   ram_limit_mb: number;
   outbound_rbac: "internal" | "draft" | "execute";
   daily_cap: number;
+  max_steps_per_run?: number;
   model: string;
   role_prompt: string;
   routines: BotRoutine[];
@@ -141,10 +201,12 @@ export interface BotDraftSpec {
   boundaries?: string[];
   role: string;
   role_prompt: string;
-  runtime: "api" | "desktop";
+  runtime: "api" | "sandbox" | "desktop";
   desktop_policy: string;
+  sandbox_policy?: string;
   outbound_rbac: "internal" | "draft" | "execute";
   daily_cap: number;
+  max_steps_per_run?: number;
   model: string;
   routines: BotRoutine[];
   tools: Array<Record<string, unknown> | string>;
@@ -264,6 +326,29 @@ export interface QueuedMessageAck {
   run_id: string;
   user_message: BotMessage | RoomMessage | null;
   queued_behind: number;
+  removed_message_ids?: string[];
+}
+
+export interface RunCheckpoint {
+  steps_completed: number;
+  max_steps: number;
+  next_batch_steps: number;
+  continue_prompt: string;
+}
+
+export interface OperatorQuestionOption {
+  id: string;
+  label: string;
+  reply: string;
+  tone?: "primary" | "secondary" | "danger";
+}
+
+export interface OperatorQuestion {
+  id: string;
+  question: string;
+  context?: string;
+  options: OperatorQuestionOption[];
+  allow_custom_reply?: boolean;
 }
 
 export interface BotMessage {
@@ -290,6 +375,8 @@ export interface BotMessage {
     applied_changes?: Record<string, unknown>;
     habit_proposal?: HabitProposal;
     delegation_plan?: DelegationPlan;
+    operator_question?: OperatorQuestion;
+    run_checkpoint?: RunCheckpoint;
     attachments?: WorkspaceFileAttachment[];
     reply_to?: MessageQuote;
     reactions?: Record<string, string[]>;
@@ -298,6 +385,9 @@ export interface BotMessage {
 }
 
 export interface RoomRecord {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   id: string;
   slug: string;
   title: string;
@@ -337,7 +427,9 @@ export interface RoomMessage {
     actions?: Array<{ screenshot_url?: string; slug?: string; page_slug?: string; title?: string; [key: string]: unknown }>;
     applied_changes?: Record<string, unknown>;
     delegation_plan?: DelegationPlan;
+    operator_question?: OperatorQuestion;
     pending_room_handoff?: PendingRoomHandoff;
+    run_checkpoint?: RunCheckpoint;
     attachments?: WorkspaceFileAttachment[];
     reply_to?: MessageQuote;
     reactions?: Record<string, string[]>;
@@ -349,6 +441,9 @@ export interface RoomMessage {
 }
 
 export interface LiveRoomStation {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   slug: string;
   title: string;
   member_bot_slugs: string[];
@@ -382,6 +477,9 @@ export interface SkillRecord {
 }
 
 export interface LiveBotStation {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   slug: string;
   name: string;
   initials: string;
@@ -392,8 +490,9 @@ export interface LiveBotStation {
   goal_metric: string;
   role: string;
   enabled: boolean;
-  runtime: "api" | "desktop";
+  runtime: "api" | "sandbox" | "desktop";
   desktop_state: string;
+  sandbox_state?: string;
   state: "running" | "waiting_approval" | "takeover_needed" | "paused" | "idle";
   active_step?: string;
   pending_approvals_count: number;
@@ -423,6 +522,20 @@ export interface LiveWorkspaceStatusResponse {
   rooms?: LiveRoomStation[];
 }
 
+export interface ApprovalExecutionResult {
+  action_type?: string;
+  session_id?: string | null;
+  vault_slug?: string;
+  host?: string | null;
+  port?: number | null;
+  command?: string;
+  status?: string;
+  exit_code?: number | null;
+  prompt_line?: string;
+  screen_text?: string;
+  trusted_prefixes_added?: string[];
+}
+
 export interface ApprovalItem {
   id: string;
   correlation_id: string;
@@ -430,9 +543,13 @@ export interface ApprovalItem {
   target_account_slug: string;
   action_type: string;
   status: "pending" | "approved" | "executed" | "rejected" | "superseded";
+  trusted_prefixes_added?: string[];
   payload: {
     title?: string;
     text?: string;
+    batch_id?: string;
+    suggested_trust_prefixes?: string[];
+    execution_result?: ApprovalExecutionResult;
     [key: string]: unknown;
   };
   edited_payload: {
@@ -460,6 +577,9 @@ export interface StyleRule {
 }
 
 export interface PageRecord {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   id: string;
   slug: string;
   title: string;
@@ -502,11 +622,27 @@ export interface PageDataResponse {
     [key: string]: unknown;
   };
   collections: Record<string, CollectionDocument[]>;
+  collection_counts?: Record<string, number>;
+  datasets?: Record<string, Array<Record<string, unknown>>>;
+  dataset_profiles?: Record<string, unknown>;
   records: CollectionDocument[];
   total_records: number;
 }
 
+export interface PageSqlQueryResult {
+  page_slug: string;
+  columns: string[];
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+  truncated: boolean;
+  collection_counts: Record<string, number>;
+  engine?: "duckdb" | "sqlite";
+}
+
 export interface DesktopInfo {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   bot_slug: string;
   bot_name: string;
   role: string;
@@ -538,13 +674,34 @@ export interface DesktopLaunchQueueItem {
   queued_at: string;
 }
 
+export interface SandboxInfo {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
+  bot_slug: string;
+  bot_name: string;
+  role: string;
+  container_name: string;
+  sandbox_state: "running" | "hibernated";
+  ram_mb: number;
+  ram_limit_mb: number;
+  image?: string;
+  volume_path?: string;
+  idle_seconds?: number;
+  idle_timeout_seconds?: number;
+}
+
 export interface DesktopsResponse {
   host: HostTelemetry;
   desktops: DesktopInfo[];
   queued_launches: DesktopLaunchQueueItem[];
+  sandboxes?: SandboxInfo[];
 }
 
 export interface IntegrationAccount {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   id: string;
   slug: string;
   provider: "google" | "telegram" | "linkedin" | "webhook" | "mcp";
@@ -568,6 +725,11 @@ export interface ModelProvider {
   is_default: boolean;
   daily_token_limit: number | null;
   monthly_budget_usd: number | null;
+  input_price_per_million?: number | null;
+  output_price_per_million?: number | null;
+  effective_input_price_per_million?: number;
+  effective_output_price_per_million?: number;
+  pricing_source?: "custom" | "live" | "catalog" | "provider_default" | "local";
   today_tokens?: number;
   today_cost_usd?: number;
   month_tokens?: number;
@@ -575,7 +737,24 @@ export interface ModelProvider {
   created_at: string;
 }
 
+export interface DiscoveredProviderModel {
+  model_id: string;
+  display_name: string;
+  context_window?: number | null;
+  input_price_per_million: number;
+  output_price_per_million: number;
+  pricing_source: "live" | "catalog" | "provider_default" | "local";
+}
+
+export interface DiscoverModelsResponse {
+  provider_type: ModelProvider["provider_type"];
+  models: DiscoveredProviderModel[];
+  pricing_mode: "live" | "local" | "estimated";
+  source_note: string;
+}
+
 export interface BotRunRecord {
+  triggered_by_email?: string;
   id: string;
   correlation_id: string;
   bot_slug: string;
@@ -591,19 +770,38 @@ export interface BotRunRecord {
   finished_at: string | null;
 }
 
+export interface BotModelUsageSlice {
+  model_id: string;
+  runs_count: number;
+  today_tokens: number;
+  month_tokens: number;
+  month_cost_usd: number;
+}
+
 export interface BotUsageItem {
   bot_slug: string;
   bot_name: string;
   model: string;
   enabled: boolean;
+  exists?: boolean;
   runs_count: number;
   today_tokens: number;
   month_tokens: number;
   month_cost_usd: number;
   top_trigger_type: string;
+  models_used?: BotModelUsageSlice[];
+}
+
+export interface UserUsageItem {
+  email: string;
+  runs_count: number;
+  today_tokens: number;
+  month_tokens: number;
+  month_cost_usd: number;
 }
 
 export interface ModelsResponse {
+  usage_by_user?: UserUsageItem[];
   providers: ModelProvider[];
   today_tokens: number;
   today_cost_usd: number;
@@ -731,6 +929,9 @@ export interface DebugOverviewResponse {
 }
 
 export interface VaultSecretRecord {
+  owner_email?: string;
+  visibility?: ResourceVisibility;
+  allowed_groups?: string[];
   id: string;
   slug: string;
   name: string;
@@ -740,9 +941,58 @@ export interface VaultSecretRecord {
   url: string;
   secret_keys: string[];
   allowed_bots: string[];
+  trusted_command_prefixes?: string[];
+  host_key_fingerprints?: Record<string, string>;
   env_placeholders: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface SSHSessionRecord {
+  session_id: string;
+  bot_slug: string;
+  vault_slug: string;
+  host: string;
+  port: number;
+  correlation_id: string;
+  status: "active" | "awaiting_input" | "taken_over" | "paused" | "closed" | string;
+  operator_takeover: boolean;
+  paused: boolean;
+  pinned: boolean;
+  last_command: string;
+  screen_text: string;
+  cast_relpath?: string;
+  cast_sha256?: string;
+  created_at: string;
+  expires_at: string;
+  live?: boolean;
+}
+
+export interface SSHAuditSettings {
+  retention_hours: number;
+  total_recordings: number;
+  pinned_recordings: number;
+}
+
+export interface ChatRetentionSettings {
+  retention_days: number;
+  bot_messages_count: number;
+  room_messages_count: number;
+  updated_at?: string | null;
+  pruned_bot_messages?: number;
+  pruned_room_messages?: number;
+  pruned_total?: number;
+}
+
+export interface ClearMessagesResponse<T> {
+  status: string;
+  target_type: "bot" | "room";
+  slug: string;
+  deleted_count: number;
+  remaining_count: number;
+  messages: T[];
+  has_more: boolean;
+  total_count: number;
 }
 
 export interface DesktopRecordingStatus {

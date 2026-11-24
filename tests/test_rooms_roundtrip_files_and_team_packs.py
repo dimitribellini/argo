@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -385,6 +386,33 @@ class TestRoomsRoundTripFilesAndTeamPacks(unittest.TestCase):
                         "role": "Manage operations and dashboards",
                     },
                 )
+                # When zero pages exist, open_page returns not_found and never fabricates "Bot Hub Board"
+                res_empty = client.post(
+                    "/api/bots/operations-coordinator/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "can you open the html board?"},
+                )
+                self.assertEqual(res_empty.status_code, 200, res_empty.text)
+                empty_actions = res_empty.json()["result"]["actions"]
+                empty_open = [a for a in empty_actions if a.get("type") == "open_page"]
+                self.assertEqual(len(empty_open), 1)
+                self.assertEqual(empty_open[0]["status"], "not_found")
+                self.assertEqual(client.get("/api/pages", headers=self._sso_headers()).json(), [])
+
+                # Once a real page exists for this bot, conversational open_page resolves and opens it
+                gen = client.post(
+                    "/api/pages/generate",
+                    headers=self._sso_headers(),
+                    json={
+                        "title": "Workspace Board",
+                        "prompt": "Show live bot status overview",
+                        "owner_bot_slug": "operations-coordinator",
+                        "template_key": "bot_hub_board",
+                    },
+                )
+                self.assertEqual(gen.status_code, 201, gen.text)
+                created_page = gen.json()
+
                 res = client.post(
                     "/api/bots/operations-coordinator/messages",
                     headers=self._sso_headers(),
@@ -396,6 +424,7 @@ class TestRoomsRoundTripFilesAndTeamPacks(unittest.TestCase):
                 self.assertEqual(len(open_acts), 1)
                 self.assertEqual(open_acts[0]["status"], "ok")
                 page_slug = open_acts[0]["slug"]
+                self.assertEqual(page_slug, created_page["slug"])
 
                 pages = client.get("/api/pages", headers=self._sso_headers()).json()
                 hub_page = next((p for p in pages if p["slug"] == page_slug), None)
@@ -404,6 +433,17 @@ class TestRoomsRoundTripFilesAndTeamPacks(unittest.TestCase):
                 self.assertIn("ARGO_LIVE_STATUS", hub_page["content_payload"])
                 self.assertIn("ARGO_OPEN_ROOM", hub_page["content_payload"])
                 self.assertNotIn("allow-same-origin", hub_page["content_payload"].lower())
+
+                # Calling open_page with a missing explicit slug must return not_found (never fall back to pages[0])
+                miss = asyncio.run(
+                    app.state.bot_runner._execute_actions(
+                        bot=app.state.repo.get_bot("operations-coordinator"),
+                        correlation_id="corr_miss",
+                        hop_count=1,
+                        actions=[{"type": "open_page", "slug": "non-existent-board", "mode": "split"}],
+                    )
+                )
+                self.assertEqual(miss[0]["status"], "not_found")
 
     def test_strict_multi_user_workspace_files_10mb_cap_and_unread_cursors(self) -> None:
         alice_hdrs = self._sso_headers("alice@example.com")
@@ -530,14 +570,59 @@ class TestRoomsRoundTripFilesAndTeamPacks(unittest.TestCase):
             app = self._build_env(tmp)
             with TestClient(app) as client:
                 starters = client.get("/api/team-packs/starters", headers=self._sso_headers()).json()
-                self.assertEqual(len(starters), 3)
-                first_pack = starters[0]
+                self.assertEqual(starters, [])
+                sample_pack = {
+                    "id": "custom-team-pack",
+                    "schema_version": "argo.team_pack.v1",
+                    "title": "Custom Coordination Pack",
+                    "description": "Three-bot JSON pack fixture",
+                    "section": "Operations",
+                    "bots": [
+                        {
+                            "source_slug": "lead-bot",
+                            "name": "Lead Bot",
+                            "role": "Coordinate work across teammates",
+                            "outbound_rbac": "draft",
+                        },
+                        {
+                            "source_slug": "scout-bot",
+                            "name": "Scout Bot",
+                            "role": "Collect updates from sources",
+                            "outbound_rbac": "internal",
+                        },
+                        {
+                            "source_slug": "writer-bot",
+                            "name": "Writer Bot",
+                            "role": "Draft summaries for approval",
+                            "outbound_rbac": "draft",
+                        },
+                    ],
+                    "pages": [
+                        {
+                            "source_slug": "pack-board",
+                            "title": "Pack Status Page",
+                            "render_mode": "sandboxed_html",
+                            "owner_bot_slug": "lead-bot",
+                            "content_payload": "<html><body>Pack Page</body></html>",
+                        }
+                    ],
+                    "rooms": [
+                        {
+                            "source_slug": "pack-room",
+                            "title": "Pack Room",
+                            "member_bot_slugs": ["lead-bot", "scout-bot", "writer-bot"],
+                            "coordinator_bot_slug": "lead-bot",
+                            "pinned_page_slug": "pack-board",
+                            "section": "Operations",
+                        }
+                    ],
+                }
 
                 # First import creates original slugs
                 imp1 = client.post(
                     "/api/team-packs/import",
                     headers=self._sso_headers(),
-                    json={"pack": first_pack},
+                    json={"pack": sample_pack},
                 )
                 self.assertEqual(imp1.status_code, 201, imp1.text)
                 b1 = imp1.json()

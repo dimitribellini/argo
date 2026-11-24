@@ -59,6 +59,9 @@ class WebhookService:
         signing_secret: str | None = None,
         event_type: str = "webhook.received",
         target_collection: str | None = "webhook_events",
+        owner_email: str = "",
+        visibility: str | None = None,
+        allowed_groups: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register an inbound signed webhook connector and return its URL (+ generated secret once)."""
         clean_name = display_name.strip()
@@ -101,6 +104,9 @@ class WebhookService:
                 "event_type": clean_event,
                 "target_collection": clean_collection,
             },
+            owner_email=owner_email,
+            visibility=visibility,
+            allowed_groups=allowed_groups,
             status="ok",
         )
 
@@ -163,15 +169,17 @@ class WebhookService:
         if not isinstance(parsed, (dict, list)):
             raise WebhookConfigError("Webhook JSON payload must be an object or array.")
 
-        resolved_delivery_id = (delivery_id or "").strip()
-        if not resolved_delivery_id:
-            if isinstance(parsed, dict) and parsed.get("id") is not None:
-                resolved_delivery_id = str(parsed["id"]).strip()
-            if not resolved_delivery_id:
-                resolved_delivery_id = hashlib.sha256(raw_body).hexdigest()[:24]
+        body_digest = hashlib.sha256(raw_body).hexdigest()[:24]
+        body_event_id = (
+            str(parsed["id"]).strip()
+            if isinstance(parsed, dict) and parsed.get("id") is not None and str(parsed["id"]).strip()
+            else ""
+        )
+        replay_key = f"id:{body_event_id}" if body_event_id else f"sha256:{body_digest}"
+        resolved_delivery_id = body_event_id or (delivery_id or "").strip() or body_digest
 
         is_fresh = await self._bus.check_and_mark_seen(
-            f"wh:{account['slug']}:{resolved_delivery_id}"
+            f"wh:{account['slug']}:{replay_key}"
         )
         if not is_fresh:
             return {

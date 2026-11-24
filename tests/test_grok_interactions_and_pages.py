@@ -621,7 +621,7 @@ class TestGrokInteractionsAndLivingPages(unittest.TestCase):
                                 "title": "Live Bot Operations Map v2",
                                 "description": "Side-by-side conversational revision",
                                 "render_mode": "sandboxed_html",
-                                "allowed_collections": ["bot_threads"],
+                                "allowed_collections": ["ops_feed"],
                                 "content_payload": "<!doctype html><html><body><h1>Live Map v2</h1></body></html>",
                             }
                         ],
@@ -642,7 +642,7 @@ class TestGrokInteractionsAndLivingPages(unittest.TestCase):
                         "role": "Build interactive pages",
                         "runtime": "api",
                         "outbound_rbac": "draft",
-                        "collections": {"read": ["bot_threads"], "write": ["bot_threads"]},
+                        "collections": {"read": ["bot_threads", "ops_feed"], "write": ["ops_feed"]},
                     },
                 ).json()
 
@@ -658,7 +658,7 @@ class TestGrokInteractionsAndLivingPages(unittest.TestCase):
                             "prompt": f"Create {tpl_key} view",
                             "template_key": tpl_key,
                             "owner_bot_slug": bot["slug"],
-                            "allowed_collections": ["bot_threads"],
+                            "allowed_collections": ["ops_feed"],
                         },
                     )
                     self.assertEqual(gen.status_code, 201, gen.text)
@@ -1107,7 +1107,7 @@ class TestGrokInteractionsAndLivingPages(unittest.TestCase):
                 self.assertEqual(len(llm_calls), 2)
                 self.assertEqual(llm_calls[1]["subjects"], ["Urgent Contract Review"])
 
-                # 6. Generated Living Pages (+ New templates) share sober graphite styling (zero gradients/fluo)
+                # 6. Generated Living Pages use Light/Dark semantic CSS vars (zero gradients / unsafe flags)
                 gen = client.post(
                     "/api/pages/generate",
                     headers=self._sso_headers(),
@@ -1121,9 +1121,10 @@ class TestGrokInteractionsAndLivingPages(unittest.TestCase):
                 )
                 self.assertEqual(gen.status_code, 201, gen.text)
                 html_doc = gen.json()["content_payload"]
-                self.assertIn("#161920", html_doc)
-                self.assertIn("#1e232c", html_doc)
+                self.assertIn("var(--bg", html_doc)
+                self.assertIn("var(--card", html_doc)
                 self.assertNotIn("linear-gradient", html_doc)
+                self.assertNotIn("allow-same-origin", html_doc.lower())
 
 
 if __name__ == "__main__":

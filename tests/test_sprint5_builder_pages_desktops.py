@@ -12,6 +12,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
@@ -27,6 +28,7 @@ from argo_core.desktop.cdp_bridge import (  # noqa: E402
     CDPPageSnapshot,
     ChromeDevToolsBridge,
     DesktopTakeoverRequiredError,
+    _select_cdp_target,
 )
 from argo_core.desktop.manager import (  # noqa: E402
     DESKTOP_IMAGE,
@@ -39,6 +41,7 @@ from argo_core.desktop.manager import (  # noqa: E402
     DockerSdkDriver,
     InMemoryDockerDriver,
     _build_agent_tar_archive,
+    _maybe_inject_selkies_iframe_shim,
 )
 from argo_core.desktop.mcp_bridge import (  # noqa: E402
     DESKTOP_AGENT_VERSION,
@@ -49,6 +52,7 @@ from argo_core.desktop.mcp_bridge import (  # noqa: E402
 )
 from argo_core.llm.router import LLMRequest  # noqa: E402
 from argo_core.main import create_app  # noqa: E402
+from argo_core.runner.bot_runner import _turn_action_fingerprint  # noqa: E402
 from argo_core.watchdog.resource_guard import HostResourceGuard  # noqa: E402
 
 
@@ -114,6 +118,7 @@ class TestSprint5BuilderPagesDesktops(unittest.TestCase):
         tg_transport: FakeTelegramTransport | None = None,
         docker_driver=None,
         cdp_transport=None,
+        cdp_action_transport=None,
         selkies_proxy_transport=None,
         desktop_agent_transport=None,
     ):
@@ -154,6 +159,7 @@ class TestSprint5BuilderPagesDesktops(unittest.TestCase):
             telegram_transport=tg_transport,
             docker_driver=docker_driver,
             cdp_transport=cdp_transport,
+            cdp_action_transport=cdp_action_transport,
             selkies_proxy_transport=selkies_proxy_transport,
             desktop_agent_transport=desktop_agent_transport,
         )
@@ -1617,6 +1623,854 @@ class TestSprint5BuilderPagesDesktops(unittest.TestCase):
                 )
                 self.assertEqual(desk_draft.status_code, 200, desk_draft.text)
                 self.assertEqual(desk_draft.json()["draft"]["routines"][0]["schedule"], "Manual")
+
+    def test_selkies_iframe_pointer_shim_hidpi_defaults_and_passive_preview(self) -> None:
+        # 1. Verify _maybe_inject_selkies_iframe_shim patches HTML root & strips ETag while leaving assets untouched
+        raw_html = b"<!doctype html><html><head><title>Selkies</title></head><body><canvas></canvas></body></html>"
+        patched_html, patched_headers = _maybe_inject_selkies_iframe_shim(
+            "",
+            200,
+            "text/html; charset=utf-8",
+            raw_html,
+            {"ETag": '"upstream-etag"', "Vary": "Accept-Encoding"},
+        )
+        self.assertIn(b'data-argo-selkies-shim="1"', patched_html)
+        self.assertIn(b"pointerrawupdate", patched_html)
+        self.assertNotIn("ETag", patched_headers)
+        self.assertEqual(patched_headers.get("Cache-Control"), "no-cache")
+        self.assertEqual(patched_headers.get("Vary"), "Accept-Encoding")
+
+        js_body = b"console.log('selkies bundle');"
+        untouched_js, js_headers = _maybe_inject_selkies_iframe_shim(
+            "assets/bundle.js",
+            200,
+            "application/javascript",
+            js_body,
+            {"ETag": '"js-etag"', "Cache-Control": "public, max-age=3600"},
+        )
+        self.assertEqual(untouched_js, js_body)
+        self.assertEqual(js_headers.get("ETag"), '"js-etag"')
+
+        async def fake_selkies_proxy(
+            slug: str,
+            subpath: str,
+            query_string: str,
+        ) -> tuple[int, str, bytes]:
+            del slug, query_string
+            if subpath in ("", "index.html"):
+                return (
+                    200,
+                    "text/html; charset=utf-8",
+                    b"<!doctype html><html><head><title>Selkies</title></head><body>Desktop</body></html>",
+                )
+            if subpath == "assets/bundle.js":
+                return 200, "application/javascript", b"window.__selkiesBundle=true;"
+            return 200, "text/plain; charset=utf-8", f"raw:{subpath}".encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(
+                tmp,
+                idle_timeout_seconds=10.0,
+                docker_driver=InMemoryDockerDriver(),
+                selkies_proxy_transport=fake_selkies_proxy,
+            )
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Desktop Align Bot",
+                        "role": "Test Selkies iframe alignment and passive live preview",
+                        "runtime": "desktop",
+                        "outbound_rbac": "draft",
+                        "model": "google:gemini-3.8-flash",
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                bot_record = created.json()
+                slug = bot_record["slug"]
+
+                # 2. Verify container runtime spec sets CSS scaling + 96 DPI + CDP 127.0.0.1:19222
+                dm = app.state.desktop_manager
+                spec = dm.build_runtime_spec(bot_record)
+                self.assertEqual(spec.environment["SELKIES_USE_CSS_SCALING"], "true")
+                self.assertEqual(spec.environment["SELKIES_SCALING_DPI"], "96")
+                self.assertIn("127.0.0.1", spec.environment["CHROME_CLI"])
+                self.assertIn("19222", spec.environment["CHROME_CLI"])
+
+                # 3. Passive screenshot on hibernated desktop must return 404 without waking container
+                hibernated_shot = client.get(
+                    f"/api/desktops/{slug}/screenshot?refresh=true&passive=true",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(hibernated_shot.status_code, 404)
+                bot_after_hibernated_shot = client.get(
+                    f"/api/bots/{slug}",
+                    headers=self._sso_headers(),
+                ).json()
+                self.assertEqual(bot_after_hibernated_shot["desktop_state"], "hibernated")
+
+                # 4. Wake desktop, verify HTML shim injection & unmodified asset/API subpaths
+                started = client.post(
+                    f"/api/desktops/{slug}/toggle",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(started.status_code, 200, started.text)
+                self.assertEqual(started.json()["desktop_state"], "running")
+
+                root_html = client.get(
+                    f"/api/desktops/{slug}/selkies/",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(root_html.status_code, 200)
+                self.assertIn('data-argo-selkies-shim="1"', root_html.text)
+                self.assertIn("pointerrawupdate", root_html.text)
+
+                asset_res = client.get(
+                    f"/api/desktops/{slug}/selkies/assets/bundle.js",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(asset_res.status_code, 200)
+                self.assertEqual(asset_res.text, "window.__selkiesBundle=true;")
+                self.assertNotIn("data-argo-selkies-shim", asset_res.text)
+
+                api_res = client.get(
+                    f"/api/desktops/{slug}/selkies/api/clipboard",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(api_res.status_code, 200)
+                self.assertEqual(api_res.text, "raw:api/clipboard")
+
+                # 5. Passive screenshot when running must return PNG without touching _last_activity_at
+                now_holder = [1000.0]
+                dm._clock = lambda: now_holder[0]
+                dm.touch_activity(slug)
+                initial_activity = dm._last_activity_at[slug]
+
+                now_holder[0] = 1004.0
+                live_passive_shot = client.get(
+                    f"/api/desktops/{slug}/screenshot?refresh=true&passive=true",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(live_passive_shot.status_code, 200)
+                self.assertEqual(live_passive_shot.headers.get("content-type"), "image/png")
+                self.assertTrue(live_passive_shot.content.startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(dm._last_activity_at[slug], initial_activity)
+
+                # Advancing past idle_timeout_seconds still auto-hibernates despite passive preview polls
+                now_holder[0] = 1015.0
+                sweep = client.post(
+                    "/api/desktops/sweep-idle",
+                    headers=self._sso_headers(),
+                )
+                self.assertEqual(sweep.status_code, 200)
+                self.assertEqual(sweep.json()["hibernated_desktops"], [slug])
+
+    def test_desktop_browser_action_interactive_flow_and_zero_bypass_gate(self) -> None:
+        # 0. Verify CDP tab selection prefers active/http page tabs over internal chrome:// / devtools:// tabs
+        tabs = [
+            {"id": "dev-1", "type": "page", "url": "devtools://devtools/bundled/inspector.html", "webSocketDebuggerUrl": "ws://1"},
+            {"id": "wel-1", "type": "page", "url": "chrome://whats-new/", "webSocketDebuggerUrl": "ws://2"},
+            {"id": "web-1", "type": "page", "url": "https://portal.example.org/search", "webSocketDebuggerUrl": "ws://3"},
+        ]
+        self.assertEqual(_select_cdp_target(tabs, prefer_http=True)["id"], "web-1")
+        self.assertEqual(_select_cdp_target(tabs, preferred_target_id="wel-1")["id"], "wel-1")
+
+        observed_requests: list[LLMRequest] = []
+        action_log: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_llm(req: LLMRequest) -> dict[str, Any]:
+            observed_requests.append(req)
+            turn = len(observed_requests)
+            if turn == 1:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Opening travel portal in Chromium.",
+                            "actions": [
+                                {"type": "desktop_browse", "url": "https://portal.example.org/search"}
+                            ],
+                        }
+                    ),
+                    "input_tokens": 20,
+                    "output_tokens": 12,
+                }
+            if turn == 2:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Clicking notice consent button.",
+                            "actions": [
+                                {"type": "desktop_browser_action", "action": "click", "text": "Accept"}
+                            ],
+                        }
+                    ),
+                    "input_tokens": 22,
+                    "output_tokens": 12,
+                }
+            if turn == 3:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Filling query field and submitting.",
+                            "actions": [
+                                {
+                                    "type": "desktop_browser_action",
+                                    "action": "fill",
+                                    "placeholder": "Destination",
+                                    "value": "MXP",
+                                    "submit": True,
+                                }
+                            ],
+                        }
+                    ),
+                    "input_tokens": 24,
+                    "output_tokens": 14,
+                }
+            if turn == 4:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Scrolling down to read full results.",
+                            "actions": [
+                                {"type": "desktop_browser_action", "action": "scroll", "direction": "down"}
+                            ],
+                        }
+                    ),
+                    "input_tokens": 24,
+                    "output_tokens": 14,
+                }
+            if "captcha_turn" in req.user_prompt or len(observed_requests) > 5:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "CAPTCHA gate requires operator takeover in Virtual Desktop.",
+                            "actions": [],
+                        }
+                    ),
+                    "input_tokens": 18,
+                    "output_tokens": 12,
+                }
+            return {
+                "text": json.dumps(
+                    {
+                        "summary": "Best direct option: Flight EX101 nonstop USD 420.",
+                        "actions": [],
+                    }
+                ),
+                "input_tokens": 26,
+                "output_tokens": 16,
+            }
+
+        async def fake_cdp_transport(
+            bot_slug: str,
+            cdp_endpoint: str,
+            url: str,
+            selector: str | None,
+        ) -> CDPPageSnapshot:
+            del bot_slug, cdp_endpoint, selector
+            return CDPPageSnapshot(
+                url="https://consent.example.org/notice",
+                status_code=200,
+                title="Privacy Notice",
+                text="Please choose Accept or Reject to continue.",
+                scroll_y=0,
+                scroll_height=1200,
+                viewport_height=800,
+                interactive_elements=[
+                    {"index": 1, "tag": "button", "text": "Accept", "selector": "[data-argo-el=\"1\"]", "in_viewport": True, "x": 640, "y": 500},
+                    {"index": 2, "tag": "button", "text": "Reject", "selector": "[data-argo-el=\"2\"]", "in_viewport": True, "x": 420, "y": 500},
+                ],
+                target_id="tab-1",
+            )
+
+        gate_state = {"armed": False}
+
+        async def fake_cdp_action_transport(
+            bot_slug: str,
+            cdp_endpoint: str,
+            action: str,
+            params: dict[str, Any],
+        ) -> CDPPageSnapshot:
+            del bot_slug, cdp_endpoint
+            action_log.append((action, dict(params)))
+            if gate_state["armed"]:
+                return CDPPageSnapshot(
+                    url="https://portal.example.org/challenge",
+                    status_code=200,
+                    title="Security Check",
+                    text="Please verify you are human to continue.",
+                    html='<div class="cf-turnstile"></div>',
+                    target_id="tab-1",
+                )
+            if action == "click":
+                return CDPPageSnapshot(
+                    url="https://portal.example.org/search",
+                    status_code=200,
+                    title="Travel Search",
+                    text="Enter origin and destination to search nonstop options.",
+                    scroll_y=0,
+                    scroll_height=1600,
+                    viewport_height=800,
+                    interactive_elements=[
+                        {"index": 1, "tag": "input", "placeholder": "Destination", "selector": "[data-argo-el=\"1\"]", "in_viewport": True, "x": 400, "y": 240}
+                    ],
+                    target_id="tab-1",
+                    matched_element={"tag": "button", "text": "Accept", "x": 640, "y": 500},
+                )
+            if action == "fill":
+                return CDPPageSnapshot(
+                    url="https://portal.example.org/results",
+                    status_code=200,
+                    title="Results",
+                    text="Option A loaded above the fold.",
+                    scroll_y=0,
+                    scroll_height=1800,
+                    viewport_height=800,
+                    interactive_elements=[],
+                    target_id="tab-1",
+                    matched_element={"tag": "input", "text": "", "x": 400, "y": 240},
+                )
+            if action == "scroll":
+                return CDPPageSnapshot(
+                    url="https://portal.example.org/results",
+                    status_code=200,
+                    title="Results",
+                    text="Flight EX101 nonstop USD 420, 06:50 departure, 7h15m.",
+                    scroll_y=600,
+                    scroll_height=1800,
+                    viewport_height=800,
+                    interactive_elements=[],
+                    target_id="tab-1",
+                )
+            return CDPPageSnapshot(url="https://portal.example.org/results", status_code=200, title="Results", text="Idle", target_id="tab-1")
+
+        llm_holder: list[Any] = [fake_llm]
+
+        async def dispatch_llm(req: LLMRequest) -> dict[str, Any]:
+            return await llm_holder[0](req)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(
+                tmp,
+                llm_transport=dispatch_llm,
+                docker_driver=InMemoryDockerDriver(),
+                cdp_transport=fake_cdp_transport,
+                cdp_action_transport=fake_cdp_action_transport,
+            )
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Interactive Browser Bot",
+                        "role": "Browse interactive pages cleanly via desktop_browser_action",
+                        "runtime": "desktop",
+                        "outbound_rbac": "internal",
+                        "model": "google:gemini-3.8-flash",
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                slug = created.json()["slug"]
+
+                with patch("argo_core.security.ssrf._default_dns_resolve", return_value=["93.184.216.34"]):
+                    msg_res = client.post(
+                        f"/api/bots/{slug}/messages",
+                        headers=self._sso_headers(),
+                        json={"text": "Check portal.example.org/search and return best nonstop flight"},
+                    )
+                self.assertEqual(msg_res.status_code, 200, msg_res.text)
+                self.assertEqual(len(observed_requests), 5)
+                self.assertIn("desktop_browser_action", observed_requests[0].system_prompt)
+                self.assertIn("interactive_elements", observed_requests[1].user_prompt)
+                self.assertEqual([a for a, _ in action_log], ["click", "fill", "scroll"])
+                self.assertIn("EX101 nonstop USD 420", msg_res.json()["result"]["summary"])
+
+                # interactive_elements must not bloat saved thread action metadata
+                thread_msgs = client.get(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                ).json()
+                bot_replies = [m for m in thread_msgs if m.get("sender") == "bot"]
+                saved_actions = bot_replies[-1]["metadata"]["actions"]
+                for saved_act in saved_actions:
+                    self.assertNotIn("interactive_elements", saved_act)
+
+                # Gate preservation: browser_action must halt cleanly on CAPTCHA/anti-bot gate
+                gate_state["armed"] = True
+                observed_requests.clear()
+
+                async def gate_llm(req: LLMRequest) -> dict[str, Any]:
+                    observed_requests.append(req)
+                    if len(observed_requests) == 1:
+                        return {
+                            "text": json.dumps(
+                                {
+                                    "summary": "Clicking next.",
+                                    "actions": [{"type": "desktop_browser_action", "action": "click", "text": "Continue"}],
+                                }
+                            ),
+                            "input_tokens": 10,
+                            "output_tokens": 8,
+                        }
+                    return {
+                        "text": json.dumps(
+                            {"summary": "Halted cleanly for operator takeover.", "actions": []}
+                        ),
+                        "input_tokens": 10,
+                        "output_tokens": 8,
+                    }
+
+                llm_holder[0] = gate_llm
+                gate_res = client.post(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Continue in browser"},
+                )
+                self.assertEqual(gate_res.status_code, 200, gate_res.text)
+                gate_actions = gate_res.json()["result"]["actions"]
+                self.assertEqual(gate_actions[0]["status"], "halted_takeover_required")
+                self.assertEqual(gate_actions[0]["gate_type"], "captcha_gate")
+                # Takeover halt must NOT suggest saving a recurring routine
+                latest_msgs = client.get(f"/api/bots/{slug}/messages", headers=self._sso_headers()).json()
+                latest_bot_meta = [m for m in latest_msgs if m.get("sender") == "bot"][-1]["metadata"]
+                self.assertNotIn("habit_proposal", latest_bot_meta)
+
+    def test_scroll_screenshot_visual_progress_vs_stuck_loop_guard_and_failed_run_presentation(self) -> None:
+        # 1. Verify MCP agent version & scroll cursor targeting + repaint delay
+        self.assertEqual(DESKTOP_AGENT_VERSION, "8")
+        self.assertIn("getactivewindow", _DESKTOP_AGENT_SCRIPT)
+        self.assertIn("_x11_screen_size(display)", _DESKTOP_AGENT_SCRIPT)
+        self.assertIn("time.sleep(0.25)", _DESKTOP_AGENT_SCRIPT)
+
+        # 2. Verify _turn_action_fingerprint distinguishes screen_hash & scroll_y changes
+        scroll_call = [{"type": "desktop_scroll", "direction": "down"}, {"type": "desktop_screenshot"}]
+        c1, o1 = _turn_action_fingerprint(
+            scroll_call,
+            [
+                {"type": "desktop_scroll", "status": "ok"},
+                {"type": "desktop_screenshot", "status": "ok", "screen_hash": "1111aaaa"},
+            ],
+        )
+        c2, o2 = _turn_action_fingerprint(
+            scroll_call,
+            [
+                {"type": "desktop_scroll", "status": "ok"},
+                {"type": "desktop_screenshot", "status": "ok", "screen_hash": "2222bbbb"},
+            ],
+        )
+        c3, o3 = _turn_action_fingerprint(
+            scroll_call,
+            [
+                {"type": "desktop_scroll", "status": "ok"},
+                {"type": "desktop_screenshot", "status": "ok", "screen_hash": "1111aaaa"},
+            ],
+        )
+        self.assertEqual(c1, c2)
+        self.assertNotEqual(o1, o2)
+        self.assertEqual(o1, o3)
+
+        # 3. End-to-end bot test: changing screenshots never trigger false loop guard; identical screens do & suppress habit_proposal
+        class _ScriptedAgentTransport:
+            def __init__(self) -> None:
+                self.shot_idx = 0
+                self.identical_mode = False
+                self.exec_fail_mode = False
+
+            async def health(self, bot_slug: str, endpoint: str, *, timeout: float = 5.0) -> dict[str, Any]:
+                del bot_slug, endpoint, timeout
+                return {"status": "ok", "agent_version": DESKTOP_AGENT_VERSION}
+
+            async def inspect(self, bot_slug: str, endpoint: str, *, timeout: float = 10.0) -> dict[str, Any]:
+                del bot_slug, endpoint, timeout
+                return {"status": "ok", "agent_version": DESKTOP_AGENT_VERSION, "display": ":1", "windows": []}
+
+            async def screenshot(
+                self,
+                bot_slug: str,
+                endpoint: str,
+                *,
+                max_width: int = 1280,
+                timeout: float = 20.0,
+            ) -> tuple[bytes, dict[str, Any]]:
+                del bot_slug, endpoint, max_width, timeout
+                self.shot_idx += 1
+                fill_val = 99 if self.identical_mode else self.shot_idx
+                png = _DEFAULT_TEST_PNG(fill_val)
+                return png, {
+                    "width": 4,
+                    "height": 3,
+                    "display": ":1",
+                    "mime_type": "image/png",
+                }
+
+            async def execute_action(
+                self,
+                bot_slug: str,
+                endpoint: str,
+                action: str,
+                params: dict[str, Any] | None = None,
+                *,
+                timeout: float = 30.0,
+            ) -> dict[str, Any]:
+                del bot_slug, endpoint, params, timeout
+                if action == "scroll":
+                    return {"status": "ok", "action": "scroll", "direction": "down", "clicks": 5}
+                if action == "screenshot":
+                    self.shot_idx += 1
+                    fill_val = 99 if self.identical_mode else self.shot_idx
+                    png = _DEFAULT_TEST_PNG(fill_val)
+                    import base64 as _b64
+                    return {
+                        "status": "ok",
+                        "action": "screenshot",
+                        "width": 4,
+                        "height": 3,
+                        "display": ":1",
+                        "mime_type": "image/png",
+                        "image_base64": _b64.b64encode(png).decode("ascii"),
+                    }
+                if action == "exec":
+                    if self.exec_fail_mode:
+                        return {
+                            "status": "command_failed",
+                            "action": "exec",
+                            "exit_code": 1,
+                            "failed_command": "python3 -c '\nimport nonexistent_pkg\nprint(1)\n'",
+                            "stdout": "",
+                            "stderr": "ModuleNotFoundError: No module named 'nonexistent_pkg'",
+                        }
+                    return {"status": "ok", "action": "exec", "exit_code": 0, "stdout": "ok", "stderr": ""}
+                return {"status": "ok", "action": action}
+
+        def _DEFAULT_TEST_PNG(byte_seed: int) -> bytes:
+            ns: dict[str, object] = {}
+            exec(compile(_DESKTOP_AGENT_SCRIPT.split("class _Handler", 1)[0], "<png>", "exec"), ns)
+            encode_fn = ns["_encode_png_rgb"]
+            return encode_fn(4, 3, bytes([byte_seed % 250, 40, 80] * 12))
+
+        scripted_agent = _ScriptedAgentTransport()
+        turns: list[int] = [0]
+        loop_guard_seen = [False]
+
+        async def scroll_llm(req: LLMRequest) -> dict[str, Any]:
+            turns[0] += 1
+            if '"type": "loop_guard"' in req.user_prompt:
+                loop_guard_seen[0] = True
+                return {
+                    "text": json.dumps({"summary": "", "actions": []}),
+                    "input_tokens": 10,
+                    "output_tokens": 6,
+                }
+            if scripted_agent.exec_fail_mode:
+                if turns[0] == 1:
+                    return {
+                        "text": json.dumps(
+                            {
+                                "summary": "Running diagnostic script.",
+                                "actions": [{"type": "desktop_exec", "command": "python3 -c '\nimport nonexistent_pkg\nprint(1)\n'"}],
+                            }
+                        ),
+                        "input_tokens": 12,
+                        "output_tokens": 10,
+                    }
+                return {
+                    "text": json.dumps({"summary": "Missing python module inside desktop.", "actions": []}),
+                    "input_tokens": 12,
+                    "output_tokens": 10,
+                }
+            if turns[0] <= 3:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": f"Scrolling pass {turns[0]} and checking screen.",
+                            "actions": [
+                                {"type": "desktop_scroll", "direction": "down", "clicks": 5},
+                                {"type": "desktop_screenshot"},
+                            ],
+                        }
+                    ),
+                    "input_tokens": 12,
+                    "output_tokens": 10,
+                }
+            return {
+                "text": json.dumps({"summary": "Finished scrolling 3 distinct screens cleanly.", "actions": []}),
+                "input_tokens": 12,
+                "output_tokens": 10,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(
+                tmp,
+                llm_transport=scroll_llm,
+                docker_driver=InMemoryDockerDriver(),
+                desktop_agent_transport=scripted_agent,
+            )
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Scroll Guard Bot",
+                        "role": "Verify visual scroll progress and failure presentation",
+                        "runtime": "desktop",
+                        "outbound_rbac": "internal",
+                        "model": "google:gemini-3.8-flash",
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                slug = created.json()["slug"]
+
+                # Case A: 3 consecutive scroll+screenshot turns with changing screen PNGs must succeed without loop guard
+                turns[0] = 0
+                scripted_agent.identical_mode = False
+                ok_res = client.post(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Scroll through 3 screens"},
+                )
+                self.assertEqual(ok_res.status_code, 200, ok_res.text)
+                self.assertIn("Finished scrolling 3 distinct screens", ok_res.json()["result"]["summary"])
+
+                # Case B: Identical screenshots on Turn 1 & Turn 2 still trigger genuine loop guard AND suppress habit_proposal
+                turns[0] = 0
+                scripted_agent.identical_mode = True
+                stuck_res = client.post(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Keep scrolling forever"},
+                )
+                self.assertEqual(stuck_res.status_code, 200, stuck_res.text)
+                self.assertTrue(loop_guard_seen[0])
+                self.assertIn("Repeated identical tool call", stuck_res.json()["result"]["summary"])
+                msgs_b = client.get(f"/api/bots/{slug}/messages", headers=self._sso_headers()).json()
+                bot_meta_b = [m for m in msgs_b if m.get("sender") == "bot"][-1]["metadata"]
+                self.assertNotIn("habit_proposal", bot_meta_b)
+
+                # Case C: Multi-line desktop_exec failure formats safely in fenced block & suppresses habit_proposal
+                turns[0] = 0
+                scripted_agent.exec_fail_mode = True
+                fail_res = client.post(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Run broken inline python script"},
+                )
+                self.assertEqual(fail_res.status_code, 200, fail_res.text)
+                fail_summary = fail_res.json()["result"]["summary"]
+                self.assertIn("```sh\n", fail_summary)
+                self.assertNotIn("`: `python3", fail_summary)
+                msgs_c = client.get(f"/api/bots/{slug}/messages", headers=self._sso_headers()).json()
+                bot_meta_c = [m for m in msgs_c if m.get("sender") == "bot"][-1]["metadata"]
+                self.assertNotIn("habit_proposal", bot_meta_c)
+
+    def test_skill_driven_ask_operator_pause_and_resume_on_same_browser_tab(self) -> None:
+        observed_requests: list[LLMRequest] = []
+        clicked_actions: list[tuple[str, dict[str, Any]]] = []
+        phase = [1]
+
+        async def fake_llm(req: LLMRequest) -> dict[str, Any]:
+            observed_requests.append(req)
+            if phase[0] == 1:
+                if len(observed_requests) == 1:
+                    return {
+                        "text": json.dumps(
+                            {
+                                "summary": "Opening webpage in Chromium.",
+                                "actions": [
+                                    {"type": "desktop_browse", "url": "https://notice.example.org/portal"}
+                                ],
+                            }
+                        ),
+                        "input_tokens": 18,
+                        "output_tokens": 12,
+                    }
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "This site asks you to choose privacy/confirmation preferences before continuing. How would you like me to proceed?",
+                            "actions": [
+                                {
+                                    "type": "ask_operator",
+                                    "question": "This page shows a confirmation dialog. How should I proceed?",
+                                    "context": "Visible buttons: Accept all, Reject all",
+                                    "options": [
+                                        {
+                                            "label": "Reject all",
+                                            "reply": "Click 'Reject all' and continue",
+                                            "tone": "primary",
+                                        },
+                                        {
+                                            "label": "Accept all",
+                                            "reply": "Click 'Accept all' and continue",
+                                            "tone": "secondary",
+                                        },
+                                        {
+                                            "label": "Cancel",
+                                            "reply": "Cancel and stop",
+                                            "tone": "danger",
+                                        },
+                                    ],
+                                    "allow_custom_reply": True,
+                                }
+                            ],
+                        }
+                    ),
+                    "input_tokens": 22,
+                    "output_tokens": 18,
+                }
+
+            # Phase 2: resumed after operator clicks an option
+            if len(observed_requests) == 3:
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "Clicking Reject all as instructed.",
+                            "actions": [
+                                {"type": "desktop_browser_action", "action": "click", "text": "Reject all"}
+                            ],
+                        }
+                    ),
+                    "input_tokens": 20,
+                    "output_tokens": 12,
+                }
+            return {
+                "text": json.dumps(
+                    {
+                        "summary": "Confirmed your choice on the active tab and loaded the target content.",
+                        "actions": [],
+                    }
+                ),
+                "input_tokens": 18,
+                "output_tokens": 12,
+            }
+
+        async def fake_cdp_transport(
+            bot_slug: str,
+            cdp_endpoint: str,
+            url: str,
+            selector: str | None,
+        ) -> CDPPageSnapshot:
+            del bot_slug, cdp_endpoint, url, selector
+            return CDPPageSnapshot(
+                url="https://notice.example.org/consent",
+                status_code=200,
+                title="Confirmation Dialog",
+                text="Please choose whether to accept or reject optional items before continuing.",
+                scroll_y=0,
+                scroll_height=900,
+                viewport_height=800,
+                interactive_elements=[
+                    {"index": 1, "tag": "button", "text": "Reject all", "selector": "[data-argo-el=\"1\"]", "in_viewport": True, "x": 420, "y": 500},
+                    {"index": 2, "tag": "button", "text": "Accept all", "selector": "[data-argo-el=\"2\"]", "in_viewport": True, "x": 640, "y": 500},
+                ],
+                target_id="tab-confirm-1",
+            )
+
+        async def fake_cdp_action_transport(
+            bot_slug: str,
+            cdp_endpoint: str,
+            action: str,
+            params: dict[str, Any],
+        ) -> CDPPageSnapshot:
+            del bot_slug, cdp_endpoint
+            clicked_actions.append((action, dict(params)))
+            return CDPPageSnapshot(
+                url="https://notice.example.org/portal",
+                status_code=200,
+                title="Main Portal",
+                text="Loaded main portal content cleanly after confirmation.",
+                scroll_y=0,
+                scroll_height=1200,
+                viewport_height=800,
+                interactive_elements=[],
+                target_id="tab-confirm-1",
+                matched_element={"tag": "button", "text": str(params.get("text") or ""), "x": 420, "y": 500},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(
+                tmp,
+                llm_transport=fake_llm,
+                docker_driver=InMemoryDockerDriver(),
+                cdp_transport=fake_cdp_transport,
+                cdp_action_transport=fake_cdp_action_transport,
+            )
+            with TestClient(app) as client:
+                created_bot = client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Skill Decision Bot",
+                        "role": "Browse webpages strictly following operator confirmation skills",
+                        "runtime": "desktop",
+                        "outbound_rbac": "internal",
+                        "model": "google:gemini-3.8-flash",
+                    },
+                )
+                self.assertEqual(created_bot.status_code, 201, created_bot.text)
+                slug = created_bot.json()["slug"]
+
+                long_marker = "ASK_OPERATOR_POLICY_MARKER_FULL_LENGTH"
+                global_instructions = (
+                    "Policy rule for all browser sessions: inspect interactive dialogs carefully. "
+                    + ("Follow strict verification steps. " * 14)
+                    + long_marker
+                )
+                self.assertGreater(len(global_instructions), 450)
+                skill_res = client.post(
+                    "/api/skills",
+                    headers=self._sso_headers(),
+                    json={
+                        "name": "Ask Before Confirmations",
+                        "description": "Always ask the operator before clicking confirmation or consent buttons.",
+                        "instructions": global_instructions,
+                        "scope_slug": "*",
+                    },
+                )
+                self.assertEqual(skill_res.status_code, 201, skill_res.text)
+
+                with patch("argo_core.security.ssrf._default_dns_resolve", return_value=["93.184.216.34"]):
+                    pause_res = client.post(
+                        f"/api/bots/{slug}/messages",
+                        headers=self._sso_headers(),
+                        json={"text": "Open https://notice.example.org/portal"},
+                    )
+                self.assertEqual(pause_res.status_code, 200, pause_res.text)
+                self.assertEqual(len(observed_requests), 2)
+                self.assertEqual(clicked_actions, [])
+
+                sys_prompt = observed_requests[0].system_prompt
+                self.assertNotIn("dismiss cookie dialogs", sys_prompt)
+                self.assertIn("always following your active Skills and Strict Boundaries", sys_prompt)
+                self.assertIn("ask_operator", sys_prompt)
+                self.assertIn(long_marker, observed_requests[0].user_prompt)
+
+                msgs_after_pause = client.get(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                ).json()
+                bot_msg_1 = [m for m in msgs_after_pause if m.get("sender") == "bot"][-1]
+                meta_1 = bot_msg_1["metadata"]
+                self.assertNotIn("habit_proposal", meta_1)
+                self.assertIn("operator_question", meta_1)
+                oq = meta_1["operator_question"]
+                self.assertEqual(oq["options"][0]["label"], "Reject all")
+                self.assertEqual(oq["options"][0]["tone"], "primary")
+                self.assertEqual(oq["options"][2]["tone"], "danger")
+                self.assertTrue(oq["allow_custom_reply"])
+                for saved_act in meta_1["actions"]:
+                    self.assertNotIn("operator_question", saved_act)
+
+                # Step 2: Operator clicks an option -> resumes on active tab
+                phase[0] = 2
+                resume_res = client.post(
+                    f"/api/bots/{slug}/messages",
+                    headers=self._sso_headers(),
+                    json={"text": oq["options"][0]["reply"]},
+                )
+                self.assertEqual(resume_res.status_code, 200, resume_res.text)
+                self.assertEqual(clicked_actions, [("click", {"text": "Reject all"})])
+                self.assertIn("Confirmed your choice on the active tab", resume_res.json()["result"]["summary"])
 
 
 if __name__ == "__main__":

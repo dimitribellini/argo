@@ -24,7 +24,11 @@ if str(BACKEND_DIR) not in sys.path:
 from argo_core.config import ArgoSettings  # noqa: E402
 from argo_core.llm.router import LLMRequest, LLMRouter  # noqa: E402
 from argo_core.main import create_app  # noqa: E402
-from argo_core.runner.bot_runner import _IncrementalSummaryExtractor  # noqa: E402
+from argo_core.runner.bot_runner import (  # noqa: E402
+    _IncrementalSummaryExtractor,
+    _compose_envelope_reply_text,
+    _extract_json_envelope_with_prose,
+)
 from argo_core.security.ssrf import PublicHttpResponse  # noqa: E402
 from argo_core.watchdog.resource_guard import HostResourceGuard  # noqa: E402
 
@@ -671,6 +675,311 @@ class TestStreamingNonBlockingAndRoomPicker(unittest.TestCase):
                 self.assertTrue(res_cancel.cancelled)
                 self.assertEqual(res_cancel.run_record["status"], "cancelled")
                 self.assertLess(elapsed_s, 0.5)
+
+    def test_incremental_extractor_actions_and_live_building_page_chip(self) -> None:
+        raw_envelope = (
+            '{"summary": "Prepared your table view.", '
+            '"actions": [{"type": "upsert_page", "slug": "sales-view", "title": "Sales View", '
+            '"render_mode": "sandboxed_html", "content_payload": "<!DOCTYPE html><body>Hi</body></html>"}]}'
+        )
+        extractor = _IncrementalSummaryExtractor()
+        emitted: list[str] = []
+        detected: list[str] = []
+        for idx in range(0, len(raw_envelope), 4):
+            out = extractor.feed(raw_envelope[idx : idx + 4])
+            if out:
+                emitted.append(out)
+            detected.extend(extractor.drain_detected_actions())
+        tail = extractor.finish()
+        if tail:
+            emitted.append(tail)
+        detected.extend(extractor.drain_detected_actions())
+
+        self.assertEqual("".join(emitted), "Prepared your table view.")
+        self.assertEqual(detected, ["__actions__", "upsert_page"])
+
+        async def streaming_page_llm(_req: LLMRequest) -> dict[str, Any]:
+            chunks = [raw_envelope[i : i + 12] for i in range(0, len(raw_envelope), 12)]
+            return {
+                "chunks": chunks,
+                "chunk_delay_s": 0.005,
+                "input_tokens": 30,
+                "output_tokens": 25,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(tmp, llm_transport=streaming_page_llm)
+            with TestClient(app) as client:
+                client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={"slug": "page-bot", "name": "Page Bot", "role": "Build pages", "outbound_rbac": "internal"},
+                )
+                captured_stream: list[dict[str, Any]] = []
+                orig_emit = app.state.bus.emit_ephemeral
+
+                async def spy_emit(event_name: str, payload: dict[str, Any]) -> None:
+                    if event_name == "turn_stream":
+                        captured_stream.append(dict(payload))
+                    await orig_emit(event_name, payload)
+
+                app.state.bus.emit_ephemeral = spy_emit
+                resp = client.post(
+                    "/api/bots/page-bot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Build a clean table page"},
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                stream_starts = [
+                    e for e in captured_stream
+                    if e.get("type") == "chip_started" and e.get("action_type") == "stream_page"
+                ]
+                stream_finishes = [
+                    e for e in captured_stream
+                    if e.get("type") == "chip_finished" and e.get("action_type") == "stream_page"
+                ]
+                self.assertEqual(len(stream_starts), 1)
+                self.assertEqual(stream_starts[0]["label"], "Building Page...")
+                self.assertEqual(len(stream_finishes), 1)
+                self.assertEqual(stream_finishes[0]["status"], "done")
+                saved_chips = resp.json()["messages"][-1]["metadata"].get("chips") or []
+                self.assertFalse(any(c.get("action_type") == "stream_page" for c in saved_chips))
+
+    def test_envelope_prose_recovery_outside_json_extra_keys_and_live_streaming(self) -> None:
+        # 1. Post-JSON Markdown with code blocks containing `{}` must be preserved cleanly
+        post_json_raw = (
+            '```json\n{"summary": "Here are the full details.", "actions": []}\n```\n\n'
+            "### Root Cause\n"
+            "Run:\n```sh\nstatus_cmd | awk '{print $1}'\n```\n"
+        )
+        env1, out1 = _extract_json_envelope_with_prose(post_json_raw)
+        self.assertIsNotNone(env1)
+        self.assertEqual(env1["actions"], [])
+        self.assertIn("### Root Cause", out1)
+        self.assertIn("awk '{print $1}'", out1)
+        composed1 = _compose_envelope_reply_text(env1, post_json_raw, out1)
+        self.assertIn("Here are the full details.", composed1)
+        self.assertIn("### Root Cause", composed1)
+        self.assertIn("awk '{print $1}'", composed1)
+
+        # 2. Pre-JSON Markdown + fenced JSON envelope preserves prose cleanly
+        pre_json_raw = (
+            "Detailed diagnosis above.\n\n"
+            '```json\n{"summary": "Saved rule.", "actions": [{"type": "remember_rule", "rule_text": "Be concise"}]}\n```'
+        )
+        env2, out2 = _extract_json_envelope_with_prose(pre_json_raw)
+        self.assertIsNotNone(env2)
+        self.assertEqual(len(env2["actions"]), 1)
+        self.assertEqual(out2, "Detailed diagnosis above.")
+        composed2 = _compose_envelope_reply_text(env2, pre_json_raw, out2)
+        self.assertIn("Saved rule.", composed2)
+        self.assertIn("Detailed diagnosis above.", composed2)
+
+        # 3. Extra user-facing JSON keys render cleanly while internal CoT keys stay hidden
+        env3 = {
+            "summary": "Analysis completed.",
+            "root_cause": "NIC flap on subnet 192.0.2.0/24",
+            "solution": ["Check link state", "Replace faulty transceiver"],
+            "thought": "SECRET_INTERNAL_COT_DO_NOT_SHOW",
+            "actions": [],
+        }
+        composed3 = _compose_envelope_reply_text(env3, json.dumps(env3), "")
+        self.assertIn("Analysis completed.", composed3)
+        self.assertIn("### Root Cause\nNIC flap on subnet 192.0.2.0/24", composed3)
+        self.assertIn("### Solution\n- Check link state\n- Replace faulty transceiver", composed3)
+        self.assertNotIn("SECRET_INTERNAL_COT_DO_NOT_SHOW", composed3)
+
+        # 4. Plain Markdown containing an illustrative JSON example (without actions/emit_event) stays untouched
+        plain_with_sample = (
+            "Here is the config format to use:\n\n"
+            '```json\n{"summary": "example"}\n```'
+        )
+        env4, _ = _extract_json_envelope_with_prose(plain_with_sample)
+        self.assertIsNone(env4)
+        self.assertEqual(_compose_envelope_reply_text(env4, plain_with_sample, ""), plain_with_sample)
+
+        # 5. Live streaming _IncrementalSummaryExtractor emits post-JSON Markdown without leaking fence/JSON
+        stream_payload = (
+            '```json\n{"summary": "Intro.", "actions": []}\n```\n\n'
+            "### Solution\n1. Fix it cleanly\n```sh\necho ok | awk '{print $1}'\n```"
+        )
+        extractor = _IncrementalSummaryExtractor()
+        chunks: list[str] = []
+        for idx in range(0, len(stream_payload), 4):
+            piece = extractor.feed(stream_payload[idx : idx + 4])
+            if piece:
+                chunks.append(piece)
+        tail = extractor.finish()
+        if tail:
+            chunks.append(tail)
+        streamed_text = "".join(chunks)
+        self.assertEqual(
+            streamed_text,
+            "Intro.\n\n### Solution\n1. Fix it cleanly\n```sh\necho ok | awk '{print $1}'\n```",
+        )
+        self.assertNotIn('"actions"', streamed_text)
+
+        # 6. End-to-end bot chat message preserves extra `details` after discovery turn
+        turn_count = [0]
+
+        async def troubleshooting_llm(req: LLMRequest) -> dict[str, Any]:
+            turn_count[0] += 1
+            if turn_count[0] == 1:
+                self.assertIn("NEVER write a 1–2 sentence teaser", req.system_prompt)
+                return {
+                    "text": json.dumps(
+                        {
+                            "summary": "",
+                            "actions": [{"type": "data_describe"}],
+                        }
+                    ),
+                    "input_tokens": 15,
+                    "output_tokens": 10,
+                }
+            return {
+                "text": json.dumps(
+                    {
+                        "summary": "Here are the details.",
+                        "details": "### Root Cause\nFlapping NIC\n\n### Solution\n1. Inspect dmesg",
+                        "actions": [],
+                    }
+                ),
+                "input_tokens": 20,
+                "output_tokens": 24,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(tmp, llm_transport=troubleshooting_llm)
+            with TestClient(app) as client:
+                client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "slug": "diag-bot",
+                        "name": "Diag Bot",
+                        "role": "Troubleshoot logs and return remediation steps",
+                        "outbound_rbac": "internal",
+                    },
+                )
+                post_res = client.post(
+                    "/api/bots/diag-bot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Verify the logs and provide a solution"},
+                )
+                self.assertEqual(post_res.status_code, 200, post_res.text)
+                thread = client.get("/api/bots/diag-bot/messages", headers=self._sso_headers()).json()
+                bot_reply = [m for m in thread if m.get("sender") == "bot"][-1]
+                self.assertIn("### Root Cause", bot_reply["text"])
+                self.assertIn("Flapping NIC", bot_reply["text"])
+                self.assertIn("### Solution", bot_reply["text"])
+                self.assertIn("1. Inspect dmesg", bot_reply["text"])
+
+    def test_malformed_json_action_envelope_retry_fallback_and_plain_text_url_fetch(self) -> None:
+        from argo_core.tools.public_web import fetch_public_webpage
+
+        # 1. Self-correction retry recovers cleanly when turn 1 emits broken JSON fence
+        turn_calls: list[list[dict[str, Any]]] = []
+
+        async def retry_llm(req: LLMRequest) -> dict[str, Any]:
+            env = json.loads(req.user_prompt)
+            obs = list(env.get("tool_observations") or [])
+            turn_calls.append(obs)
+            if not obs:
+                return {
+                    "text": '```json\n{"summary": "", "actions": [{"type": "desktop_exec", "commands": ["python3 -c \'\nimport broken\n',
+                    "input_tokens": 12,
+                    "output_tokens": 20,
+                }
+            return {
+                "text": json.dumps({"summary": "Recovered clean answer after retrying.", "actions": []}),
+                "input_tokens": 18,
+                "output_tokens": 12,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(tmp, llm_transport=retry_llm)
+            with TestClient(app) as client:
+                client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "slug": "recover-bot",
+                        "name": "Recover Bot",
+                        "role": "Test malformed envelope recovery",
+                        "outbound_rbac": "internal",
+                    },
+                )
+                r1 = client.post(
+                    "/api/bots/recover-bot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Fetch setup script"},
+                ).json()["result"]
+                self.assertEqual(r1["summary"], "Recovered clean answer after retrying.")
+                self.assertGreaterEqual(len(turn_calls), 2)
+                self.assertEqual(turn_calls[1][-1].get("type"), "envelope_parse_error")
+
+        # 2. Repeated broken JSON envelopes NEVER leak raw JSON or emit habit_proposal
+        async def always_broken_llm(req: LLMRequest) -> dict[str, Any]:
+            return {
+                "text": '```json\n{"summary": "", "actions": [{"type": "desktop_exec", "commands": ["python3 -c \'\nunterminated',
+                "input_tokens": 10,
+                "output_tokens": 15,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._build_env(tmp, llm_transport=always_broken_llm)
+            with TestClient(app) as client:
+                client.post(
+                    "/api/bots",
+                    headers=self._sso_headers(),
+                    json={
+                        "slug": "broken-bot",
+                        "name": "Broken Bot",
+                        "role": "Test malformed envelope fallback",
+                        "outbound_rbac": "internal",
+                    },
+                )
+                r2 = client.post(
+                    "/api/bots/broken-bot/messages",
+                    headers=self._sso_headers(),
+                    json={"text": "Run broken output"},
+                ).json()["result"]
+                self.assertNotIn('"actions"', r2["summary"])
+                self.assertNotIn('"summary"', r2["summary"])
+                self.assertIn("formatting error", r2["summary"])
+                self.assertNotIn("habit_proposal", r2.get("metadata") or {})
+
+        # 3. fetch_public_webpage returns text/plain raw shell scripts verbatim without HTML mangling
+        raw_script = (
+            "#!/usr/bin/env bash\n"
+            "cat <<'EOF' > /etc/modprobe.d/r8152.conf\n"
+            "options r8152 power_save=0\n"
+            "EOF\n"
+            "modprobe -r r8152 2>/dev/null || true\n"
+        )
+
+        class _PlainScriptFetcher:
+            async def fetch(
+                self, url: str, headers: dict[str, str] | None = None, max_bytes: int = 10_485_760
+            ) -> PublicHttpResponse:
+                del headers, max_bytes
+                return PublicHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "text/plain; charset=utf-8"},
+                    body=raw_script,
+                )
+
+        fetched = asyncio.run(
+            fetch_public_webpage(
+                "https://raw.githubusercontent.com/org/repo/main/setup.sh",
+                fetcher=_PlainScriptFetcher(),
+            )
+        )
+        self.assertEqual(fetched["title"], "setup.sh")
+        self.assertEqual(fetched["markdown"], raw_script)
+        self.assertIn("2>/dev/null", fetched["markdown"])
+        self.assertIn("cat <<'EOF' > /etc/modprobe.d/r8152.conf", fetched["markdown"])
 
 
 if __name__ == "__main__":

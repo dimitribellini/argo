@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
+import http.client
 import ipaddress
+import json
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,6 +64,7 @@ class PublicHttpResponse:
     status_code: int
     headers: dict[str, str]
     body: str
+    raw_bytes: bytes = b""
 
 
 class PublicHttpFetcher(Protocol):
@@ -212,11 +218,218 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return fp
 
 
+_PINNED_FETCH_IPS: contextvars.ContextVar[tuple[str, tuple[str, ...]] | None] = (
+    contextvars.ContextVar("_PINNED_FETCH_IPS", default=None)
+)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection connecting strictly to pre-validated resolved IP(s)."""
+
+    def __init__(
+        self,
+        pinned_ips: tuple[str, ...],
+        host: str,
+        port: int | None = None,
+        timeout: float = 15.0,
+    ) -> None:
+        self._pinned_ips = pinned_ips
+        super().__init__(host, port=port, timeout=timeout)
+
+    def connect(self) -> None:
+        last_exc: Exception | None = None
+        for ip_str in self._pinned_ips:
+            try:
+                self.sock = socket.create_connection(
+                    (ip_str, self.port), self.timeout, self.source_address
+                )
+                return
+            except OSError as exc:
+                last_exc = exc
+        raise last_exc or OSError(f"Failed to connect to pinned IPs for {self.host}")
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection connecting strictly to pre-validated IP(s) with hostname TLS SNI."""
+
+    def __init__(
+        self,
+        pinned_ips: tuple[str, ...],
+        host: str,
+        port: int | None = None,
+        timeout: float = 15.0,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        self._pinned_ips = pinned_ips
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=context or ssl.create_default_context(),
+        )
+
+    def connect(self) -> None:
+        last_exc: Exception | None = None
+        for ip_str in self._pinned_ips:
+            raw_sock: socket.socket | None = None
+            try:
+                raw_sock = socket.create_connection(
+                    (ip_str, self.port), self.timeout, self.source_address
+                )
+                self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+                return
+            except Exception as exc:
+                if raw_sock is not None:
+                    with contextlib.suppress(Exception):
+                        raw_sock.close()
+                last_exc = exc
+        raise last_exc or OSError(f"Failed to connect to pinned TLS IPs for {self.host}")
+
+
 class SafePublicHttpFetcher:
     """Async public HTTP fetcher validating every DNS resolution and redirect against SSRF."""
 
     def __init__(self, *, resolver: Callable[[str], list[str]] | None = None) -> None:
         self._resolver = resolver
+
+    async def _single_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        resolved_ips: tuple[str, ...],
+        headers: dict[str, str],
+        body_bytes: bytes | None = None,
+        timeout_seconds: float,
+        max_bytes: int,
+    ) -> PublicHttpResponse:
+        if not resolved_ips:
+            raise SSRFBlockedError(f"No validated public IPs available for '{url}'.")
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname or ""
+        scheme = parsed.scheme.lower()
+        port = parsed.port or (443 if scheme == "https" else 80)
+
+        try:
+            import aiohttp  # type: ignore[import-not-found]
+        except ImportError:
+            aiohttp = None
+
+        if aiohttp is not None:
+            class _PinnedAiohttpResolver(aiohttp.abc.AbstractResolver):  # type: ignore[name-defined]
+                def __init__(self, expected_host: str, ips: tuple[str, ...]) -> None:
+                    self._expected_host = expected_host.strip().lower()
+                    self._ips = ips
+
+                async def resolve(
+                    self, host: str, port: int = 0, family: int = socket.AF_UNSPEC
+                ) -> list[dict[str, Any]]:
+                    if host.strip().lower() != self._expected_host:
+                        raise SSRFBlockedError(
+                            f"Unexpected DNS resolution for '{host}' during pinned request."
+                        )
+                    entries: list[dict[str, Any]] = []
+                    for ip_str in self._ips:
+                        ip_obj = ipaddress.ip_address(ip_str)
+                        ip_family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
+                        if family not in (0, socket.AF_UNSPEC) and ip_family != family:
+                            continue
+                        entries.append(
+                            {
+                                "hostname": host,
+                                "host": ip_str,
+                                "port": port,
+                                "family": ip_family,
+                                "proto": 0,
+                                "flags": socket.AI_NUMERICHOST,
+                            }
+                        )
+                    if not entries and family not in (0, socket.AF_UNSPEC):
+                        return await self.resolve(host, port=port, family=socket.AF_UNSPEC)
+                    if not entries:
+                        raise SSRFBlockedError(f"No pinned public IP available for '{host}'.")
+                    return entries
+
+                async def close(self) -> None:
+                    return None
+
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            connector = aiohttp.TCPConnector(resolver=_PinnedAiohttpResolver(hostname, resolved_ips))
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                    async with session.request(
+                        method,
+                        url,
+                        data=body_bytes,
+                        headers=headers,
+                        allow_redirects=False,
+                    ) as resp:
+                        bounded_max = max(0, int(max_bytes))
+                        buf = bytearray()
+                        limit = bounded_max + 1
+                        while len(buf) < limit:
+                            chunk = await resp.content.read(min(65_536, limit - len(buf)))
+                            if not chunk:
+                                break
+                            buf.extend(chunk)
+                        raw = bytes(buf[:bounded_max])
+                        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                        return PublicHttpResponse(
+                            url=str(resp.url),
+                            status_code=int(resp.status),
+                            headers=resp_headers,
+                            body=raw.decode("utf-8", errors="replace"),
+                            raw_bytes=raw,
+                        )
+            except SSRFBlockedError:
+                raise
+            except Exception as exc:
+                raise PublicFetchError(
+                    url=url,
+                    status_code=None,
+                    message=f"HTTP request failed for '{url}': {exc}",
+                ) from exc
+
+        def _sync_pinned() -> PublicHttpResponse:
+            target = parsed.path or "/"
+            if parsed.query:
+                target = f"{target}?{parsed.query}"
+            conn: http.client.HTTPConnection
+            if scheme == "https":
+                conn = _PinnedHTTPSConnection(
+                    resolved_ips, hostname, port=port, timeout=timeout_seconds
+                )
+            else:
+                conn = _PinnedHTTPConnection(
+                    resolved_ips, hostname, port=port, timeout=timeout_seconds
+                )
+            try:
+                conn.request(method, target, body=body_bytes, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raw = raw[:max_bytes]
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                return PublicHttpResponse(
+                    url=url,
+                    status_code=int(resp.status),
+                    headers=resp_headers,
+                    body=raw.decode("utf-8", errors="replace"),
+                    raw_bytes=raw,
+                )
+            except SSRFBlockedError:
+                raise
+            except Exception as exc:
+                raise PublicFetchError(
+                    url=url,
+                    status_code=None,
+                    message=f"HTTP request failed for '{url}': {exc}",
+                ) from exc
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+        return await asyncio.to_thread(_sync_pinned)
 
     async def _single_get(
         self,
@@ -226,66 +439,61 @@ class SafePublicHttpFetcher:
         timeout_seconds: float,
         max_bytes: int,
     ) -> PublicHttpResponse:
-        try:
-            import aiohttp  # type: ignore[import-not-found]
-        except ImportError:
-            aiohttp = None
+        pinned = _PINNED_FETCH_IPS.get()
+        if pinned is not None and pinned[0] == url and pinned[1]:
+            resolved_ips = pinned[1]
+        else:
+            url, raw_ips = validate_public_url(url, resolver=self._resolver)
+            resolved_ips = tuple(raw_ips)
+        return await self._single_request(
+            "GET",
+            url,
+            resolved_ips=resolved_ips,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
 
-        if aiohttp is not None:
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=False,
-                ) as resp:
-                    raw = await resp.content.read(max_bytes + 1)
-                    if len(raw) > max_bytes:
-                        raw = raw[:max_bytes]
-                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                    return PublicHttpResponse(
-                        url=str(resp.url),
-                        status_code=int(resp.status),
-                        headers=resp_headers,
-                        body=raw.decode("utf-8", errors="replace"),
-                    )
-
-        def _sync_get() -> PublicHttpResponse:
-            opener = urllib.request.build_opener(_NoRedirectHandler())
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            try:
-                with opener.open(req, timeout=timeout_seconds) as resp:
-                    raw = resp.read(max_bytes + 1)
-                    if len(raw) > max_bytes:
-                        raw = raw[:max_bytes]
-                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                    return PublicHttpResponse(
-                        url=str(getattr(resp, "url", url) or url),
-                        status_code=int(resp.getcode() or 200),
-                        headers=resp_headers,
-                        body=raw.decode("utf-8", errors="replace"),
-                    )
-            except urllib.error.HTTPError as exc:
-                raw = exc.read(max_bytes) if hasattr(exc, "read") else b""
-                resp_headers = (
-                    {k.lower(): v for k, v in exc.headers.items()}
-                    if exc.headers is not None
-                    else {}
-                )
-                return PublicHttpResponse(
-                    url=url,
-                    status_code=int(exc.code),
-                    headers=resp_headers,
-                    body=raw.decode("utf-8", errors="replace"),
-                )
-            except Exception as exc:
-                raise PublicFetchError(
-                    url=url,
-                    status_code=None,
-                    message=f"HTTP request failed for '{url}': {exc}",
-                ) from exc
-
-        return await asyncio.to_thread(_sync_get)
+    async def post_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        timeout_seconds: float = 15.0,
+        max_bytes: int = 262_144,
+    ) -> PublicHttpResponse:
+        """POST JSON strictly to validated public IP(s) with redirects disabled."""
+        validated_url, raw_ips = validate_public_url(url, resolver=self._resolver)
+        req_headers = {
+            "User-Agent": "ArgoCore/0.1 (SSRF-Guarded Fetcher)",
+            "Content-Type": "application/json",
+            **(headers or {}),
+        }
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        response = await self._single_request(
+            "POST",
+            validated_url,
+            resolved_ips=tuple(raw_ips),
+            headers=req_headers,
+            body_bytes=body_bytes,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
+        if response.status_code in _REDIRECT_CODES:
+            location = response.headers.get("location", "").strip()
+            raise SSRFBlockedError(
+                f"Webhook redirect HTTP {response.status_code}"
+                + (f" to '{location}'" if location else "")
+                + f" blocked for '{validated_url}'."
+            )
+        if response.status_code >= 400:
+            raise PublicFetchError(
+                url=validated_url,
+                status_code=response.status_code,
+                message=f"Upstream HTTP {response.status_code} posting to {validated_url}",
+            )
+        return response
 
     async def fetch(
         self,
@@ -304,16 +512,20 @@ class SafePublicHttpFetcher:
         }
         current_url = url
         for _ in range(max_redirects + 1):
-            validated_url, _ = validate_public_url(
+            validated_url, resolved_ips = validate_public_url(
                 current_url,
                 resolver=self._resolver,
             )
-            response = await self._single_get(
-                validated_url,
-                headers=req_headers,
-                timeout_seconds=timeout_seconds,
-                max_bytes=max_bytes,
-            )
+            pin_tok = _PINNED_FETCH_IPS.set((validated_url, tuple(resolved_ips)))
+            try:
+                response = await self._single_get(
+                    validated_url,
+                    headers=req_headers,
+                    timeout_seconds=timeout_seconds,
+                    max_bytes=max_bytes,
+                )
+            finally:
+                _PINNED_FETCH_IPS.reset(pin_tok)
 
             if response.status_code in _REDIRECT_CODES:
                 location = response.headers.get("location", "").strip()

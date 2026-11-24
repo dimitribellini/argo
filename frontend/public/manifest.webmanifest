@@ -1,0 +1,22 @@
+{
+  "name": "Argo — Multi-Bot Automation Workspace",
+  "short_name": "Argo",
+  "description": "Self-hosted multi-bot automation workspace with Approvals, Living Pages, and isolated Virtual Desktops.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "minimal-ui",
+  "background_color": "#f8fafc",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

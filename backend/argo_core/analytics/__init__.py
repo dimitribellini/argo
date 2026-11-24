@@ -1,0 +1,41 @@
+"""In-process DuckDB 2.0 universal analytics, document parsing, and sandboxed query engine."""
+
+from argo_core.analytics.engine import (
+    ANALYTICS_DOCUMENT_EXTENSIONS,
+    ANALYTICS_DOCUMENT_MIMES,
+    MAX_ANALYTICS_UPLOAD_BYTES,
+    MAX_WORKSPACE_FILE_BYTES,
+    dataset_identifier,
+    execute_duckdb_query,
+    extract_document_summary_from_bytes,
+    ingest_file_to_analytics,
+    is_analytics_or_document_file,
+    is_duckdb_runtime_supported,
+    max_workspace_file_bytes_for_name,
+    profile_datasets,
+    read_dataset_rows,
+    render_pdf_pages_png,
+    validate_readonly_sandbox_sql,
+    verify_analytics_runtime,
+    write_rows_to_parquet,
+)
+
+__all__ = [
+    "ANALYTICS_DOCUMENT_EXTENSIONS",
+    "ANALYTICS_DOCUMENT_MIMES",
+    "MAX_ANALYTICS_UPLOAD_BYTES",
+    "MAX_WORKSPACE_FILE_BYTES",
+    "dataset_identifier",
+    "execute_duckdb_query",
+    "extract_document_summary_from_bytes",
+    "ingest_file_to_analytics",
+    "is_analytics_or_document_file",
+    "is_duckdb_runtime_supported",
+    "max_workspace_file_bytes_for_name",
+    "profile_datasets",
+    "read_dataset_rows",
+    "render_pdf_pages_png",
+    "validate_readonly_sandbox_sql",
+    "verify_analytics_runtime",
+    "write_rows_to_parquet",
+]

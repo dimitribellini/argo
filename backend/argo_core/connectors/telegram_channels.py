@@ -95,9 +95,15 @@ def _extract_lxml_text(node: Any) -> str:
 
 
 def _parse_with_lxml(html_text: str, channel_handle: str) -> list[dict[str, Any]]:
+    if not html_text or not html_text.strip():
+        return []
     from lxml import html as lxml_html  # type: ignore[import-not-found]
+    from lxml.etree import ParserError  # type: ignore[import-not-found]
 
-    doc = lxml_html.fromstring(html_text)
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except (ParserError, ValueError):
+        return []
     widgets = doc.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' tgme_widget_message ') and @data-post]")
     items: list[dict[str, Any]] = []
     for widget in widgets:

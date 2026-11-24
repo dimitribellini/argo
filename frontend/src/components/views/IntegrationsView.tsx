@@ -1,13 +1,15 @@
 import { useState, type FormEvent } from "react";
-import type { IntegrationAccount } from "../../types";
+import type { IntegrationAccount, SsoPrincipal } from "../../types";
+import { formatVisibilityLabel, visibilityBadgeClasses } from "../VisibilityPicker";
 
 interface IntegrationsViewProps {
+  principal?: SsoPrincipal | null;
   integrations: IntegrationAccount[];
   onOpenGoogleWizard: (reauthAccount?: IntegrationAccount) => void;
   onOpenTelegramWizard: () => void;
   onOpenLinkedInModal: () => void;
   onOpenWebhookModal: () => void;
-  onOpenNewIntegration: () => void;
+  onOpenNewIntegration: (defaultProvider?: IntegrationAccount["provider"]) => void;
   onAddPublicMonitor: (channelHandle: string) => Promise<void>;
   onSyncIntegration: (slug: string) => Promise<void>;
   onTestIntegration: (slug: string) => Promise<void>;
@@ -40,12 +42,33 @@ function renderAccountRow(
     onDelete: (slug: string) => Promise<void>;
     onReauth?: (acc: IntegrationAccount) => void;
     onSync?: (slug: string) => Promise<void>;
+    isMultiUser?: boolean;
+    canManage?: boolean;
   },
 ) {
+  const canEdit = options.canManage !== false;
   return (
     <div key={acc.id} className="py-3 flex items-center justify-between gap-3 text-xs">
       <div className="min-w-0 space-y-0.5">
-        <div className="font-medium text-slate-900">{acc.display_name}</div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="font-medium text-slate-900">{acc.display_name}</span>
+          {options.isMultiUser && (
+            <>
+              <span
+                className={`px-1.5 py-0.2 rounded-full border text-[10px] font-medium ${visibilityBadgeClasses(
+                  acc.visibility,
+                )}`}
+              >
+                {formatVisibilityLabel(acc.visibility, acc.allowed_groups)}
+              </span>
+              {acc.owner_email && (
+                <span className="text-[10.5px] text-slate-400 truncate">
+                  {acc.owner_email}
+                </span>
+              )}
+            </>
+          )}
+        </div>
         <div className="text-[11px] text-slate-500 truncate capitalize">
           {acc.account_identifier || acc.provider}
         </div>
@@ -70,7 +93,7 @@ function renderAccountRow(
             Sync Preview
           </button>
         )}
-        {options.onReauth && (
+        {options.onReauth && canEdit && (
           <button
             type="button"
             onClick={() => options.onReauth!(acc)}
@@ -97,19 +120,22 @@ function renderAccountRow(
               Send Test
             </button>
           )}
-        <button
-          type="button"
-          onClick={() => void options.onDelete(acc.slug)}
-          className="text-[11px] text-rose-600 hover:underline cursor-pointer"
-        >
-          Remove
-        </button>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => void options.onDelete(acc.slug)}
+            className="text-[11px] text-rose-600 hover:underline cursor-pointer"
+          >
+            Remove
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
 export function IntegrationsView({
+  principal = null,
   integrations,
   onOpenGoogleWizard,
   onOpenTelegramWizard,
@@ -126,10 +152,18 @@ export function IntegrationsView({
   const [publicHandle, setPublicHandle] = useState("");
   const [addingPublic, setAddingPublic] = useState(false);
 
+  const isMultiUser = Boolean(principal?.multi_user);
+  const isAdmin = Boolean(principal?.is_admin);
+  const callerEmail = (principal?.email || "").toLowerCase();
+  const canManageAcc = (owner?: string) =>
+    !isMultiUser || isAdmin || !owner || owner.toLowerCase() === callerEmail;
+
   const googleAccounts = integrations.filter((item) => item.provider === "google");
   const telegramAccounts = integrations.filter((item) => item.provider === "telegram");
+  const mcpServers = integrations.filter((item) => item.provider === "mcp");
   const socialAndHooks = integrations.filter(
-    (item) => item.provider !== "google" && item.provider !== "telegram",
+    (item) =>
+      item.provider !== "google" && item.provider !== "telegram" && item.provider !== "mcp",
   );
 
   async function submitPublicMonitor(e: FormEvent) {
@@ -168,7 +202,7 @@ export function IntegrationsView({
             </button>
             <button
               type="button"
-              onClick={onOpenNewIntegration}
+              onClick={() => onOpenNewIntegration()}
               className="border border-slate-200 bg-white text-slate-700 px-3 py-1.5 rounded-xl text-xs font-medium cursor-pointer hover:bg-slate-50"
             >
               + Custom / MCP
@@ -207,6 +241,8 @@ export function IntegrationsView({
                   onTest: onTestIntegration,
                   onDelete: onDeleteIntegration,
                   onReauth: (item) => onOpenGoogleWizard(item),
+                  isMultiUser,
+                  canManage: canManageAcc(acc.owner_email),
                 }),
               )}
             </div>
@@ -245,6 +281,8 @@ export function IntegrationsView({
                   onSendTest: onSendTestMessage,
                   onDelete: onDeleteIntegration,
                   onSync: onSyncIntegration,
+                  isMultiUser,
+                  canManage: canManageAcc(acc.owner_email),
                 }),
               )}
             </div>
@@ -307,6 +345,46 @@ export function IntegrationsView({
                 renderAccountRow(acc, {
                   onTest: onTestIntegration,
                   onDelete: onDeleteIntegration,
+                  isMultiUser,
+                  canManage: canManageAcc(acc.owner_email),
+                }),
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Dynamic MCP Tool Servers */}
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs space-y-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h3 className="text-xs font-semibold text-slate-900">
+                MCP Tool Servers
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Connect remote Streamable HTTP JSON-RPC 2.0 MCP endpoints; Verify discovers live tools automatically
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => onOpenNewIntegration("mcp")}
+              className="border border-slate-200 bg-white text-slate-900 px-3 py-1.5 rounded-xl text-xs font-medium cursor-pointer hover:bg-slate-50"
+            >
+              + Add MCP Server
+            </button>
+          </div>
+
+          {mcpServers.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-slate-200 p-4 text-center text-xs text-slate-500">
+              No external MCP servers configured yet. Click + Add MCP Server and click Verify to discover tools dynamically.
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100">
+              {mcpServers.map((acc) =>
+                renderAccountRow(acc, {
+                  onTest: onTestIntegration,
+                  onDelete: onDeleteIntegration,
+                  isMultiUser,
+                  canManage: canManageAcc(acc.owner_email),
                 }),
               )}
             </div>

@@ -10,6 +10,7 @@ import {
   EyeOff,
   FileText,
   Loader2,
+  LogOut,
   Moon,
   Pin,
   Plus,
@@ -31,7 +32,7 @@ import type {
   ViewId,
   WorkspaceSummary,
 } from "../types";
-import { formatFriendlyTime } from "../utils/format";
+import { formatFriendlyTime, stripMarkdownPreview } from "../utils/format";
 import { BotAvatar, type BotStatusDot } from "./BotAvatar";
 
 interface SidebarProps {
@@ -62,6 +63,7 @@ interface SidebarProps {
   principal: SsoPrincipal | null;
   theme: "light" | "dark";
   onToggleTheme: (next: "light" | "dark") => void;
+  onSignOut?: () => void;
 }
 
 export function Sidebar({
@@ -92,6 +94,7 @@ export function Sidebar({
   principal,
   theme,
   onToggleTheme,
+  onSignOut,
 }: SidebarProps) {
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
   const [showHiddenBots, setShowHiddenBots] = useState(false);
@@ -168,7 +171,8 @@ export function Sidebar({
           ? "waiting_approval"
           : !bot.enabled
             ? "paused"
-            : bot.runtime === "desktop" && bot.desktop_state === "running"
+            : (bot.runtime === "desktop" && bot.desktop_state === "running") ||
+                (bot.runtime === "sandbox" && bot.sandbox_state === "running")
               ? "desktop"
               : "active";
 
@@ -176,7 +180,7 @@ export function Sidebar({
     const scheduleText = station?.schedule_label || primaryRoutine?.schedule || "Manual";
     const lastRunRel = station?.last_run_at ? formatFriendlyTime(station.last_run_at) : "";
     const handoffTarget = bot.handoff_bot_slug ? botBySlug.get(bot.handoff_bot_slug) : undefined;
-    const rawSub = (station?.last_action_subtitle ?? "").trim();
+    const rawSub = stripMarkdownPreview(station?.last_action_subtitle ?? "");
     const cleanSub = /^(?:completed on |fallback succeeded on |ready! action mode)/i.test(rawSub)
       ? ""
       : rawSub;
@@ -502,7 +506,7 @@ export function Sidebar({
                   const roomStation = roomStationBySlug.get(room.slug);
                   const roomUnread = Boolean(roomStation?.unread) && !isRoomSelected;
                   const subtitle =
-                    roomStation?.last_message_preview ||
+                    stripMarkdownPreview(roomStation?.last_message_preview ?? "") ||
                     `${room.member_bot_slugs.length} bots`;
                   const memberBots = room.member_bot_slugs
                     .map((s) => botBySlug.get(s))
@@ -650,7 +654,7 @@ export function Sidebar({
                 <span>Approvals</span>
               </span>
               {pendingApprovals > 0 && (
-                <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-400 text-slate-950 shadow-xs">
+                <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500 text-white">
                   {pendingApprovals}
                 </span>
               )}
@@ -766,14 +770,28 @@ export function Sidebar({
             </div>
           </button>
 
-          <button
-            type="button"
-            title={theme === "dark" ? "Switch to Light mode" : "Switch to Dark mode"}
-            onClick={() => onToggleTheme(theme === "dark" ? "light" : "dark")}
-            className="p-2 rounded-xl border border-slate-200 bg-white text-slate-600 hover:text-slate-900 cursor-pointer shrink-0"
-          >
-            {theme === "dark" ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              title={theme === "dark" ? "Switch to Light mode" : "Switch to Dark mode"}
+              aria-label={theme === "dark" ? "Switch to Light mode" : "Switch to Dark mode"}
+              onClick={() => onToggleTheme(theme === "dark" ? "light" : "dark")}
+              className="p-2 rounded-xl border border-slate-200 bg-white text-slate-600 hover:text-slate-900 cursor-pointer shrink-0"
+            >
+              {theme === "dark" ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+            </button>
+            {onSignOut && (
+              <button
+                type="button"
+                title={principal?.email ? `Sign out (${principal.email})` : "Sign out"}
+                aria-label="Sign out"
+                onClick={onSignOut}
+                className="p-2 rounded-xl border border-slate-200 bg-white text-slate-600 hover:text-rose-700 hover:border-rose-300 cursor-pointer shrink-0"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </aside>

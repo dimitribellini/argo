@@ -1,0 +1,20 @@
+FROM registry.fedoraproject.org/fedora:45
+
+LABEL org.opencontainers.image.source="https://github.com/dimitribellini/argo" \
+      org.opencontainers.image.description="Argo headless Fedora 45 script sandbox (non-root UID 1000)"
+
+RUN dnf install -y --allowerasing --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        python3 \
+        curl \
+        jq && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf /var/cache/libdnf5 && \
+    (grep -q ':1000:' /etc/group || echo 'argo:x:1000:' >> /etc/group) && \
+    (grep -q ':1000:1000:' /etc/passwd || echo 'argo:x:1000:1000:Argo Sandbox:/workspace:/bin/bash' >> /etc/passwd) && \
+    mkdir -p /workspace && \
+    chown 1000:1000 /workspace
+
+WORKDIR /workspace
+USER 1000:1000
+
+CMD ["sleep", "infinity"]
